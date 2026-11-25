@@ -1,0 +1,68 @@
+name: Build Windows x64 (Win11 onedir)
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build onedir package with PyInstaller
+        run: pyinstaller energy-ems.spec --noconfirm --clean
+
+      - name: Assemble release folder
+        shell: pwsh
+        run: |
+          Copy-Item -Path build_win11.bat -Destination dist/energy_ems/ -Force
+          Copy-Item -Path README_DEPLOY.md -Destination dist/energy_ems/ -Force
+
+      - name: Compress archive
+        id: package
+        shell: pwsh
+        run: |
+          $stamp = Get-Date -Format yyyyMMdd
+          $zip = "energy-ems-win11-x64-$stamp.zip"
+          Compress-Archive -Path "dist/energy_ems/*" -DestinationPath $zip -Force
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.zip }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish Release (可直链下载)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: energy-ems Win11 x64
+          body: |
+            能耗管理系统 energy_ems · Win11 x64 onedir 完整包。
+            解压后双击 build_win11.bat，浏览器打开 http://127.0.0.1:8000/ ，默认密码 ems2026。
+            首次启动为 simulate 模拟数据模式，看板与报表立即可用。
+          files: ${{ steps.package.outputs.zip }}
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

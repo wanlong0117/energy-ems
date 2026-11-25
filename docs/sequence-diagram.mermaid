@@ -1,0 +1,70 @@
+sequenceDiagram
+    autonumber
+    actor Op as 运维/浏览器
+    participant Main as main.py
+    participant DB as db.py
+    participant Auth as api_auth.py/auth.py
+    participant Cfg as api_config.py
+    participant Vld as schemas.py
+    participant Agg as aggregation.py
+    participant Col as collector.py
+    participant Mb as modbus.py
+    participant Data as api_data.py
+    participant GW as E90网关
+
+    Note over Main,DB: 场景1 · 启动建库
+    Main->>DB: init_db()
+    DB->>DB: get_conn() + PRAGMA journal_mode=WAL
+    DB->>DB: executescript(schema.sql) + INSERT 三类能源
+    Main->>Col: create_task(collector.start())
+    Main->>Agg: create_task(aggregator.run_loop())
+
+    Note over Op,Auth: 场景2 · 登录
+    Op->>Auth: POST /api/login {password}
+    Auth->>Auth: load_password() 比对
+    alt 密码错误
+        Auth->>DB: log_event(warn, api, LOGIN_FAIL)
+        Auth-->>Op: 401 {ok:false, error}
+    else 密码正确
+        Auth->>Auth: 生成 token → sessions
+        Auth->>DB: log_event(info, api, LOGIN)
+        Auth-->>Op: 200 {ok:true} + Set-Cookie ems_session
+    end
+
+    Note over Col,GW: 场景3 · 采集写库
+    loop 每 device / poll_interval
+        Col->>Col: 等待 reload_event（热生效）
+        Col->>DB: query(device/point 配置快照)
+        Col->>Col: merge_reads() 合并相邻寄存器
+        Col->>Mb: read_registers(slave, func, offset, count)
+        Mb->>GW: MBAP+PDU via TCP 8886
+        GW-->>Mb: 寄存器字节
+        Mb->>Mb: parse_response() + decode(f32/CDAB/scale/offset/min-max)
+        Mb-->>Col: [(point_id, value, quality)]
+        Col->>DB: execute(INSERT OR REPLACE reading) + upsert reading_latest
+        alt 超时/异常/越界
+            Col->>DB: log_event(error/warn, collector, READ_FAIL)
+            Col->>Col: retry + 断网重连
+        end
+    end
+
+    Note over Op,Mb: 场景4 · 点位试读
+    Op->>Cfg: POST /api/point/{id}/read
+    Cfg->>DB: query_one(point by id)
+    Cfg->>Vld: 校验 point 参数合法
+    Cfg->>Mb: read_registers(slave, func, offset, count)
+    Mb->>GW: MBAP+PDU
+    GW-->>Mb: 寄存器字节
+    Mb->>Mb: decode() → 工程值
+    Mb-->>Cfg: {raw_hex, raw_regs, parsed_value, quality}
+    Cfg-->>Op: 200 {ok:true, data:{raw, parsed}}
+
+    Note over Agg,DB: 场景5 · 08:10 日结算（UTC 00:10 = 本地 08:10）
+    Agg->>Agg: 定时到 UTC 00:10
+    Agg->>DB: query(hourly WHERE hour_start in 昨日 24h 窗口)
+    Agg->>Agg: 累加 energy_wh、求 peak/avg、按 purpose 拆分
+    Agg->>DB: query_one(tariff WHERE is_default=1)
+    Agg->>Agg: calc_cost(energy_wh/1e6 × price_cent)
+    Agg->>DB: INSERT OR REPLACE daily(is_final=1, cost_cent)
+    Agg->>DB: log_event(info, collector, SETTLE_DONE)
+    Data-->>Op: GET /api/daily 返回已结算数据

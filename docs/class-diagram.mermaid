@@ -1,0 +1,235 @@
+classDiagram
+    direction TB
+
+    %% ============ 数据模型（对应 schema.sql 12 表） ============
+    class Node {
+        +int id
+        +str name
+        +int parent_id
+        +str kind
+        +int sort_order
+        +int is_active
+    }
+    class Device {
+        +int id
+        +str name
+        +int node_id
+        +str protocol
+        +str host
+        +int port
+        +int timeout_ms
+        +int retry
+        +int poll_interval
+        +int is_enabled
+        +int last_ok_at
+        +str last_error
+    }
+    class Point {
+        +int id
+        +str name
+        +int device_id
+        +int slave_id
+        +int func_code
+        +int reg_offset
+        +int reg_count
+        +str data_type
+        +str byte_order
+        +float scale
+        +float offset_const
+        +float min_val
+        +float max_val
+        +str unit
+        +str point_role
+        +int is_enabled
+    }
+    class EnergyCategory {
+        +int id
+        +str name
+        +str unit
+    }
+    class Meter {
+        +int id
+        +str name
+        +int node_id
+        +int category_id
+        +str purpose
+        +int is_counted
+        +int daily_8am
+        +int is_enabled
+    }
+    class MeterPoint {
+        +int meter_id
+        +int point_id
+        +str role
+    }
+    class Reading {
+        +int point_id
+        +int ts
+        +float value
+        +int quality
+    }
+    class ReadingLatest {
+        +int point_id
+        +int ts
+        +float value
+        +int quality
+    }
+    class Hourly {
+        +int meter_id
+        +int hour_start
+        +int energy_wh
+        +float avg_power
+        +float max_power
+        +int sample_cnt
+    }
+    class Daily {
+        +int meter_id
+        +int day_start
+        +int energy_wh
+        +float peak_power
+        +float avg_power
+        +int cost_cent
+        +int is_final
+    }
+    class Tariff {
+        +int id
+        +str name
+        +int price_cent
+        +int start_hour
+        +int end_hour
+        +int is_default
+    }
+    class EventLog {
+        +int id
+        +int ts
+        +str level
+        +str source
+        +str code
+        +str message
+        +int ref_id
+    }
+
+    %% ============ 服务层 ============
+    class DB {
+        +get_conn() Connection
+        +init_db() None
+        +query(sql, params) list
+        +query_one(sql, params) Row
+        +execute(sql, params) int
+        +log_event(level, source, code, message, ref_id) None
+    }
+    class AuthService {
+        +sessions dict
+        +load_password() str
+        +login(password, response) JSONResponse
+        +logout(request) JSONResponse
+        +current_user(request) bool
+        +require_auth(request) bool
+    }
+    class PointValidator {
+        +validate_reg_offset(v) int
+        +validate_reg_count(v) int
+        +validate_type_count(dt, count) None
+        +check_overlap(device_id, slave_id, func_code, offset, count, exclude_id) None
+    }
+    class ModbusClient {
+        +str host
+        +int port
+        +int timeout_ms
+        +connect() None
+        +close() None
+        +build_adu(slave, func, offset, count) bytes
+        +parse_response(data) list
+        +read_registers(slave, func, offset, count) list
+        +decode(registers, point) tuple
+    }
+    class Collector {
+        +tasks dict
+        +config_sig str
+        +reload_event Event
+        +start() None
+        +poll_device(device) None
+        +merge_reads(device, points) list
+        +write_batch(rows) None
+        +reload() None
+        +probe_point(point_id) dict
+    }
+    class Aggregator {
+        +rollup_hour(hour_start) None
+        +settle_day(day_start) None
+        +calc_cost(energy_wh, day_start) int
+        +split_by_purpose(day_start) list
+        +run_loop() None
+    }
+    class ConfigService {
+        +list(resource) list
+        +get(resource, id) dict
+        +create(resource, body) dict
+        +update(resource, id, body) dict
+        +delete(resource, id) bool
+        +validate_point(body) None
+        +test_device(id) dict
+    }
+    class DataService {
+        +latest(filters) list
+        +hourly(filters) list
+        +daily(filters) list
+        +events(filters) list
+    }
+
+    %% ============ 接入层 ============
+    class ApiAuth {
+        +login(req) JSONResponse
+        +logout(req) JSONResponse
+        +session(req) dict
+    }
+    class ApiConfig {
+        +crud(resource, id, method) dict
+        +read_point(id) dict
+        +test_device(id) dict
+        +list_events(filters) list
+        +reload_collector() dict
+    }
+    class ApiData {
+        +latest(filters) list
+        +hourly(filters) list
+        +daily(filters) list
+        +settle(day_start) dict
+    }
+    class Main {
+        +app FastAPI
+        +lifespan() None
+        +mount_routes() None
+    }
+
+    %% ============ 关系 ============
+    Node "1" -- "0..*" Device : 包含
+    Node "1" -- "0..*" Meter : 归属
+    EnergyCategory "1" -- "0..*" Meter : 分类
+    Device "1" -- "0..*" Point : 采集点
+    Meter "1" -- "0..*" MeterPoint : 关联
+    Point "1" -- "0..*" MeterPoint : 关联
+    Point "1" -- "0..*" Reading : 时序值
+    Point "1" -- "0..1" ReadingLatest : 最新值
+    Meter "1" -- "0..*" Hourly : 小时汇总
+    Meter "1" -- "0..*" Daily : 日汇总
+    Tariff "1" -- "0..*" Daily : 计费
+
+    Main --> ApiAuth
+    Main --> ApiConfig
+    Main --> ApiData
+    Main --> Collector
+    Main --> Aggregator
+    ApiAuth --> AuthService
+    ApiConfig --> ConfigService
+    ApiConfig --> Collector
+    ApiConfig --> ModbusClient
+    ApiData --> DataService
+    ApiData --> Aggregator
+    ConfigService --> PointValidator
+    ConfigService --> DB
+    DataService --> DB
+    AuthService --> DB
+    Collector --> ModbusClient
+    Collector --> DB
+    Aggregator --> DB

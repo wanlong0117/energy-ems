@@ -1,0 +1,87 @@
+sequenceDiagram
+    autonumber
+    actor Op as 运维/浏览器
+    participant Main as main.py
+    participant Cfg as config.json
+    participant Sim as simulator.py
+    participant Col as collector.py
+    participant Mb as modbus.py
+    participant Agg as aggregation.py
+    participant DB as db.py
+    participant Rep as reports.py
+    participant Man as manual.py
+    participant Dash as dashboard/index.html
+    participant GW as Modbus设备/网关
+    participant Exe as Win11 exe/bat
+
+    Note over Exe,Main: 场景5 · Win11 包启动路径解析（onedir）
+    Op->>Exe: 双击 build_win11.bat
+    Exe->>Main: 设工作目录→启动 energy_ems.exe
+    Main->>Main: app_dir()=exe同级 / resource_dir()=_MEIPASS
+    Main->>DB: DB_PATH=app_dir()/energy.db；SCHEMA=resource_dir()/schema.sql
+    Main->>Cfg: load_password()=app_dir()/config.json（旧配置补默认字段）
+
+    Note over Main,DB: 场景1a · simulate 启动产数→写库→汇总→看板
+    Main->>DB: init_db()（幂等补 manual_reading）
+    Main->>Cfg: 读 data_mode
+    alt data_mode == simulate
+        Main->>Sim: ensure_baseline()（4×25表+15电极点+5机械排水点）
+        Main->>Sim: create_task(start())；不启动 Collector
+        loop 每 simulate_interval_sec(默认300s)
+            Sim->>Sim: tick() 累计单调+波动
+            Sim->>DB: INSERT OR REPLACE reading + upsert reading_latest
+        end
+    else data_mode == live
+        Main->>Col: create_task(start())；不启动 Simulator
+    end
+    Main->>Agg: create_task(run_loop())
+    opt simulate 模式
+        Main->>Agg: create_task(run_simulate_loop())
+    end
+    loop 每 simulate_rollup_sec(默认600s) / simulate 模式
+        Agg->>DB: rollup_hour(当前小时)
+        Agg->>DB: settle_day(当天, is_final=0)
+    end
+
+    Note over Op,Dash: 场景1b · 看板读取真实 DB
+    Op->>Dash: 打开首页（StaticFiles 挂载 /）
+    Dash->>Main: GET /api/session + /api/latest + /api/hourly + /api/daily
+    Main-->>Dash: {ok:true,data:[...]}（SVG 折线/柱图刷新）
+    Dash->>Dash: CN/EN 切换 i18n；6 页签渲染
+
+    Note over Op,Man: 场景2 · 手动录入→三表一致→日重算
+    Op->>Man: POST /api/manual {point_id,ts,value,operator,remark}
+    Man->>DB: BEGIN；INSERT manual_reading(point_id,ts)
+    Man->>DB: INSERT OR REPLACE reading(quality=3)
+    Man->>DB: upsert reading_latest（仅 ts 更新时覆盖）；COMMIT
+    alt 重复 (point_id,ts)
+        Man->>DB: log_event(user,MANUAL_OVERWRITE) + 响应 overwritten=true
+    end
+    Man->>Agg: recompute(ts)：rollup_hour(ts所在小时)
+    Man->>Agg: settle_day(ts所在日, is_final=当日原值)
+    Note right of Agg: weekly/monthly 按需聚合，无需重算
+    Man-->>Op: {ok:true,data:{point_id,ts,...}}
+
+    Note over Op,Rep: 场景3 · 报表导出 Excel/PDF
+    Op->>Rep: GET /api/report/export?kind=weekly&fmt=xlsx&from&to
+    Rep->>Agg: weekly(filters)（daily 按 ISO 周 SUM，误差 0）
+    Agg->>DB: SELECT ... FROM daily JOIN meter WHERE day_start∈区间 GROUP BY week_start
+    Agg-->>Rep: 周汇总 rows（含合计）
+    alt fmt == xlsx
+        Rep->>Rep: to_xlsx() openpyxl 中文表头+合计
+    else fmt == pdf
+        Rep->>Rep: to_pdf() reportlab STSong-Light，A4横版，页眉页脚
+    end
+    Rep-->>Op: 200 文件流（Content-Disposition attachment）
+
+    Note over Op,GW: 场景4 · Modbus RTU over TCP 试读（CRC16）
+    Op->>Main: POST /api/point/{id}/read
+    Main->>Col: probe_point(id)
+    Col->>DB: 查 point + device(protocol=modbus_rtu_tcp)
+    Col->>Mb: _client_for(device) → ModbusRTUTCPClient
+    Mb->>Mb: build_adu() addr+PDU+crc16()
+    Mb->>GW: RTU 帧 via TCP（≤3000ms）
+    GW-->>Mb: RTU 响应
+    Mb->>Mb: parse_response() 校验 CRC16 + 解寄存器
+    Mb-->>Col: registers → decode() 工程值+quality
+    Col-->>Op: {ok:true,data:{raw_hex,parsed_value,parsed_orders,elapsed_ms}}

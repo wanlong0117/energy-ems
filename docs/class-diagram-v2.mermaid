@@ -1,0 +1,174 @@
+classDiagram
+    direction TB
+
+    %% ============ 新增/变更数据模型 ============
+    class ManualReading {
+        +int id
+        +int point_id
+        +int ts
+        +float value
+        +str operator
+        +str remark
+    }
+    note for ManualReading "第13张表；UNIQUE(point_id,ts)；\n录入事务同步 reading(quality=3)+reading_latest"
+
+    class Device {
+        +int id
+        +str name
+        +int node_id
+        +str protocol
+        +str host
+        +int port
+        +int timeout_ms
+        +int retry
+        +int poll_interval
+        +int is_enabled
+    }
+    note for Device "protocol 扩展为\nmodbus_tcp|modbus_rtu_tcp|modbus_rtu_serial|manual"
+
+    class Point { +int id +str name +int device_id +float scale +str unit }
+    class Reading { +int point_id +int ts +float value +int quality }
+    class ReadingLatest { +int point_id +int ts +float value +int quality }
+    class Hourly { +int meter_id +int hour_start +int energy_wh +float avg_power +int sample_cnt }
+    class Daily { +int meter_id +int day_start +int energy_wh +int cost_cent +int is_final }
+    class EventLog { +int id +int ts +str level +str source +str code +str message }
+    class Meter { +int id +str name +int node_id +str purpose +int is_counted }
+
+    %% ============ 服务层（新增加粗语义） ============
+    class Simulator {
+        +int interval_sec
+        +dict baselines
+        +ensure_baseline() None
+        +start() None
+        +tick() None
+        +write_points(rows) None
+        +shutdown() None
+    }
+    note for Simulator "simulate 模式专用；写真实表；\n与 Collector 互斥；模拟频率可配"
+
+    class ManualService {
+        +record(body) dict
+        +list(filters) list
+        +recompute(ts) None
+        +_write_in_txn(row) None
+    }
+    class ReportService {
+        +build(kind, filters) list
+        +to_xlsx(rows, meta) bytes
+        +to_pdf(rows, meta) bytes
+        +_stsong_font() Font
+    }
+    class Aggregator {
+        +rollup_hour(hour_start) None
+        +settle_day(day_start, is_final=1) None
+        +weekly(filters) list
+        +monthly(filters) list
+        +run_loop() None
+        +run_simulate_loop() None
+    }
+    class Collector {
+        +tasks dict
+        +reload_event Event
+        +start() None
+        +_client_for(device) BaseModbusClient
+        +merge_reads(device, points) list
+        +write_batch(rows) None
+        +probe_point(id) dict
+        +shutdown() None
+    }
+    class DataService {
+        +latest(filters) list
+        +hourly(filters) list
+        +daily(filters) list
+    }
+    class DB {
+        +get_conn() Connection
+        +init_db() None
+        +query(sql, params) list
+        +execute(sql, params) int
+        +log_event(...) None
+    }
+
+    %% ============ Modbus 三协议 ============
+    class BaseModbusClient {
+        <<abstract>>
+        +str host
+        +int timeout_ms
+        +int retry
+        +build_adu(slave, func, offset, count) bytes*
+        +parse_response(data) list*
+        +read_registers(slave, func, offset, count) list*
+        +decode(registers, point) tuple
+    }
+    class ModbusTCPClient {
+        +build_adu() bytes
+        +parse_response() list
+        +connect() None
+    }
+    class ModbusRTUTCPClient {
+        +crc16(data) int
+        +build_adu() bytes
+        +parse_response() list
+    }
+    class ModbusRTUSerialClient {
+        +str port
+        +int baudrate
+        +parity() str
+        +build_adu() bytes
+        +parse_response() list
+    }
+    note for ModbusRTUTCPClient "RTU 帧(地址+PDU+CRC16)走 TCP；\n校验 CRC；禁 pymodbus"
+    note for ModbusRTUSerialClient "pyserial COM 口；\nto_thread 包装避免阻塞事件循环"
+
+    %% ============ 接入层 / 前端 ============
+    class ApiReport {
+        +export(kind, fmt, filters) StreamingResponse
+        +create_manual(body) dict
+        +list_manual(filters) list
+        +switch_mode(body) dict
+    }
+    class ApiData {
+        +weekly(filters) dict
+        +monthly(filters) dict
+        +mode() dict
+    }
+    class Main {
+        +app FastAPI
+        +lifespan() None
+    }
+    class Dashboard {
+        +str index_html
+        +i18n dict
+        +renderCharts() None
+    }
+    note for Dashboard "单文件 index.html；6 页签；CN/EN；\nSVG 自绘；StaticFiles 挂载 /"
+
+    %% ============ 关系 ============
+    Point "1" -- "0..*" Reading : 时序值
+    Point "1" -- "0..1" ReadingLatest : 最新值
+    Point "1" -- "0..*" ManualReading : 人工补录
+    Device "1" -- "0..*" Point : 采集点
+    Meter "1" -- "0..*" Hourly : 小时汇总
+    Meter "1" -- "0..*" Daily : 日汇总
+
+    BaseModbusClient <|-- ModbusTCPClient
+    BaseModbusClient <|-- ModbusRTUTCPClient
+    BaseModbusClient <|-- ModbusRTUSerialClient
+    Collector --> BaseModbusClient : 按 protocol 分派
+    Simulator ..> DB : 互斥写入
+    Collector --> DB
+    Aggregator --> DB : daily→weekly/monthly 视图
+    ManualService --> DB : 单事务三表
+    ManualService --> Aggregator : 回填重算
+    ReportService --> Aggregator : 复用周/月视图
+    ReportService --> DataService
+    DataService --> DB
+
+    Main --> Simulator
+    Main --> Collector
+    Main --> Aggregator
+    Main --> ApiReport
+    Main --> ApiData
+    Main --> Dashboard : 静态挂载
+    ApiReport --> ReportService
+    ApiReport --> ManualService

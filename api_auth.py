@@ -1,0 +1,35 @@
+"""认证路由：POST /api/login、POST /api/logout、GET /api/session。
+
+除 login/session 外，其它 API 路由均在各自 router 上挂 require_auth 依赖。
+"""
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import JSONResponse
+
+import auth
+from auth import require_auth
+from schemas import LoginIn, ok
+
+router = APIRouter(prefix="/api", tags=["auth"])
+
+
+@router.post("/login")
+def login(body: LoginIn, response: Response) -> JSONResponse:
+    """固定密码登录，成功写 ems_session cookie。"""
+    return auth.login(body.password, response)
+
+
+@router.post("/logout", dependencies=[Depends(require_auth)])
+def logout(request: Request) -> JSONResponse:
+    """登出：清除内存会话与 cookie（需登录）。"""
+    return auth.logout(request)
+
+
+@router.get("/session")
+def session(request: Request) -> dict:
+    """会话状态查询（无需登录，始终 ok:true）。"""
+    return ok({"authenticated": auth.current_user(request)})
+
+
+__all__ = ["router", "require_auth"]

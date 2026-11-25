@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>能耗管理系统 / Energy EMS</title>
+<style>
+  :root {
+    --bg: #f4f6fa; --card: #ffffff; --ink: #1f2937; --muted: #6b7280;
+    --line: #d8dee9; --brand: #1f5fd0; --brand2: #e8f0fe; --ok: #137333;
+    --warn: #b06000; --err: #c5221f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between;
+           gap: 12px; padding: 12px 20px; background: #12325f; color: #fff; }
+  .brand { font-size: 18px; font-weight: 700; letter-spacing: .5px; }
+  .badge { display: inline-block; margin-left: 10px; padding: 2px 10px; border-radius: 12px;
+           background: #2f6fd0; font-size: 12px; font-weight: 500; }
+  .badge.live { background: #137333; }
+  .header-actions { display: flex; gap: 8px; }
+  nav { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 20px 0; background: #fff;
+        border-bottom: 1px solid var(--line); }
+  nav button { border: 0; background: transparent; color: var(--muted); padding: 10px 16px;
+               cursor: pointer; border-bottom: 3px solid transparent; font-size: 14px; }
+  nav button.active { color: var(--brand); border-bottom-color: var(--brand); font-weight: 700; }
+  main { padding: 18px 20px 40px; max-width: 1280px; margin: 0 auto; }
+  .tab { display: none; }
+  .tab.active { display: block; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+  h2 { margin: 0 0 14px; font-size: 17px; }
+  h3 { margin: 0 0 10px; font-size: 15px; }
+  .grid { display: grid; gap: 12px; }
+  .cards { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+  .kpi { background: var(--brand2); border-radius: 8px; padding: 14px; }
+  .kpi .label { color: var(--muted); font-size: 12px; }
+  .kpi .value { font-size: 22px; font-weight: 700; margin-top: 6px; color: #12325f; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-bottom: 12px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  input, select, textarea { padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+                            font: inherit; background: #fff; color: var(--ink); min-width: 130px; }
+  textarea { min-height: 64px; resize: vertical; }
+  button.primary { background: var(--brand); color: #fff; border: 0; border-radius: 6px;
+                   padding: 9px 16px; cursor: pointer; font: inherit; }
+  button.ghost { background: #fff; color: var(--brand); border: 1px solid var(--brand);
+                 border-radius: 6px; padding: 8px 14px; cursor: pointer; font: inherit; }
+  button.small { padding: 4px 9px; font-size: 12px; }
+  button.danger { color: var(--err); border-color: var(--err); }
+  .charts { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+  svg { width: 100%; height: auto; background: #fff; border: 1px solid var(--line); border-radius: 8px; }
+  .empty { padding: 26px; text-align: center; color: var(--muted); background: #fafbfd;
+           border: 1px dashed var(--line); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+  th { background: #f1f4f9; color: var(--muted); font-weight: 600; white-space: nowrap; }
+  tr:hover td { background: #fafbfd; }
+  .tablewrap { overflow-x: auto; }
+  .toast { position: fixed; right: 18px; bottom: 18px; padding: 10px 16px; border-radius: 8px;
+           color: #fff; background: var(--ok); z-index: 99; display: none; max-width: 380px; }
+  .toast.error { background: var(--err); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .hint { background: #fff8e6; border: 1px solid #f0d9a0; color: #7a5200;
+          padding: 10px 12px; border-radius: 6px; margin-top: 10px; }
+  .formgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+  .loginbox { max-width: 380px; margin: 40px auto; }
+  .loginbox input { width: 100%; }
+  .flexbetween { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+  code { background: #f1f4f9; padding: 2px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span data-i18n="app_title">能耗管理系统</span><span id="modeBadge" class="badge">simulate</span></div>
+  <div class="header-actions">
+    <button id="langBtn" class="ghost small" type="button">EN</button>
+    <button id="logoutBtn" class="ghost small" type="button" data-i18n="logout_btn">退出登录</button>
+  </div>
+</header>
+<nav id="tabs">
+  <button type="button" data-tab="login" data-i18n="tab_login">登录</button>
+  <button type="button" data-tab="dashboard" data-i18n="tab_dashboard">看板</button>
+  <button type="button" data-tab="config" data-i18n="tab_config">配置</button>
+  <button type="button" data-tab="report" data-i18n="tab_report">报表</button>
+  <button type="button" data-tab="manual" data-i18n="tab_manual">手动录入</button>
+  <button type="button" data-tab="events" data-i18n="tab_events">事件日志</button>
+</nav>
+<main>
+  <!-- 登录 -->
+  <section class="tab" id="tab-login">
+    <div class="card loginbox">
+      <h2 data-i18n="login_title">登录</h2>
+      <div class="row"><label style="flex:1"><span data-i18n="password">密码</span>
+        <input id="password" type="password" autocomplete="current-password"></label></div>
+      <button id="loginBtn" class="primary" type="button" data-i18n="login_btn">登录</button>
+      <p class="muted" id="loginModeHint"></p>
+    </div>
+  </section>
+
+  <!-- 看板 -->
+  <section class="tab" id="tab-dashboard">
+    <div class="card">
+      <div class="flexbetween"><h2 data-i18n="dash_overview">实时概览</h2>
+        <div class="row" style="margin:0">
+          <label><span data-i18n="node_filter">节点</span><select id="dashNode"></select></label>
+          <label><span data-i18n="purpose_filter">用途</span><select id="dashPurpose"></select></label>
+          <button id="dashRefresh" class="ghost small" type="button" data-i18n="refresh">刷新</button>
+        </div>
+      </div>
+      <div class="grid cards">
+        <div class="kpi"><div class="label" data-i18n="kpi_points">最新点位</div><div class="value" id="kpiPoints">0</div></div>
+        <div class="kpi"><div class="label" data-i18n="kpi_energy">区间电量(毫度)</div><div class="value" id="kpiEnergy">0</div></div>
+        <div class="kpi"><div class="label" data-i18n="kpi_cost">区间电费(分)</div><div class="value" id="kpiCost">0</div></div>
+        <div class="kpi"><div class="label" data-i18n="kpi_update">最新时间</div><div class="value" id="kpiUpdate">-</div></div>
+      </div>
+    </div>
+    <div class="grid charts">
+      <div class="card"><h3 data-i18n="trend_hour">小时电量趋势</h3><svg id="lineChart" viewBox="0 0 620 260"></svg></div>
+      <div class="card"><h3 data-i18n="trend_purpose">按用途日汇总</h3><svg id="barChart" viewBox="0 0 620 260"></svg></div>
+    </div>
+    <div class="card"><h3 data-i18n="latest_table">最新读数</h3><div class="tablewrap"><table id="latestTable"></table></div></div>
+  </section>
+
+  <!-- 配置 -->
+  <section class="tab" id="tab-config">
+    <div class="card">
+      <div class="flexbetween"><h2 data-i18n="config_title">配置管理</h2>
+        <div class="row" style="margin:0">
+          <label><span data-i18n="resource">资源</span><select id="cfgResource"></select></label>
+          <button id="cfgRefresh" class="ghost small" type="button" data-i18n="refresh">刷新</button>
+        </div>
+      </div>
+      <div class="formgrid" id="cfgForm"></div>
+      <div class="row" style="margin-top:12px">
+        <button id="cfgSave" class="primary" type="button" data-i18n="save">保存</button>
+        <button id="cfgNew" class="ghost" type="button" data-i18n="reset">重置</button>
+      </div>
+    </div>
+    <div class="card"><div class="tablewrap"><table id="cfgTable"></table></div></div>
+    <div class="card">
+      <h3 data-i18n="trial_title">点位试读</h3>
+      <div class="row"><label><span data-i18n="point">点位</span><select id="trialPoint"></select></label>
+        <button id="trialBtn" class="primary" type="button" data-i18n="trial_read">试读</button></div>
+      <pre id="trialResult" class="muted">-</pre>
+    </div>
+    <div class="card">
+      <h3 data-i18n="mode_switch">数据模式切换</h3>
+      <div class="row"><label><span>data_mode</span><select id="modeSelect">
+        <option value="simulate">simulate</option><option value="live">live</option></select></label>
+        <button id="modeSwitchBtn" class="primary" type="button" data-i18n="switch">切换</button></div>
+      <div class="hint" data-i18n="restart_hint">切换后需重启服务生效：simulate 使用内置模拟器，live 由 Modbus 采集器接管，二者互斥。</div>
+    </div>
+  </section>
+
+  <!-- 报表 -->
+  <section class="tab" id="tab-report">
+    <div class="card">
+      <div class="flexbetween"><h2 data-i18n="report_title">能耗报表</h2>
+        <div class="row" style="margin:0">
+          <label><span data-i18n="kind">类型</span><select id="repKind">
+            <option value="daily" data-i18n="kind_daily">日</option>
+            <option value="weekly" data-i18n="kind_weekly">周</option>
+            <option value="monthly" data-i18n="kind_monthly">月</option></select></label>
+          <label><span data-i18n="from">起</span><input id="repFrom" type="date"></label>
+          <label><span data-i18n="to">止</span><input id="repTo" type="date"></label>
+          <label><span data-i18n="node_filter">节点</span><select id="repNode"></select></label>
+          <label><span data-i18n="purpose_filter">用途</span><select id="repPurpose"></select></label>
+          <button id="repLoad" class="ghost" type="button" data-i18n="preview">预览</button>
+          <button id="repXlsx" class="primary" type="button" data-i18n="export_xlsx">导出 Excel</button>
+          <button id="repPdf" class="primary" type="button" data-i18n="export_pdf">导出 PDF</button>
+        </div>
+      </div>
+      <svg id="repPreview" viewBox="0 0 900 200"></svg>
+    </div>
+  </section>
+
+  <!-- 手动录入 -->
+  <section class="tab" id="tab-manual">
+    <div class="card">
+      <h2 data-i18n="manual_title">手动录入</h2>
+      <div class="formgrid">
+        <label><span data-i18n="point">点位</span><select id="manPoint"></select></label>
+        <label><span data-i18n="ts">时间</span><input id="manTs" type="datetime-local"></label>
+        <label><span data-i18n="value">数值</span><input id="manValue" type="number" step="any"></label>
+        <label><span data-i18n="operator">录入人</span><input id="manOperator" type="text"></label>
+        <label style="grid-column:1/-1"><span data-i18n="remark">备注</span><input id="manRemark" type="text"></label>
+      </div>
+      <div class="row" style="margin-top:12px"><button id="manSubmit" class="primary" type="button" data-i18n="submit">提交</button></div>
+    </div>
+    <div class="card"><h3 data-i18n="recent">最近录入</h3><div class="tablewrap"><table id="manTable"></table></div></div>
+  </section>
+
+  <!-- 事件日志 -->
+  <section class="tab" id="tab-events">
+    <div class="card">
+      <div class="flexbetween"><h2 data-i18n="events_title">事件日志</h2>
+        <div class="row" style="margin:0">
+          <label><span data-i18n="level">级别</span><select id="evLevel">
+            <option value="">ALL</option><option value="info">info</option>
+            <option value="warn">warn</option><option value="error">error</option></select></label>
+          <label><span data-i18n="source">来源</span><select id="evSource">
+            <option value="">ALL</option><option value="api">api</option>
+            <option value="collector">collector</option><option value="user">user</option></select></label>
+          <label><span data-i18n="limit">条数</span><input id="evLimit" type="number" value="100" min="1" max="500"></label>
+          <button id="evRefresh" class="ghost" type="button" data-i18n="refresh">刷新</button>
+        </div>
+      </div>
+      <div class="tablewrap"><table id="evTable"></table></div>
+    </div>
+  </section>
+</main>
+<div id="toast" class="toast"></div>
+
+<script>
+"use strict";
+/* ===== i18n：右上角 CN/EN 覆盖全部文案 ===== */
+const I18N = {
+  zh: {
+    app_title: "能耗管理系统", logout_btn: "退出登录", tab_login: "登录", tab_dashboard: "看板",
+    tab_config: "配置", tab_report: "报表", tab_manual: "手动录入", tab_events: "事件日志",
+    login_title: "登录", password: "密码", login_btn: "登录", login_fail: "登录失败",
+    dash_overview: "实时概览", refresh: "刷新", node_filter: "节点", purpose_filter: "用途",
+    kpi_points: "最新点位", kpi_energy: "区间电量(毫度)", kpi_cost: "区间电费(分)", kpi_update: "最新时间",
+    trend_hour: "小时电量趋势", trend_purpose: "按用途日汇总", latest_table: "最新读数",
+    config_title: "配置管理", resource: "资源", save: "保存", reset: "重置", edit: "编辑", delete: "删除",
+    trial_title: "点位试读", trial_read: "试读", point: "点位", mode_switch: "数据模式切换", switch: "切换",
+    restart_hint: "切换后需重启服务生效：simulate 使用内置模拟器，live 由 Modbus 采集器接管，二者互斥。",
+    report_title: "能耗报表", kind: "类型", kind_daily: "日", kind_weekly: "周", kind_monthly: "月",
+    from: "起", to: "止", preview: "预览", export_xlsx: "导出 Excel", export_pdf: "导出 PDF",
+    manual_title: "手动录入", ts: "时间", value: "数值", operator: "录入人", remark: "备注",
+    submit: "提交", recent: "最近录入", events_title: "事件日志", level: "级别", source: "来源",
+    limit: "条数", no_data: "暂无数据 / No data", saved: "保存成功", failed: "操作失败",
+    confirm_delete: "确认删除该记录？", overwritten: "已覆盖同时间点原记录", trial_fail: "试读失败",
+    need_login: "请先登录", welcome: "当前数据模式"
+  },
+  en: {
+    app_title: "Energy EMS", logout_btn: "Logout", tab_login: "Login", tab_dashboard: "Dashboard",
+    tab_config: "Config", tab_report: "Reports", tab_manual: "Manual Entry", tab_events: "Event Log",
+    login_title: "Login", password: "Password", login_btn: "Sign in", login_fail: "Login failed",
+    dash_overview: "Live Overview", refresh: "Refresh", node_filter: "Node", purpose_filter: "Purpose",
+    kpi_points: "Latest Points", kpi_energy: "Energy (milli)", kpi_cost: "Cost (cent)", kpi_update: "Last Update",
+    trend_hour: "Hourly Energy Trend", trend_purpose: "Daily Energy by Purpose", latest_table: "Latest Readings",
+    config_title: "Configuration", resource: "Resource", save: "Save", reset: "Reset", edit: "Edit", delete: "Delete",
+    trial_title: "Point Probe", trial_read: "Probe", point: "Point", mode_switch: "Data Mode Switch", switch: "Switch",
+    restart_hint: "Restart is required: simulate uses the built-in simulator, live uses Modbus collectors (mutually exclusive).",
+    report_title: "Energy Reports", kind: "Kind", kind_daily: "Daily", kind_weekly: "Weekly", kind_monthly: "Monthly",
+    from: "From", to: "To", preview: "Preview", export_xlsx: "Export Excel", export_pdf: "Export PDF",
+    manual_title: "Manual Entry", ts: "Timestamp", value: "Value", operator: "Operator", remark: "Remark",
+    submit: "Submit", recent: "Recent Entries", events_title: "Event Log", level: "Level", source: "Source",
+    limit: "Limit", no_data: "No data", saved: "Saved", failed: "Operation failed",
+    confirm_delete: "Delete this record?", overwritten: "Existing record at same timestamp was overwritten",
+    trial_fail: "Probe failed", need_login: "Please sign in first", welcome: "Current data mode"
+  }
+};
+const state = { lang: "zh", authed: false, mode: "simulate", editing: {}, latest: [], daily: [], hourly: [] };
+const $ = (id) => document.getElementById(id);
+const t = (key) => (I18N[state.lang] && I18N[state.lang][key]) || key;
+const ALL = "\u5168\u90e8 / ALL";
+
+function toast(message, isError) {
+  const box = $("toast");
+  box.textContent = String(message);
+  box.className = "toast" + (isError ? " error" : "");
+  box.style.display = "block";
+  window.setTimeout(() => { box.style.display = "none"; }, 3200);
+}
+async function api(path, options) {
+  const init = Object.assign({ credentials: "same-origin" }, options || {});
+  if (init.body && typeof init.body !== "string") {
+    init.headers = Object.assign({ "Content-Type": "application/json" }, init.headers || {});
+    init.body = JSON.stringify(init.body);
+  }
+  const response = await fetch(path, init);
+  let payload = {};
+  try { payload = await response.json(); } catch (e) { payload = { ok: false, error: response.statusText }; }
+  if (!response.ok || !payload.ok) {
+    const error = new Error(payload.error || ("HTTP " + response.status));
+    error.status = response.status;
+    throw error;
+  }
+  return payload.data;
+}
+function dayStart(dateText) {
+  if (!dateText) return "";
+  return String(Math.floor(Date.parse(dateText + "T00:00:00Z") / 1000));
+}
+function fmtTime(ts) {
+  if (!ts) return "-";
+  return new Date(Number(ts) * 1000).toLocaleString();
+}
+function esc(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => (
+    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]
+  ));
+}
+
+/* ===== i18n 应用与页签切换 ===== */
+function applyI18n() {
+  document.documentElement.lang = state.lang === "zh" ? "zh-CN" : "en";
+  document.title = t("app_title");
+  document.querySelectorAll("[data-i18n]").forEach((node) => { node.textContent = t(node.dataset.i18n); });
+  document.querySelectorAll("[data-i18n-ph]").forEach((node) => { node.placeholder = t(node.dataset.i18nPh); });
+  $("langBtn").textContent = state.lang === "zh" ? "EN" : "CN";
+  renderModeBadge();
+}
+function renderModeBadge() {
+  const badge = $("modeBadge");
+  badge.textContent = state.mode;
+  badge.className = "badge" + (state.mode === "live" ? " live" : "");
+  $("loginModeHint").textContent = t("welcome") + ": " + state.mode;
+}
+function switchTab(name) {
+  document.querySelectorAll(".tab").forEach((node) => node.classList.remove("active"));
+  document.querySelectorAll("nav button").forEach((node) => node.classList.toggle("active", node.dataset.tab === name));
+  const section = $("tab-" + name);
+  if (section) section.classList.add("active");
+  if (name === "dashboard") loadDashboard();
+  if (name === "config") loadConfig();
+  if (name === "report") loadReport();
+  if (name === "manual") loadManualPage();
+  if (name === "events") loadEvents();
+}
+
+/* ===== SVG 自绘图表 ===== */
+function svgLine(target, points, label) {
+  const width = 620, height = 260, pad = 42;
+  if (!points.length) { target.innerHTML = '<text x="310" y="130" text-anchor="middle" fill="#6b7280">' + esc(t("no_data")) + "</text>"; return; }
+  const values = points.map((p) => Number(p.value) || 0);
+  const max = Math.max.apply(null, values), min = Math.min.apply(null, values);
+  const span = max - min || 1;
+  const stepX = (width - 2 * pad) / Math.max(1, values.length - 1);
+  const coords = values.map((v, i) => [pad + i * stepX, height - pad - ((v - min) / span) * (height - 2 * pad)]);
+  let svg = '<rect width="100%" height="100%" fill="#fff"/>';
+  svg += '<line x1="' + pad + '" y1="' + (height - pad) + '" x2="' + (width - pad) + '" y2="' + (height - pad) + '" stroke="#d8dee9"/>';
+  svg += '<text x="6" y="20" fill="#6b7280" font-size="11">' + esc(max.toFixed(0)) + "</text>";
+  svg += '<text x="6" y="' + (height - pad) + '" fill="#6b7280" font-size="11">' + esc(min.toFixed(0)) + "</text>";
+  svg += '<polyline fill="none" stroke="#1f5fd0" stroke-width="2" points="' + coords.map((c) => c[0].toFixed(1) + "," + c[1].toFixed(1)).join(" ") + '"/>';
+  coords.forEach((c, i) => {
+    svg += '<circle cx="' + c[0].toFixed(1) + '" cy="' + c[1].toFixed(1) + '" r="2.5" fill="#1f5fd0"><title>' + esc(points[i].label) + ": " + esc(points[i].value) + "</title></circle>";
+    if (i === 0 || i === coords.length - 1 || i % Math.ceil(coords.length / 5) === 0) {
+      svg += '<text x="' + c[0].toFixed(1) + '" y="' + (height - pad + 16) + '" text-anchor="middle" fill="#6b7280" font-size="10">' + esc(points[i].label) + "</text>";
+    }
+  });
+  svg += '<text x="' + (width - pad) + '" y="20" text-anchor="end" fill="#6b7280" font-size="11">' + esc(label) + "</text>";
+  target.innerHTML = svg;
+}
+function svgBars(target, items) {
+  const width = 620, height = 260, pad = 42;
+  if (!items.length) { target.innerHTML = '<text x="310" y="130" text-anchor="middle" fill="#6b7280">' + esc(t("no_data")) + "</text>"; return; }
+  const max = Math.max.apply(null, items.map((item) => item.value)) || 1;
+  const slot = (width - 2 * pad) / items.length;
+  let svg = '<rect width="100%" height="100%" fill="#fff"/>';
+  svg += '<line x1="' + pad + '" y1="' + (height - pad) + '" x2="' + (width - pad) + '" y2="' + (height - pad) + '" stroke="#d8dee9"/>';
+  items.forEach((item, i) => {
+    const barHeight = (item.value / max) * (height - 2 * pad);
+    const x = pad + i * slot + slot * 0.2;
+    svg += '<rect x="' + x.toFixed(1) + '" y="' + (height - pad - barHeight).toFixed(1) + '" width="' + (slot * 0.6).toFixed(1) + '" height="' + barHeight.toFixed(1) + '" fill="#1f5fd0"><title>' + esc(item.label) + ": " + esc(item.value) + "</title></rect>";
+    svg += '<text x="' + (x + slot * 0.3).toFixed(1) + '" y="' + (height - pad + 16) + '" text-anchor="middle" fill="#6b7280" font-size="10">' + esc(item.label) + "</text>";
+  });
+  target.innerHTML = svg;
+}
+function svgTable(target, rows, columns) {
+  const width = 900, rowH = 26, colW = width / columns.length;
+  const height = 34 + (rows.length + 1) * rowH;
+  target.setAttribute("viewBox", "0 0 " + width + " " + Math.max(120, height));
+  let svg = '<rect width="100%" height="100%" fill="#fff"/>';
+  columns.forEach((col, i) => {
+    svg += '<rect x="' + (i * colW) + '" y="4" width="' + colW + '" height="' + rowH + '" fill="#3367d6"/>';
+    svg += '<text x="' + (i * colW + 8) + '" y="21" fill="#fff" font-size="11">' + esc(col) + "</text>";
+  });
+  if (!rows.length) {
+    svg += '<text x="450" y="90" text-anchor="middle" fill="#6b7280">' + esc(t("no_data")) + "</text>";
+  } else {
+    rows.forEach((row, r) => {
+      const y = 4 + (r + 1) * rowH;
+      if (r % 2) svg += '<rect x="0" y="' + y + '" width="' + width + '" height="' + rowH + '" fill="#f6f8fb"/>';
+      columns.forEach((col, c) => {
+        svg += '<text x="' + (c * colW + 8) + '" y="' + (y + 17) + '" fill="#1f2937" font-size="11">' + esc(row[col]) + "</text>";
+      });
+    });
+  }
+  target.innerHTML = svg;
+}
+
+/* ===== 通用下拉框 ===== */
+async function fillSelect(select, loader, includeAll, valueKey, textKey) {
+  const items = await loader();
+  select.innerHTML = "";
+  if (includeAll) {
+    const option = document.createElement("option");
+    option.value = ""; option.textContent = ALL;
+    select.appendChild(option);
+  }
+  items.forEach((item) => {
+    const option = document.createElement("option");
+    option.value = String(item[valueKey]); option.textContent = String(item[textKey]);
+    select.appendChild(option);
+  });
+}
+const nodesLoader = async () => (await api("/api/config/node")) || [];
+const purposesLoader = async () => ["total", "production", "hvac", "lighting", "other"].map((p) => ({ id: p, name: p }));
+
+/* ===== 登录 / 看板 ===== */
+async function loadSession() {
+  try {
+    const session = await api("/api/session");
+    state.authed = !!session.authenticated;
+  } catch (e) { state.authed = false; }
+  try {
+    const mode = await api("/api/mode");
+    state.mode = mode.data_mode || "simulate";
+    $("modeSelect").value = state.mode;
+  } catch (e) { state.mode = "simulate"; }
+  renderModeBadge();
+  switchTab(state.authed ? "dashboard" : "login");
+}
+async function loadFilters() {
+  await fillSelect($("dashNode"), nodesLoader, true, "id", "name");
+  await fillSelect($("repNode"), nodesLoader, true, "id", "name");
+  await fillSelect($("dashPurpose"), purposesLoader, true, "id", "name");
+  await fillSelect($("repPurpose"), purposesLoader, true, "id", "name");
+}
+async function doLogin() {
+  try {
+    await api("/api/login", { method: "POST", body: { password: $("password").value } });
+    await loadFilters();
+    await loadSession();
+    toast(t("welcome") + ": " + state.mode);
+  } catch (e) { toast(t("login_fail") + ": " + e.message, true); }
+}
+async function loadDashboard() {
+  if (!state.authed) { switchTab("login"); return; }
+  try {
+    const node = $("dashNode").value, purpose = $("dashPurpose").value;
+    const query = (base) => base + (node ? "&node_id=" + node : "") + (purpose ? "&purpose=" + purpose : "");
+    const [latest, hourly, daily] = await Promise.all([
+      api("/api/latest"), api(query("/api/hourly")), api(query("/api/daily")),
+    ]);
+    state.latest = latest || []; state.hourly = hourly || []; state.daily = daily || [];
+    $("kpiPoints").textContent = String(state.latest.length);
+    $("kpiEnergy").textContent = String(state.daily.reduce((sum, row) => sum + (Number(row.energy_wh) || 0), 0));
+    $("kpiCost").textContent = String(state.daily.reduce((sum, row) => sum + (Number(row.cost_cent) || 0), 0));
+    $("kpiUpdate").textContent = fmtTime(state.latest.length ? state.latest[0].ts : 0);
+    const series = state.hourly.slice().sort((a, b) => a.hour_start - b.hour_start).map((row) => ({
+      label: new Date(row.hour_start * 1000).toISOString().slice(5, 13),
+      value: (Number(row.energy_wh) || 0) / 1000000,
+    }));
+    svgLine($("lineChart"), series, "kWh");
+    const byPurpose = {};
+    state.daily.forEach((row) => {
+      byPurpose[row.purpose || "other"] = (byPurpose[row.purpose || "other"] || 0) + (Number(row.energy_wh) || 0) / 1000000;
+    });
+    svgBars($("barChart"), Object.keys(byPurpose).map((key) => ({ label: key, value: byPurpose[key] })));
+    const table = $("latestTable");
+    table.innerHTML = "<thead><tr><th>ID</th><th>Name</th><th>Value</th><th>Unit</th><th>Quality</th><th>TS</th></tr></thead><tbody>" +
+      (state.latest.length ? state.latest.slice(0, 100).map((row) =>
+        "<tr><td>" + esc(row.point_id) + "</td><td>" + esc(row.name) + "</td><td>" + esc(row.value) +
+        "</td><td>" + esc(row.unit || "") + "</td><td>" + esc(row.quality) + "</td><td>" + esc(fmtTime(row.ts)) + "</td></tr>"
+      ).join("") : '<tr><td colspan="6">' + esc(t("no_data")) + "</td></tr>") + "</tbody>";
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ===== 配置 ===== */
+const RESOURCES = ["node", "device", "point", "energy_category", "meter", "meter_point", "tariff"];
+const FIELDS = {
+  node: ["name", "parent_id", "kind", "sort_order", "is_active", "remark"],
+  device: ["name", "node_id", "protocol", "host", "port", "timeout_ms", "retry", "poll_interval", "is_enabled", "remark"],
+  point: ["name", "device_id", "slave_id", "func_code", "reg_offset", "reg_count", "data_type", "byte_order", "scale", "offset_const", "min_val", "max_val", "unit", "point_role", "is_enabled", "remark"],
+  energy_category: ["name", "unit"],
+  meter: ["name", "node_id", "category_id", "purpose", "is_counted", "daily_8am", "is_enabled", "remark"],
+  meter_point: ["meter_id", "point_id", "role"],
+  tariff: ["name", "price_cent", "start_hour", "end_hour", "is_default"]
+};
+const INT_FIELDS = new Set(["parent_id", "node_id", "category_id", "meter_id", "point_id", "port", "timeout_ms", "retry", "poll_interval", "slave_id", "func_code", "reg_offset", "reg_count", "sort_order", "is_active", "is_enabled", "is_counted", "daily_8am", "price_cent", "start_hour", "end_hour", "is_default"]);
+const FLOAT_FIELDS = new Set(["scale", "offset_const", "min_val", "max_val"]);
+function selectOptions(field) {
+  const map = {
+    protocol: ["modbus_tcp", "modbus_rtu_tcp", "modbus_rtu_serial", "manual"],
+    kind: ["area", "line", "room", "device_area"],
+    data_type: ["u16", "s16", "u32", "s32", "f32", "u64"],
+    byte_order: ["ABCD", "CDAB", "BADC", "DCBA"],
+    point_role: ["energy", "power", "status", "other"],
+    purpose: ["total", "production", "hvac", "lighting", "other"],
+    role: ["reading", "power"]
+  };
+  return map[field] || null;
+}
+function buildForm(resource, record) {
+  const form = $("cfgForm");
+  form.innerHTML = "";
+  (FIELDS[resource] || []).forEach((field) => {
+    const label = document.createElement("label");
+    label.textContent = field;
+    let input;
+    const options = selectOptions(field);
+    if (options) {
+      input = document.createElement("select");
+      options.forEach((option) => {
+        const item = document.createElement("option");
+        item.value = option; item.textContent = option;
+        input.appendChild(item);
+      });
+    } else {
+      input = document.createElement("input");
+      input.type = (field === "remark") ? "text" : "text";
+    }
+    input.dataset.field = field;
+    const value = record && record[field] !== undefined && record[field] !== null ? record[field] : "";
+    input.value = String(value);
+    label.appendChild(input);
+    form.appendChild(label);
+  });
+}
+function readForm(resource) {
+  const body = {};
+  $("cfgForm").querySelectorAll("[data-field]").forEach((input) => {
+    const field = input.dataset.field, raw = input.value.trim();
+    if (INT_FIELDS.has(field)) body[field] = raw === "" ? null : Number.parseInt(raw, 10);
+    else if (FLOAT_FIELDS.has(field)) body[field] = raw === "" ? null : Number.parseFloat(raw);
+    else body[field] = raw === "" ? null : raw;
+  });
+  return body;
+}
+async function loadConfig() {
+  if (!state.authed) { switchTab("login"); return; }
+  const select = $("cfgResource");
+  if (!select.options.length) {
+    RESOURCES.forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name; option.textContent = name;
+      select.appendChild(option);
+    });
+  }
+  const resource = select.value || RESOURCES[0];
+  select.value = resource;
+  try {
+    const rows = await api("/api/config/" + resource);
+    const table = $("cfgTable");
+    const columns = FIELDS[resource] || [];
+    table.innerHTML = "<thead><tr><th>id</th>" + columns.map((c) => "<th>" + esc(c) + "</th>").join("") + "<th>op</th></tr></thead><tbody>" +
+      (rows.length ? rows.map((row) => "<tr><td>" + esc(row.id) + "</td>" +
+        columns.map((c) => "<td>" + esc(row[c]) + "</td>").join("") +
+        '<td><button class="ghost small" data-edit="' + esc(row.id) + '">' + esc(t("edit")) + '</button> ' +
+        '<button class="ghost small danger" data-del="' + esc(row.id) + '">' + esc(t("delete")) + "</button></td></tr>").join("")
+        : '<tr><td colspan="' + (columns.length + 2) + '">' + esc(t("no_data")) + "</td></tr>") + "</tbody>";
+    table.querySelectorAll("[data-edit]").forEach((button) => button.onclick = () => {
+      const record = rows.find((row) => String(row.id) === button.dataset.edit);
+      state.editing[resource] = record.id;
+      buildForm(resource, record);
+    });
+    table.querySelectorAll("[data-del]").forEach((button) => button.onclick = async () => {
+      if (!window.confirm(t("confirm_delete"))) return;
+      try { await api("/api/config/" + resource + "/" + button.dataset.del, { method: "DELETE" });
+            state.editing[resource] = null; buildForm(resource, null); await loadConfig(); toast(t("saved")); }
+      catch (e) { toast(e.message, true); }
+    });
+    if (!state.editing[resource]) buildForm(resource, null);
+    await fillSelect($("trialPoint"), async () => await api("/api/config/point"), false, "id", "name");
+  } catch (e) { toast(e.message, true); }
+}
+async function saveConfig() {
+  const resource = $("cfgResource").value || RESOURCES[0];
+  const body = readForm(resource);
+  const id = state.editing[resource];
+  try {
+    if (id) await api("/api/config/" + resource + "/" + id, { method: "PUT", body: body });
+    else await api("/api/config/" + resource, { method: "POST", body: body });
+    state.editing[resource] = null;
+    buildForm(resource, null);
+    await loadConfig();
+    toast(t("saved"));
+  } catch (e) { toast(e.message, true); }
+}
+async function trialRead() {
+  const id = $("trialPoint").value;
+  if (!id) { toast(t("need_login"), true); return; }
+  try {
+    const result = await api("/api/point/" + id + "/read", { method: "POST" });
+    $("trialResult").textContent = JSON.stringify(result, null, 2);
+  } catch (e) { $("trialResult").textContent = t("trial_fail") + ": " + e.message; toast(e.message, true); }
+}
+async function doSwitchMode() {
+  try {
+    const result = await api("/api/mode/switch", { method: "POST", body: { data_mode: $("modeSelect").value } });
+    state.mode = result.data_mode;
+    renderModeBadge();
+    toast(t("restart_hint"));
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ===== 报表 ===== */
+function reportQuery() {
+  const params = [];
+  const node = $("repNode").value, purpose = $("repPurpose").value;
+  if ($("repFrom").value) params.push("from=" + dayStart($("repFrom").value));
+  if ($("repTo").value) params.push("to=" + dayStart($("repTo").value));
+  if (node) params.push("node_id=" + node);
+  if (purpose) params.push("purpose=" + encodeURIComponent(purpose));
+  return params.join("&");
+}
+async function loadReport() {
+  if (!state.authed) { switchTab("login"); return; }
+  const kind = $("repKind").value;
+  const query = reportQuery();
+  try {
+    const rows = await api("/api/" + kind + (query ? "?" + query : ""));
+    const columns = ["period_start", "meter_name", "purpose", "node_name", "energy_wh", "cost_cent", "is_final"];
+    const display = rows.map((row) => ({
+      period_start: fmtTime(row.period_start || row.day_start).slice(0, 16),
+      meter_name: row.meter_name || "", purpose: row.purpose || "",
+      node_name: row.node_name || "", energy_wh: row.energy_wh || 0,
+      cost_cent: row.cost_cent || 0, is_final: row.is_final || 0
+    }));
+    svgTable($("repPreview"), display, columns);
+  } catch (e) { toast(e.message, true); }
+}
+async function exportReport(fmt) {
+  const kind = $("repKind").value;
+  const query = reportQuery();
+  const params = ["kind=" + kind, "fmt=" + fmt];
+  if (query) params.push(query);
+  try {
+    const response = await fetch("/api/report/export?" + params.join("&"), { credentials: "same-origin" });
+    if (!response.ok) {
+      let body = {}; try { body = await response.json(); } catch (e) {}
+      throw new Error(body.error || ("HTTP " + response.status));
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "energy-" + kind + "." + fmt;
+    document.body.appendChild(anchor); anchor.click(); document.body.removeChild(anchor);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ===== 手动录入 ===== */
+async function loadManualPage() {
+  if (!state.authed) { switchTab("login"); return; }
+  try {
+    const points = await api("/api/config/point");
+    const select = $("manPoint");
+    select.innerHTML = "";
+    points.forEach((point) => {
+      const option = document.createElement("option");
+      option.value = String(point.id); option.textContent = String(point.name);
+      select.appendChild(option);
+    });
+    const preferred = points.find((point) => String(point.name).indexOf("机械排水") >= 0);
+    if (preferred) select.value = String(preferred.id);
+    if (!$("manTs").value) {
+      const now = new Date(Date.now() - new Date().getTimezoneOffset() * 60000);
+      $("manTs").value = now.toISOString().slice(0, 16);
+    }
+    await loadManualList();
+  } catch (e) { toast(e.message, true); }
+}
+async function loadManualList() {
+  try {
+    const rows = await api("/api/manual?limit=100");
+    const table = $("manTable");
+    table.innerHTML = "<thead><tr><th>id</th><th>point</th><th>ts</th><th>value</th><th>operator</th><th>remark</th></tr></thead><tbody>" +
+      (rows.length ? rows.map((row) => "<tr><td>" + esc(row.id) + "</td><td>" + esc(row.point_name || row.point_id) +
+        "</td><td>" + esc(fmtTime(row.ts)) + "</td><td>" + esc(row.value) + "</td><td>" + esc(row.operator) +
+        "</td><td>" + esc(row.remark || "") + "</td></tr>").join("")
+        : '<tr><td colspan="6">' + esc(t("no_data")) + "</td></tr>") + "</tbody>";
+  } catch (e) { toast(e.message, true); }
+}
+async function submitManual() {
+  const body = {
+    point_id: Number($("manPoint").value),
+    ts: Math.floor(Date.parse($("manTs").value) / 1000),
+    value: Number($("manValue").value),
+    operator: $("manOperator").value.trim(),
+    remark: $("manRemark").value.trim()
+  };
+  if (!body.point_id || !body.ts || !body.operator) { toast(t("failed"), true); return; }
+  try {
+    const result = await api("/api/manual", { method: "POST", body: body });
+    toast(t("saved") + (result.overwritten ? " / " + t("overwritten") : ""));
+    await loadManualList();
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ===== 事件日志 ===== */
+async function loadEvents() {
+  if (!state.authed) { switchTab("login"); return; }
+  const params = [];
+  if ($("evLevel").value) params.push("level=" + $("evLevel").value);
+  if ($("evSource").value) params.push("source=" + $("evSource").value);
+  params.push("limit=" + ($("evLimit").value || 100));
+  try {
+    const rows = await api("/api/events?" + params.join("&"));
+    const table = $("evTable");
+    table.innerHTML = "<thead><tr><th>id</th><th>ts</th><th>level</th><th>source</th><th>code</th><th>message</th></tr></thead><tbody>" +
+      (rows.length ? rows.map((row) => "<tr><td>" + esc(row.id) + "</td><td>" + esc(fmtTime(row.ts)) +
+        "</td><td>" + esc(row.level) + "</td><td>" + esc(row.source) + "</td><td>" + esc(row.code || "") +
+        "</td><td>" + esc(row.message) + "</td></tr>").join("")
+        : '<tr><td colspan="6">' + esc(t("no_data")) + "</td></tr>") + "</tbody>";
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ===== 事件绑定与启动 ===== */
+function bind() {
+  $("langBtn").onclick = () => {
+    state.lang = state.lang === "zh" ? "en" : "zh";
+    applyI18n();
+    const active = document.querySelector("nav button.active");
+    if (active) switchTab(active.dataset.tab);
+  };
+  document.querySelectorAll("nav button").forEach((button) => {
+    button.onclick = () => {
+      if (button.dataset.tab !== "login" && !state.authed) { toast(t("need_login"), true); switchTab("login"); return; }
+      switchTab(button.dataset.tab);
+    };
+  });
+  $("loginBtn").onclick = doLogin;
+  $("password").onkeydown = (event) => { if (event.key === "Enter") doLogin(); };
+  $("logoutBtn").onclick = async () => {
+    try { await api("/api/logout", { method: "POST" }); } catch (e) {}
+    state.authed = false; switchTab("login");
+  };
+  $("dashRefresh").onclick = loadDashboard;
+  $("cfgRefresh").onclick = loadConfig;
+  $("cfgResource").onchange = () => { state.editing = {}; loadConfig(); };
+  $("cfgSave").onclick = saveConfig;
+  $("cfgNew").onclick = () => buildForm($("cfgResource").value || RESOURCES[0], null);
+  $("trialBtn").onclick = trialRead;
+  $("modeSwitchBtn").onclick = doSwitchMode;
+  $("repLoad").onclick = loadReport;
+  $("repXlsx").onclick = () => exportReport("xlsx");
+  $("repPdf").onclick = () => exportReport("pdf");
+  $("manSubmit").onclick = submitManual;
+  $("evRefresh").onclick = loadEvents;
+}
+async function init() {
+  try {
+    await loadFilters();
+  } catch (e) { toast(e.message, true); }
+  applyI18n();
+  bind();
+  await loadSession();
+}
+init();
+</script>
+</body>
+</html>

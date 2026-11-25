@@ -1,0 +1,307 @@
+"""配置后台 API：7 类资源 CRUD、点位试读、设备连接测试、事件日志、采集热生效。
+
+全部路由挂 require_auth 依赖；成功 {ok:true,data?}，失败 {ok:false,error} + 状态码。
+"""
+from __future__ import annotations
+
+import time
+from typing import Any, Callable, Coroutine
+
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+
+import db
+from auth import require_auth
+from collector import collector
+from modbus import ModbusClient, ModbusError
+from schemas import (
+    DeviceIn,
+    EnergyCategoryIn,
+    MeterIn,
+    MeterPointIn,
+    NodeIn,
+    PointIn,
+    TariffIn,
+    fail,
+    ok,
+    validate_point,
+)
+from settings import DEFAULT_TIMEOUT_MS, PROBE_TIMEOUT_MS, RESOURCES
+
+router = APIRouter(prefix="/api", tags=["config"], dependencies=[Depends(require_auth)])
+
+MODEL_MAP: dict[str, type[BaseModel]] = {
+    "node": NodeIn,
+    "device": DeviceIn,
+    "point": PointIn,
+    "energy_category": EnergyCategoryIn,
+    "meter": MeterIn,
+    "meter_point": MeterPointIn,
+    "tariff": TariffIn,
+}
+
+
+class ConfigService:
+    """配置资源服务层：通用 CRUD + 点位校验 + 设备连接测试。"""
+
+    @staticmethod
+    def _check_resource(resource: str) -> None:
+        if resource not in RESOURCES:
+            raise ValueError(
+                f"不支持的资源: {resource}，可选 {', '.join(sorted(RESOURCES))}"
+            )
+
+    @staticmethod
+    def _id_col(resource: str) -> str:
+        # meter_point 为复合主键表，用隐式 rowid 作为对外 id
+        return "rowid" if resource == "meter_point" else "id"
+
+    @staticmethod
+    def _cols(resource: str) -> str:
+        return "rowid AS id, meter_id, point_id, role" if resource == "meter_point" else "*"
+
+    @staticmethod
+    def _order(resource: str) -> str:
+        if resource == "meter_point":
+            return " ORDER BY meter_id, point_id, role"
+        return " ORDER BY id"
+
+    def list(self, resource: str) -> list[dict[str, Any]]:
+        """列出某资源的全部记录。"""
+        self._check_resource(resource)
+        rows = db.query(f"SELECT {self._cols(resource)} FROM {resource}{self._order(resource)}")
+        return [dict(row) for row in rows]
+
+    def get(self, resource: str, item_id: int) -> dict[str, Any]:
+        """按 id 读取单条记录。"""
+        self._check_resource(resource)
+        row = db.query_one(
+            f"SELECT {self._cols(resource)} FROM {resource} WHERE {self._id_col(resource)}=?",
+            (int(item_id),),
+        )
+        if row is None:
+            raise LookupError(f"{resource} id={item_id} 不存在")
+        return dict(row)
+
+    def create(self, resource: str, body: dict[str, Any]) -> dict[str, Any]:
+        """新增记录；point 保存时执行硬性校验。"""
+        self._check_resource(resource)
+        data: dict[str, Any] = MODEL_MAP[resource](**body).model_dump()
+        if resource == "point":
+            validate_point(data)
+        columns: list[str] = list(data.keys())
+        placeholders: str = ", ".join("?" for _ in columns)
+        sql: str = (
+            f"INSERT INTO {resource} ({', '.join(columns)}) VALUES ({placeholders})"
+        )
+        new_id: int = db.execute(sql, tuple(data[column] for column in columns))
+        if resource in ("device", "point"):
+            collector.reload()  # 采集配置变更热生效
+        return self.get(resource, new_id)
+
+    def update(self, resource: str, item_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        """局部更新记录；point 校验时排除自身 id 的区间。"""
+        self._check_resource(resource)
+        old: dict[str, Any] = self.get(resource, item_id)
+        merged: dict[str, Any] = dict(old)
+        merged.update(body)
+        data: dict[str, Any] = MODEL_MAP[resource](**merged).model_dump()
+        if resource == "point":
+            validate_point(merged, exclude_id=int(item_id))
+
+        fields: dict[str, Any] = {
+            key: value for key, value in data.items() if key in body and key != "id"
+        }
+        if fields:
+            assignments: str = ", ".join(f"{key}=?" for key in fields)
+            db.execute(
+                f"UPDATE {resource} SET {assignments} WHERE {self._id_col(resource)}=?",
+                (*fields.values(), int(item_id)),
+            )
+        if resource in ("device", "point"):
+            collector.reload()
+        return self.get(resource, item_id)
+
+    def delete(self, resource: str, item_id: int) -> bool:
+        """删除记录；device/point 删除后触发采集重载。"""
+        self._check_resource(resource)
+        self.get(resource, item_id)  # 不存在则抛 LookupError -> 404
+        db.execute(
+            f"DELETE FROM {resource} WHERE {self._id_col(resource)}=?", (int(item_id),)
+        )
+        if resource in ("device", "point"):
+            collector.reload()
+        return True
+
+    async def test_device(self, device_id: int) -> dict[str, Any]:
+        """连接测试：有点位则实际读一次寄存器，无点位仅做 TCP 连接。"""
+        row: Any = db.query_one("SELECT * FROM device WHERE id=?", (int(device_id),))
+        if row is None:
+            raise LookupError(f"device id={device_id} 不存在")
+        device: dict[str, Any] = dict(row)
+        timeout_ms: int = min(
+            int(device.get("timeout_ms") or DEFAULT_TIMEOUT_MS), PROBE_TIMEOUT_MS
+        )
+        client = ModbusClient(str(device["host"]), int(device.get("port") or 502), timeout_ms, 0)
+        started: float = time.monotonic()
+        try:
+            point_row: Any = db.query_one(
+                "SELECT * FROM point WHERE device_id=? AND is_enabled=1 ORDER BY id LIMIT 1",
+                (int(device_id),),
+            )
+            if point_row is None:
+                await client.connect()  # 无点位：只验证 TCP 可达
+                registers: list[int] = []
+                message: str = "TCP 连接成功（该设备未配置点位，未读取寄存器）"
+            else:
+                point: dict[str, Any] = dict(point_row)
+                registers = await client.read_registers(
+                    int(point["slave_id"]), int(point["func_code"]),
+                    int(point["reg_offset"]), int(point["reg_count"]),
+                )
+                message = f"读取成功，返回 {len(registers)} 个寄存器"
+            db.execute(
+                "UPDATE device SET last_ok_at=?, last_error=NULL WHERE id=?",
+                (int(time.time()), int(device_id)),
+            )
+        except (ModbusError, OSError, ValueError) as exc:
+            db.execute(
+                "UPDATE device SET last_error=? WHERE id=?", (str(exc), int(device_id))
+            )
+            db.log_event("error", "api", "DEVICE_TEST_FAIL", str(exc), int(device_id))
+            raise RuntimeError(f"设备连接测试失败: {exc}") from exc
+        finally:
+            await client.close()
+
+        return {
+            "device_id": int(device_id),
+            "ok": True,
+            "message": message,
+            "raw_regs": registers,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+
+
+config_service: ConfigService = ConfigService()
+
+
+def _err_text(exc: Exception) -> str:
+    """Pydantic 错误只取首条简明信息，避免把模型内部细节暴露给前端。"""
+    if isinstance(exc, ValidationError):
+        errors: list[dict[str, Any]] = exc.errors()
+        if errors:
+            return str(errors[0].get("msg", str(exc)))
+    return str(exc)
+
+
+def _run(action: Callable[[], Any]) -> Any:
+    """同步动作统一错误映射。"""
+    try:
+        return ok(action())
+    except LookupError as exc:
+        return fail(str(exc), 404)
+    except (ValueError, TypeError, ValidationError) as exc:
+        return fail(_err_text(exc), 400)
+    except RuntimeError as exc:
+        return fail(str(exc), 502)
+    except Exception as exc:
+        return fail(f"操作失败: {exc}", 500)
+
+
+async def _arun(action: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
+    """异步动作统一错误映射。"""
+    try:
+        return ok(await action())
+    except LookupError as exc:
+        return fail(str(exc), 404)
+    except (ValueError, TypeError, ValidationError) as exc:
+        return fail(_err_text(exc), 400)
+    except RuntimeError as exc:
+        return fail(str(exc), 502)
+    except Exception as exc:
+        return fail(f"操作失败: {exc}", 500)
+
+
+@router.get("/config/{resource}")
+def list_config(resource: str) -> Any:
+    """GET /api/config/{resource}：资源列表。"""
+    return _run(lambda: config_service.list(resource))
+
+
+@router.get("/config/{resource}/{item_id}")
+def get_config(resource: str, item_id: int) -> Any:
+    """GET /api/config/{resource}/{id}：单条详情。"""
+    return _run(lambda: config_service.get(resource, item_id))
+
+
+@router.post("/config/{resource}")
+def create_config(resource: str, body: dict[str, Any]) -> Any:
+    """POST /api/config/{resource}：新增（point 自动校验）。"""
+    return _run(lambda: config_service.create(resource, body))
+
+
+@router.put("/config/{resource}/{item_id}")
+def update_config(
+    resource: str, item_id: int, body: dict[str, Any]
+) -> Any:
+    """PUT /api/config/{resource}/{id}：更新（point 校验 + 热生效）。"""
+    return _run(lambda: config_service.update(resource, item_id, body))
+
+
+@router.delete("/config/{resource}/{item_id}")
+def delete_config(resource: str, item_id: int) -> Any:
+    """DELETE /api/config/{resource}/{id}：删除。"""
+    return _run(lambda: config_service.delete(resource, item_id))
+
+
+@router.post("/point/{item_id}/read")
+async def read_point(item_id: int) -> Any:
+    """POST /api/point/{id}/read：试读原始寄存器与解析值。"""
+    return await _arun(lambda: collector.probe_point(item_id))
+
+
+@router.post("/device/{item_id}/test")
+async def test_device(item_id: int) -> Any:
+    """POST /api/device/{id}/test：设备连接测试。"""
+    return await _arun(lambda: config_service.test_device(item_id))
+
+
+@router.post("/collector/reload")
+def reload_collector() -> Any:
+    """POST /api/collector/reload：采集配置热生效。"""
+    def action() -> bool:
+        collector.reload()
+        return True
+
+    return _run(action)
+
+
+@router.get("/events")
+def list_events(
+    level: str | None = None,
+    source: str | None = None,
+    since: int | None = None,
+    limit: int = 100,
+) -> Any:
+    """GET /api/events：事件日志（level/source/since/limit 过滤）。"""
+    def action() -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if level:
+            conditions.append("level=?")
+            params.append(level)
+        if source:
+            conditions.append("source=?")
+            params.append(source)
+        if since is not None:
+            conditions.append("ts>=?")
+            params.append(int(since))
+        sql: str = "SELECT * FROM event_log"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        return [dict(row) for row in db.query(sql, tuple(params))]
+
+    return _run(action)
