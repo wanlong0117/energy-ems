@@ -14,9 +14,38 @@ import db
 from aggregation import aggregator
 from auth import require_auth
 from schemas import SettleIn, fail, ok
-from settings import DATA_MODE_DEFAULT, SECONDS_PER_DAY, day_floor
+from settings import (
+    DATA_MODE_DEFAULT,
+    QUERY_DAILY_DEFAULT_DAYS,
+    QUERY_HOURLY_DEFAULT_DAYS,
+    QUERY_MAX_ROWS,
+    SECONDS_PER_DAY,
+    day_floor,
+)
 
 router = APIRouter(prefix="/api", tags=["data"], dependencies=[Depends(require_auth)])
+
+
+def _window(
+    from_ts: int | None, to_ts: int | None, default_days: int | None
+) -> tuple[int | None, int | None]:
+    """把「可选的 from/to」收敛成时间窗；default_days=None 表示不做默认收敛。
+
+    接口层必须给缺省窗——不该有「不传参数就返回全表」的默认行为：100 块表一年
+    会产出 87 万行 hourly（约 180 MB），一次请求就能把工控机拖死。
+    报表服务层反过来要 None：它拿到的窗由调用方（api_report）算好，再套一层
+    默认窗会把「查全量做年报到月报」的历史数据裁掉。
+    """
+    if default_days is None:
+        return (
+            int(from_ts) if from_ts is not None else None,
+            int(to_ts) if to_ts is not None else None,
+        )
+    end: int = int(to_ts) if to_ts is not None else int(time.time())
+    start: int = (
+        int(from_ts) if from_ts is not None else end - int(default_days) * SECONDS_PER_DAY
+    )
+    return start, end
 
 
 class DataService:
@@ -52,19 +81,25 @@ class DataService:
         to_ts: int | None = None,
         purpose: str | None = None,
         node_id: int | None = None,
+        default_days: int | None = QUERY_HOURLY_DEFAULT_DAYS,
     ) -> list[dict[str, Any]]:
-        """小时汇总：meter_id / 时间窗 / purpose / node_id 过滤。"""
+        """小时汇总：meter_id / 时间窗 / purpose / node_id 过滤。
+
+        时间窗必填化：缺省为最近 QUERY_HOURLY_DEFAULT_DAYS 天，并按
+        hour_start 倒序截断到 QUERY_MAX_ROWS 行。
+        """
+        start, end = _window(from_ts, to_ts, default_days)
         conditions: list[str] = []
         params: list[Any] = []
+        if start is not None:
+            conditions.append("h.hour_start>=?")
+            params.append(start)
+        if end is not None:
+            conditions.append("h.hour_start<=?")
+            params.append(end)
         if meter_id is not None:
             conditions.append("h.meter_id=?")
             params.append(int(meter_id))
-        if from_ts is not None:
-            conditions.append("h.hour_start>=?")
-            params.append(int(from_ts))
-        if to_ts is not None:
-            conditions.append("h.hour_start<=?")
-            params.append(int(to_ts))
         if purpose:
             conditions.append("m.purpose=?")
             params.append(purpose)
@@ -78,8 +113,16 @@ class DataService:
         )
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY h.hour_start DESC, h.meter_id"
-        return [dict(row) for row in db.query(sql, tuple(params))]
+        sql += " ORDER BY h.hour_start DESC, h.meter_id LIMIT ?"
+        params.append(QUERY_MAX_ROWS + 1)
+        rows = db.query(sql, tuple(params))
+        if len(rows) > QUERY_MAX_ROWS:
+            db.log_event_throttled(
+                "warn", "api", "QUERY_TRUNCATED",
+                f"/api/hourly 命中行数超过 {QUERY_MAX_ROWS}，已按时间倒序截断，请缩小时间范围",
+            )
+            rows = rows[:QUERY_MAX_ROWS]
+        return [dict(row) for row in rows]
 
     @staticmethod
     def daily(
@@ -89,19 +132,21 @@ class DataService:
         purpose: str | None = None,
         node_id: int | None = None,
         is_final: int | None = None,
+        default_days: int | None = QUERY_DAILY_DEFAULT_DAYS,
     ) -> list[dict[str, Any]]:
-        """日汇总：在小时过滤项基础上增加 is_final 过滤。"""
+        """日汇总：在小时过滤项基础上增加 is_final 过滤；缺省时间窗同 hourly 逻辑。"""
+        start, end = _window(from_ts, to_ts, default_days)
         conditions: list[str] = []
         params: list[Any] = []
+        if start is not None:
+            conditions.append("d.day_start>=?")
+            params.append(day_floor(start))
+        if end is not None:
+            conditions.append("d.day_start<=?")
+            params.append(int(end))
         if meter_id is not None:
             conditions.append("d.meter_id=?")
             params.append(int(meter_id))
-        if from_ts is not None:
-            conditions.append("d.day_start>=?")
-            params.append(int(from_ts))
-        if to_ts is not None:
-            conditions.append("d.day_start<=?")
-            params.append(int(to_ts))
         if purpose:
             conditions.append("m.purpose=?")
             params.append(purpose)
@@ -118,8 +163,16 @@ class DataService:
         )
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY d.day_start DESC, d.meter_id"
-        return [dict(row) for row in db.query(sql, tuple(params))]
+        sql += " ORDER BY d.day_start DESC, d.meter_id LIMIT ?"
+        params.append(QUERY_MAX_ROWS + 1)
+        rows = db.query(sql, tuple(params))
+        if len(rows) > QUERY_MAX_ROWS:
+            db.log_event_throttled(
+                "warn", "api", "QUERY_TRUNCATED",
+                f"/api/daily 命中行数超过 {QUERY_MAX_ROWS}，已按时间倒序截断，请缩小时间范围",
+            )
+            rows = rows[:QUERY_MAX_ROWS]
+        return [dict(row) for row in rows]
 
 
 data_service: DataService = DataService()
@@ -207,13 +260,19 @@ def monthly(
 
 @router.get("/mode")
 def mode() -> Any:
-    """GET /api/mode：返回当前 data_mode（登录页只读展示；需登录）。"""
+    """GET /api/mode：返回当前 data_mode 与「今日」起点（登录页只读展示；需登录）。
+
+    一并回 today_start，让看板不必自己算日切点——日切点可配（默认本地 08:00），
+    前端算错了就会出现「KPI 跨了两个统计日」的诡异现象。
+    """
     try:
         config: dict[str, Any] = auth.load_config()
         return ok({
             "data_mode": str(config.get("data_mode", DATA_MODE_DEFAULT)),
             "simulate_interval_sec": int(config.get("simulate_interval_sec", 300)),
             "simulate_rollup_sec": int(config.get("simulate_rollup_sec", 600)),
+            "today_start": day_floor(time.time()),
+            "now": int(time.time()),
         })
     except Exception as exc:
         return _internal("MODE_QUERY_FAIL", "查询数据模式", exc)

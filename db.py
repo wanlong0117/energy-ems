@@ -120,3 +120,38 @@ def log_event(
         "INSERT INTO event_log (ts, level, source, code, message, ref_id) VALUES (?,?,?,?,?,?)",
         (int(time.time()), level, source, code, message, ref_id),
     )
+
+
+# 节流状态：key = code|ref_id -> 上次落库时刻（单调时钟）与期间被折叠的条数
+_log_throttle_at: dict[str, float] = {}
+_log_suppressed: dict[str, int] = {}
+
+
+def log_event_throttled(
+    level: str,
+    source: str,
+    code: str,
+    message: str,
+    ref_id: int | None = None,
+    window_sec: int | None = None,
+) -> None:
+    """同 (code, ref_id) 在窗口内只落一条，其余折叠计数并在下次落库时说明。
+
+    采集失败、任务复活、查询截断这类事件在故障状态下是「每秒一条」的量级，
+    event_log 上限 2 万条，几小时就能把真正的审计证据冲掉。折叠不改语义，
+    只是把「连续 N 次同类」压成一条可读记录。
+    """
+    from settings import EVENT_LOG_THROTTLE_SEC  # 局部导入，避免 settings <-> db 循环
+
+    span: int = int(window_sec if window_sec is not None else EVENT_LOG_THROTTLE_SEC)
+    key: str = f"{code}|{ref_id if ref_id is not None else '-'}"
+    now: float = time.monotonic()
+    last: float | None = _log_throttle_at.get(key)
+    if last is not None and now - last < span:
+        _log_suppressed[key] = _log_suppressed.get(key, 0) + 1
+        return
+    folded: int = _log_suppressed.pop(key, 0)
+    _log_throttle_at[key] = now
+    if folded:
+        message = f"{message}（此前 {span}s 内另有 {folded} 次同类事件已折叠）"
+    log_event(level, source, code, message, ref_id)

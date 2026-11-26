@@ -1,8 +1,8 @@
-# 运行时依赖：全部锁定到具体版本，避免 Windows 打包与现场部署时漂移
+# 运行时依赖：全部锁定到具体版本，避免 Windows 打包与现场部署时漂移。
+# 只放程序运行需要的东西；PyInstaller 属构建期工具，见 requirements-build.txt。
 fastapi==0.165.0
 uvicorn==0.54.0
 pydantic==2.14.4
 openpyxl==3.1.5
 reportlab==5.1.1
 pyserial==3.5
-pyinstaller==6.22.3

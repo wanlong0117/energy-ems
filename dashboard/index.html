@@ -264,7 +264,7 @@
     </nav>
     <div class="sidebar-foot">
       <div class="mode-row"><span class="status-dot"></span><span id="modeBadge" class="badge">simulate</span></div>
-      <div class="ver">v0.1.2 · MIT</div>
+      <div class="ver">v0.1.3 · MIT</div>
     </div>
   </aside>
   <div class="shell">
@@ -318,12 +318,12 @@
           <div class="kpi-value" id="kpiPoints">0</div><div class="kpi-foot">ONLINE POINTS</div>
         </div>
         <div class="kpi">
-          <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_energy">区间电量(kWh)</span>
+          <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_energy">今日电量(kWh)</span>
             <span class="kpi-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12l1-8.5Z"/></svg></span></div>
           <div class="kpi-value" id="kpiEnergy">0.00</div><div class="kpi-foot">ENERGY · kWh</div>
         </div>
         <div class="kpi">
-          <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_cost">区间电费(元)</span>
+          <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_cost">今日电费(元)</span>
             <span class="kpi-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19V5M4 19h16"/><path d="M8 15v-4M12 15V8M16 15v-6"/></svg></span>
           </div>
           <div class="kpi-value" id="kpiCost">0.00</div><div class="kpi-foot">COST · CNY</div>
@@ -337,7 +337,7 @@
     </div>
     <div class="grid charts">
       <div class="card">
-        <div class="card-head"><h3 data-i18n="trend_hour">小时电量趋势</h3><span class="chip">kWh · 24H</span></div>
+        <div class="card-head"><h3 data-i18n="trend_hour">小时电量趋势</h3><span class="chip">kWh · 48H</span></div>
         <svg id="lineChart" viewBox="0 0 620 260"></svg>
       </div>
       <div class="card">
@@ -461,7 +461,7 @@ const I18N = {
     tab_config: "配置", tab_report: "报表", tab_manual: "手动录入", tab_events: "事件日志",
     login_title: "登录", password: "密码", login_btn: "登录", login_fail: "登录失败",
     dash_overview: "实时概览", refresh: "刷新", node_filter: "节点", purpose_filter: "用途",
-    kpi_points: "最新点位", kpi_energy: "区间电量(kWh)", kpi_cost: "区间电费(元)", kpi_update: "最新时间",
+    kpi_points: "最新点位", kpi_energy: "今日电量(kWh)", kpi_cost: "今日电费(元)", kpi_update: "最新时间",
     trend_hour: "小时电量趋势", trend_purpose: "按用途日汇总", latest_table: "最新读数",
     rep_period: "期间", rep_meter: "计量表", rep_purpose_col: "用途", rep_node: "节点",
     rep_energy: "电量(kWh)", rep_cost: "电费(元)", rep_final: "已结算",
@@ -486,7 +486,7 @@ const I18N = {
     tab_config: "Config", tab_report: "Reports", tab_manual: "Manual Entry", tab_events: "Event Log",
     login_title: "Login", password: "Password", login_btn: "Sign in", login_fail: "Login failed",
     dash_overview: "Live Overview", refresh: "Refresh", node_filter: "Node", purpose_filter: "Purpose",
-    kpi_points: "Latest Points", kpi_energy: "Energy (kWh)", kpi_cost: "Cost (CNY)", kpi_update: "Last Update",
+    kpi_points: "Latest Points", kpi_energy: "Energy Today (kWh)", kpi_cost: "Cost Today (CNY)", kpi_update: "Last Update",
     trend_hour: "Hourly Energy Trend", trend_purpose: "Daily Energy by Purpose", latest_table: "Latest Readings",
     rep_period: "Period", rep_meter: "Meter", rep_purpose_col: "Purpose", rep_node: "Node",
     rep_energy: "Energy (kWh)", rep_cost: "Cost (CNY)", rep_final: "Settled",
@@ -510,7 +510,7 @@ const I18N = {
   }
 };
 const state = { lang: "zh", authed: false, mode: "simulate", mustChangePassword: false,
-                editing: {}, latest: [], daily: [], hourly: [] };
+                editing: {}, latest: [], daily: [], hourly: [], todayStart: 0 };
 const $ = (id) => document.getElementById(id);
 const t = (key) => (I18N[state.lang] && I18N[state.lang][key]) || key;
 const ALL = "\u5168\u90e8 / ALL";
@@ -725,8 +725,10 @@ async function loadSession() {
   try {
     const mode = await api("/api/mode");
     state.mode = mode.data_mode || "simulate";
+    // 日切点由后端给（默认本地 08:00 且可配），前端不要自己按 00:00 算
+    state.todayStart = Number(mode.today_start) || 0;
     $("modeSelect").value = state.mode;
-  } catch (e) { state.mode = "simulate"; }
+  } catch (e) { state.mode = "simulate"; state.todayStart = 0; }
   renderModeBadge();
   $("logoutBtn").style.display = state.authed ? "" : "none";
   if (state.authed && state.mustChangePassword) {
@@ -787,9 +789,16 @@ async function loadDashboard() {
   if (!state.authed) { switchTab("login"); return; }
   try {
     const node = $("dashNode").value, purpose = $("dashPurpose").value;
-    const query = (base) => base + (node ? "&node_id=" + node : "") + (purpose ? "&purpose=" + purpose : "");
+    const now = Math.floor(Date.now() / 1000);
+    // 「今日」按后端日切点算；趋势看最近 48 小时。前端显式传时间窗，
+    // 否则接口会退回自己的默认窗（3/90 天），KPI 就变成"全部历史求和"。
+    const today = state.todayStart || (now - 86400);
+    const query = (base, from, to) => base + "?from=" + from + "&to=" + to +
+      (node ? "&node_id=" + node : "") + (purpose ? "&purpose=" + purpose : "");
     const [latest, hourly, daily] = await Promise.all([
-      api("/api/latest"), api(query("/api/hourly")), api(query("/api/daily")),
+      api("/api/latest"),
+      api(query("/api/hourly", today - 86400, now)),
+      api(query("/api/daily", today, now)),
     ]);
     state.latest = latest || []; state.hourly = hourly || []; state.daily = daily || [];
     const fmt = (value) => Number(value || 0).toLocaleString("en-US");

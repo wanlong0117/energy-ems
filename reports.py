@@ -32,12 +32,25 @@ KEYS: tuple[str, ...] = (
 )
 COLUMN_WIDTHS_MM: tuple[float, ...] = (32.0, 46.0, 28.0, 32.0, 30.0, 26.0, 30.0, 22.0)
 
-# 报表页脚固定说明：先让人判断这张表能不能用，再判断数字对不对
-FOOTNOTE: str = (
-    "说明：日汇总口径为本地 08:00 至次日 08:00（期间列为区间起点）；"
-    "电量单位 kWh、电费单位 元，均已按两位小数折算；"
-    "“已结算=否”表示该期数据未达完整度门槛，仅供参考。"
-)
+def footnote() -> str:
+    """报表页脚说明：日切点可配，文案必须跟着配置走，不能写死 08:00。
+
+    先让人判断这张表能不能用，再判断数字对不对——所以「已结算=否」的含义
+    必须写在报表上，否则拿报表对账的人会把它当最终数。
+    """
+    from settings import DAY_START_LOCAL_HOUR
+
+    start: int = int(DAY_START_LOCAL_HOUR)
+    end: int = (start + 24) % 24
+    return (
+        f"说明：日汇总口径为本地 {start:02d}:00 至次日 {end:02d}:00（期间列为区间起点）；"
+        "电量单位 kWh、电费单位 元，均已按两位小数折算；"
+        "“已结算=否”表示该期数据未达完整度门槛，仅供参考。"
+    )
+
+
+# 兼容旧引用；运行期请调用 footnote()，它会读取当前配置的日切点
+FOOTNOTE: str = footnote()
 
 KIND_TITLES: dict[str, str] = {
     "daily": "日能耗报表 / Daily Energy Report",
@@ -60,6 +73,9 @@ class ReportService:
                 purpose=options.get("purpose"),
                 node_id=options.get("node_id"),
                 is_final=options.get("is_final"),
+                # 报表服务不套默认窗：时间范围由调用方（api_report）算好并显式传入，
+                # 再收敛一次会把「不传范围查全量」的场景裁成最近 90 天
+                default_days=None,
             )
             return self._normalize(raw, "daily")
         if kind == "weekly":
@@ -170,7 +186,7 @@ class ReportService:
         sheet.merge_cells(
             start_row=note_idx, start_column=1, end_row=note_idx, end_column=len(HEADERS)
         )
-        note_cell = sheet.cell(row=note_idx, column=1, value=FOOTNOTE)
+        note_cell = sheet.cell(row=note_idx, column=1, value=footnote())
         note_cell.font = Font(size=9, color="666666")
         note_cell.alignment = Alignment(wrap_text=True, vertical="top")
         sheet.row_dimensions[note_idx].height = 32
@@ -276,7 +292,7 @@ class ReportService:
         )
         document_items: list[Any] = [
             Paragraph(title, title_style), Spacer(1, 4 * mm), table,
-            Spacer(1, 3 * mm), Paragraph(FOOTNOTE, note_style),
+            Spacer(1, 3 * mm), Paragraph(footnote(), note_style),
         ]
         page.build(document_items, onFirstPage=draw_page, onLaterPages=draw_page)
         return buffer.getvalue()

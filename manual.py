@@ -82,6 +82,14 @@ class ManualService:
                 (row["point_id"], row["ts"]),
             ).fetchone()
             overwritten: bool = existing is not None
+            # 是否覆盖了「真实采集值」：reading 里同 (point_id, ts) 已有非人工记录时，
+            # 人工录入会把现场实测值改掉。旧实现只在覆盖 manual_reading 时留痕，
+            # 于是真实计量数据可被无痕改写。
+            raw_prev = conn.execute(
+                "SELECT value, quality FROM reading WHERE point_id=? AND ts=?",
+                (row["point_id"], row["ts"]),
+            ).fetchone()
+            clobbered_raw: bool = raw_prev is not None and int(raw_prev["quality"]) != QUALITY_MANUAL
 
             conn.execute(
                 "INSERT OR REPLACE INTO manual_reading "
@@ -102,6 +110,18 @@ class ManualService:
                 "WHERE excluded.ts >= reading_latest.ts",
                 (row["point_id"], row["ts"], row["value"], QUALITY_MANUAL),
             )
+            if clobbered_raw:
+                conn.execute(
+                    "INSERT INTO event_log (ts, level, source, code, message, ref_id) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        int(time.time()), "warn", "user", "MANUAL_OVERWRITE_RAW",
+                        f"人工录入覆盖现场采集值 point_id={row['point_id']} ts={row['ts']} "
+                        f"原值={raw_prev['value']}(quality={raw_prev['quality']}) "
+                        f"新值={row['value']} operator={row['operator']}",
+                        row["point_id"],
+                    ),
+                )
             if overwritten:
                 # 审计与三表同事务，避免"覆盖成功但无日志"
                 conn.execute(

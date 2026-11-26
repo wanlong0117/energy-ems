@@ -89,6 +89,27 @@ energy_ems/
 - 旧版本库升级：直接替换程序，启动会自动执行 `schema.sql` 与 `migrations.py` 的版本化迁移
   （补齐新增列/索引），13 张业务表数据全部保留；迁移记录见 `schema_version` 表。
 
+- **v0.1.3 升级后必须重算历史**（重要）：本版修正了小时电量的取窗方式，旧库里
+  `hourly` / `daily` 的数字是在「整点读数丢一个采样间隔」的旧口径下算出来的，
+  300s 轮询实测偏低约 8.3%。升级步骤：
+
+  1. 停服务，备份 `energy.db`（见上）；
+  2. 在装有 Python 的机器上先试算影响面：
+
+     ```bat
+     python scripts\recompute.py --db energy.db --dry-run
+     ```
+
+  3. 确认无误后正式重算：
+
+     ```bat
+     python scripts\recompute.py --db energy.db
+     ```
+
+  脚本只重建「原始读数仍存在」的时间段，已过 90 天保留期的历史汇总不会被抹掉；
+  默认保留原定稿标记（对账表不会整片变成未结算），加 `--strict-coverage` 才按现状重判。
+  输出会打印重算前后的电量合计与变化百分比，并写入 `RECOMPUTE_DONE` 事件。
+
 ## 6. 常见问题
 
 **Q：双击 exe 后窗口一闪而过 / 提示缺少 DLL**

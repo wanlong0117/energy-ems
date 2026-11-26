@@ -289,9 +289,12 @@ def test_backup_script_creates_and_prunes_snapshots(ready_db, tmp_path):
 
 def test_dashboard_uses_kwh_and_redirects_on_401():
     html = (ROOT / "dashboard" / "index.html").read_text(encoding="utf-8")
-    assert "区间电量(kWh)" in html and "区间电费(元)" in html
+    # KPI 口径是「今日」（按后端日切点算），不是「全部历史求和」
+    assert "今日电量(kWh)" in html and "今日电费(元)" in html
     assert "区间电量(毫度)" not in html and "区间电费(分)" not in html
     assert "fmtKwh" in html and "fmtYuan" in html
+    # 时间窗由前端显式传给接口，避免接口退回默认窗导致 KPI 口径漂移
+    assert "state.todayStart" in html and "?from=" in html
     assert "status === 401" in html and "session_expired" in html
 
 

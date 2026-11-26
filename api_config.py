@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 import db
 from auth import require_auth
 from collector import collector
-from modbus import ModbusClient, ModbusError
+from modbus import ModbusError
 from schemas import (
     DeviceIn,
     EnergyCategoryIn,
@@ -159,7 +159,14 @@ class ConfigService:
         return True
 
     async def test_device(self, device_id: int) -> dict[str, Any]:
-        """连接测试：有点位则实际读一次寄存器，无点位仅做 TCP 连接。"""
+        """连接测试：有点位则实际读一次寄存器，无点位只验证链路可达。
+
+        必须按 device.protocol 分派客户端（走 collector._client_for）：
+        旧实现固定用 ModbusClient(host, port)，串口设备（host=COM3、port=4800 波特率）
+        会被当成 TCP 去连 COM3:4800，报「nodename nor servname provided」，
+        现场只会以为串口线坏了——而同一台设备的「点位试读」走的是正确分派，
+        两处结果不一致最难排查。
+        """
         row: Any = db.query_one("SELECT * FROM device WHERE id=?", (int(device_id),))
         if row is None:
             raise LookupError(f"device id={device_id} 不存在")
@@ -167,7 +174,11 @@ class ConfigService:
         timeout_ms: int = min(
             int(device.get("timeout_ms") or DEFAULT_TIMEOUT_MS), PROBE_TIMEOUT_MS
         )
-        client = ModbusClient(str(device["host"]), int(device.get("port") or 502), timeout_ms, 0)
+        probe_device: dict[str, Any] = dict(device)
+        probe_device["timeout_ms"] = timeout_ms
+        probe_device["retry"] = 0
+        client = collector._client_for(probe_device)
+        is_serial: bool = str(device.get("protocol") or "").lower() == "modbus_rtu_serial"
         started: float = time.monotonic()
         try:
             point_row: Any = db.query_one(
@@ -175,9 +186,10 @@ class ConfigService:
                 (int(device_id),),
             )
             if point_row is None:
-                await client.connect()  # 无点位：只验证 TCP 可达
+                await client.connect()  # 无点位：只验证链路可达
                 registers: list[int] = []
-                message: str = "TCP 连接成功（该设备未配置点位，未读取寄存器）"
+                link: str = "串口已打开" if is_serial else "TCP 连接成功"
+                message: str = f"{link}（该设备未配置点位，未读取寄存器）"
             else:
                 point: dict[str, Any] = dict(point_row)
                 registers = await client.read_registers(
@@ -225,6 +237,22 @@ def _fail_internal(code: str, exc: Exception) -> JSONResponse:
     return fail("服务器内部错误", 500)
 
 
+def _conflict_text(exc: sqlite3.IntegrityError) -> tuple[str, str]:
+    """把 sqlite3.IntegrityError 拆成 (事件码, 人话)。
+
+    同一个异常类覆盖两种完全不同的现场问题：
+      · UNIQUE  —— 重复关联（同一 meter 重复挂同一 point），操作员要的是「已存在」；
+      · FOREIGN KEY —— 删除/改键被别的表引用，操作员要的是「先解除关联」。
+    旧实现一律回「该记录仍被其它数据引用」，重复关联时人会被引到完全错误的方向。
+    """
+    text: str = str(exc).upper()
+    if "UNIQUE" in text:
+        return "DUPLICATE_CONFLICT", "该关联已存在，请勿重复添加"
+    if "FOREIGN KEY" in text:
+        return "FK_CONFLICT", "该记录仍被其它数据引用，请先解除关联后再操作"
+    return "CONSTRAINT_CONFLICT", "数据约束冲突，请检查关联关系"
+
+
 def _run(action: Callable[[], Any]) -> Any:
     """同步动作统一错误映射。"""
     try:
@@ -232,9 +260,10 @@ def _run(action: Callable[[], Any]) -> Any:
     except LookupError as exc:
         return fail(str(exc), 404)
     except sqlite3.IntegrityError as exc:
-        # 被其它表引用时删除/改键：明确 409，不把 SQLite 原文抛给前端
-        db.log_event("warn", "api", "FK_CONFLICT", f"外键约束冲突: {exc}")
-        return fail("该记录仍被其它数据引用，请先解除关联后再操作", 409)
+        # 不把 SQLite 原文抛给前端，但保留事件码与原文方便运维定位
+        code, text = _conflict_text(exc)
+        db.log_event("warn", "api", code, f"约束冲突: {exc}")
+        return fail(text, 409)
     except (ValueError, TypeError, ValidationError) as exc:
         return fail(_err_text(exc), 400)
     except RuntimeError as exc:
@@ -250,8 +279,9 @@ async def _arun(action: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
     except LookupError as exc:
         return fail(str(exc), 404)
     except sqlite3.IntegrityError as exc:
-        db.log_event("warn", "api", "FK_CONFLICT", f"外键约束冲突: {exc}")
-        return fail("该记录仍被其它数据引用，请先解除关联后再操作", 409)
+        code, text = _conflict_text(exc)
+        db.log_event("warn", "api", code, f"约束冲突: {exc}")
+        return fail(text, 409)
     except (ValueError, TypeError, ValidationError) as exc:
         return fail(_err_text(exc), 400)
     except RuntimeError as exc:

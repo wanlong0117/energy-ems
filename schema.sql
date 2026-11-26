@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS reading (
   quality   INTEGER NOT NULL DEFAULT 0,  -- 0=正常 1=超时 2=越界 3=人工
   PRIMARY KEY (point_id, ts)
 ) WITHOUT ROWID;
+-- 主键是 (point_id, ts)，按时间扫描（90 天清理、按时段聚合）用不上前缀，单独建 ts 索引
+CREATE INDEX IF NOT EXISTS idx_reading_ts ON reading(ts);
 
 -- ============ 8. 最新值（看板轮询只查这张） ============
 CREATE TABLE IF NOT EXISTS reading_latest (

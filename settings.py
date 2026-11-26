@@ -120,6 +120,14 @@ RETENTION_BATCH: int = 5000          # 单批删除行数，避免长事务锁�
 EVENT_LOG_MAX_ROWS: int = 20000      # 事件日志保留条数上限
 SETTLE_MIN_COVERAGE: float = 0.9     # 日结算定稿门槛：小时覆盖与表覆盖均需 ≥90%
 
+# ---------- 查询默认时间窗（无参查询必须收敛，否则整表进内存） ----------
+# 100 块表一年 ≈ 87.6 万行 hourly，单次响应可达 180 MB，浏览器与工控机都撑不住。
+QUERY_HOURLY_DEFAULT_DAYS: int = 3   # /api/hourly 未给时间窗时默认最近 3 天
+# daily 给足一年：既保住「不传参数查年报」的老用法，又能挡住「三年历史一次拉完」
+QUERY_DAILY_DEFAULT_DAYS: int = 366
+QUERY_MAX_ROWS: int = 50000          # 单次查询行数硬上限，超出按时间倒序截断
+EVENT_LOG_THROTTLE_SEC: int = 60     # 同类事件在该窗口内折叠为一条，避免刷爆审计日志
+
 # ---------- 寄存器解析（data_type × byte_order） ----------
 TYPE_COUNT: dict[str, int] = {
     "u16": 1, "s16": 1,
@@ -184,4 +192,4 @@ HTTP_PORT: int = 8000
 
 # ---------- 版本 ----------
 # 单一事实源：FastAPI 元信息、/healthz、看板侧栏都读它，避免三处各写一个版本号
-APP_VERSION: str = "0.1.2"
+APP_VERSION: str = "0.1.3"

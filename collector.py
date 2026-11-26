@@ -41,6 +41,10 @@ class Collector:
         self.tasks: dict[int, asyncio.Task[None]] = {}
         self.config_sig: str = ""
         self.reload_event: asyncio.Event = asyncio.Event()
+        # 复活退避：任务若崩溃后立即又崩（配置本身有问题），不能每秒重建一次，
+        # 否则 CPU 空转 + 每秒一条日志。device_id -> 允许下次复活的时间（单调时钟）。
+        self._revive_hold: dict[int, float] = {}
+        self._revive_delay: dict[int, float] = {}
 
     async def start(self) -> None:
         """常驻调度器：监听 reload_event，增删设备采集协程，并定期复活异常退出的任务。"""
@@ -63,7 +67,12 @@ class Collector:
         采集协程的异常分支虽已兜住常见错误，但内存错误、第三方库异常等仍可能
         让任务结束。旧实现只在配置变更时重建，任务一旦退出就永久不采集，
         与「每秒巡检兜底恢复」的注释不符。
+
+        重建带指数退避（1s→60s）：设备配置本身有错时任务会秒崩，无退避就是
+        「每秒建一次任务 + 每秒一条 COLLECTOR_REVIVE」，既烧 CPU 又冲掉审计日志。
+        采集恢复正常后由 _clear_revive_backoff() 把退避清零。
         """
+        now: float = time.monotonic()
         dead: dict[int, str] = {}
         for device_id, task in list(self.tasks.items()):
             if not task.done():
@@ -76,15 +85,42 @@ class Collector:
             dead[device_id] = f"{type(exc).__name__}: {exc}" if exc else "ended"
         if not dead:
             return
-        db.log_event(
-            "warn", "collector", "COLLECTOR_REVIVE",
-            "采集任务异常退出，已重建: "
-            + "; ".join(f"device {device_id} ({reason})" for device_id, reason in dead.items()),
-        )
-        self._sync_tasks()
 
-    def _sync_tasks(self) -> None:
-        """依据当前 device 配置快照，取消失效任务并为新增设备建任务。"""
+        revived: list[str] = []
+        revived_ids: set[int] = set()
+        holding: list[str] = []
+        for device_id, reason in dead.items():
+            if now < self._revive_hold.get(device_id, 0.0):
+                holding.append(f"device {device_id}")
+                continue
+            delay: float = self._revive_delay.get(device_id, RECONNECT_BACKOFF_BASE_SEC)
+            self._revive_hold[device_id] = now + delay
+            self._revive_delay[device_id] = min(
+                delay * 2.0, RECONNECT_BACKOFF_MAX_SEC
+            )
+            revived_ids.add(device_id)
+            revived.append(f"device {device_id} ({reason})")
+
+        db.log_event_throttled(
+            "warn", "collector", "COLLECTOR_REVIVE",
+            f"采集任务异常退出 {len(dead)} 个，本次重建 {len(revived)} 个"
+            + (f"，退避中 {len(holding)} 个" if holding else "")
+            + (": " + "; ".join(revived) if revived else ""),
+        )
+        # 本轮判定要重建的设备必须立即建起来，hold 只拦「下一轮」的重复复活
+        self._sync_tasks(forced=revived_ids)
+
+    def _clear_revive_backoff(self, device_id: int) -> None:
+        """设备恢复正常采集后清掉复活退避，下次真崩了仍能按 1 秒起步重建。"""
+        self._revive_hold.pop(device_id, None)
+        self._revive_delay.pop(device_id, None)
+
+    def _sync_tasks(self, forced: set[int] | None = None) -> None:
+        """依据当前 device 配置快照，取消失效任务并为新增设备建任务。
+
+        forced：本次必须重建的设备（复活流程判定过，跳过退避检查）。
+        """
+        force: set[int] = set(forced or ())
         # manual 设备（模拟器预置的手动表/机械表）不参与 Modbus 采集
         devices: list[dict[str, Any]] = [
             dict(row) for row in db.query(
@@ -99,11 +135,15 @@ class Collector:
                     task.cancel()  # 配置变更：旧任务会在下一个 await 处退出
                 del self.tasks[device_id]
 
+        now: float = time.monotonic()
         for device_id, device in wanted.items():
-            if device_id not in self.tasks:
-                self.tasks[device_id] = asyncio.create_task(
-                    self.poll_device(device), name=f"ems-poll-device-{device_id}"
-                )
+            if device_id in self.tasks:
+                continue
+            if device_id not in force and now < self._revive_hold.get(device_id, 0.0):
+                continue  # 复活退避中，等巡检下一轮
+            self.tasks[device_id] = asyncio.create_task(
+                self.poll_device(device), name=f"ems-poll-device-{device_id}"
+            )
 
         self.config_sig = "|".join(
             f"{device['id']}:{device.get('host')}:{device.get('port')}:{device.get('poll_interval')}"
@@ -178,7 +218,7 @@ class Collector:
                         code: str = (
                             "READ_TIMEOUT" if isinstance(exc, ModbusTimeoutError) else "READ_FAIL"
                         )
-                        db.log_event(
+                        db.log_event_throttled(
                             "warn", "collector", code,
                             f"设备 {device_id} 分组读取失败，{len(carried)} 个点位保持上一值"
                             f"并标记超时: {exc}", device_id,
@@ -205,18 +245,19 @@ class Collector:
                             continue
                         rows.append((int(point["id"]), now_ts, value, quality))
                         if quality == QUALITY_TIMEOUT:
-                            db.log_event(
+                            db.log_event_throttled(
                                 "warn", "collector", "READ_TIMEOUT",
                                 f"点位 {point['id']} 读取超时", int(point["id"]),
                             )
                         elif quality == QUALITY_OUT_OF_RANGE:
-                            db.log_event(
+                            db.log_event_throttled(
                                 "warn", "collector", "VALUE_OUT_OF_RANGE",
                                 f"点位 {point['id']} 越界: {value}", int(point["id"]),
                             )
 
                 self.write_batch(rows)
                 if any_ok:
+                    self._clear_revive_backoff(device_id)
                     db.execute(
                         "UPDATE device SET last_ok_at=?, last_error=NULL WHERE id=?",
                         (now_ts, device_id),
@@ -233,7 +274,7 @@ class Collector:
             except asyncio.CancelledError:
                 raise  # 热生效/关停时正常退出
             except (ModbusError, OSError, ValueError, sqlite3.Error) as exc:
-                db.log_event(
+                db.log_event_throttled(
                     "error", "collector", "READ_FAIL",
                     f"设备 {device_id}({device.get('host')}) 采集失败: {exc}", device_id,
                 )
@@ -303,11 +344,16 @@ class Collector:
         return merged
 
     def write_batch(self, rows: list[tuple[int, int, float, int]]) -> None:
-        """同步短事务写原始读数与最新值；latest 仅在时间戳更新时覆盖。"""
+        """同步短事务写原始读数与最新值；latest 仅在时间戳更新时覆盖。
+
+        两条 executemany 必须同生共死：旧实现用全局连接，第一条成功后第二条失败时
+        不会回滚，随后任意线程的提交（例如 log_event 里的 execute）会把「reading 写进去了、
+        reading_latest 没写」的半截状态一并提交，于是最新值与历史读数长期不一致。
+        """
         if not rows:
             return
         try:
-            with db.locked_conn() as conn:
+            with db.transaction() as conn:
                 conn.executemany(
                     "INSERT OR REPLACE INTO reading (point_id, ts, value, quality) VALUES (?,?,?,?)",
                     rows,
@@ -319,9 +365,9 @@ class Collector:
                     "WHERE excluded.ts >= reading_latest.ts",
                     rows,
                 )
-                conn.commit()
         except sqlite3.Error as exc:
-            db.log_event("error", "collector", "WRITE_FAIL", f"写读数失败: {exc}")
+            # 事务已回滚，raw 与 latest 都没有落库，下个轮询周期会重试
+            db.log_event("error", "collector", "WRITE_FAIL", f"写读数失败（整批已回滚）: {exc}")
 
     def _carry_forward(
         self, points: list[dict[str, Any]], ts: int

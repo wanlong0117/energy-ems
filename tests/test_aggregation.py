@@ -67,9 +67,12 @@ def test_settle_day_uses_utc_midnight_final_flag_and_cost(isolated_db):
     assert row["avg_power"] == 200.0
     assert DAY_START % 86400 == 0  # UTC 00:00 == 本地 08:00
 
-    # 只有 1 小时数据：不满足 90% 覆盖门槛，必须保留未结算并留痕
+    # 只有 1 小时数据：表覆盖 1/1 达标，但单表小时覆盖 1/24 不足 90%，
+    # 必须保留未结算并按表留痕（定稿门槛是按表判的，不是按全局小时并集）
     assert row["is_final"] == 0
-    assert db.query_one("SELECT 1 FROM event_log WHERE code='SETTLE_INCOMPLETE'") is not None
+    assert db.query_one(
+        "SELECT 1 FROM event_log WHERE code='SETTLE_METER_INCOMPLETE'"
+    ) is not None
 
     # 补齐 24 小时后重结算：定稿，且不重复写行
     fill_hourly(meter_id, DAY_START)

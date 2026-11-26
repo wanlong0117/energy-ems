@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import db
+import settings as settings_module
 import tariff
 from settings import (
     CATCHUP_LOOKBACK_DAYS,
@@ -35,20 +36,31 @@ from settings import (
 )
 
 
+def _tz_shift() -> int:
+    """本地时区偏移的秒数（运行期读取，便于按环境变量切换口径与用例覆盖）。"""
+    return int(settings_module.TZ_OFFSET_HOURS) * SECONDS_PER_HOUR
+
+
 def week_start(day_start: int) -> int:
-    """返回 day_start 所在 ISO 周的周一 UTC 00:00 时间戳（周一为首）。"""
-    day_start = int(day_start)
-    weekday: int = datetime.fromtimestamp(day_start, tz=timezone.utc).weekday()
-    return day_start - weekday * SECONDS_PER_DAY
+    """返回 day_start 所在 ISO 周的周一，且与日切点对齐（周一为首）。
+
+    先换算到本地日历再取周一，最后换回 UTC；日切点可配后仍然成立——
+    默认（UTC+8 / 08:00）下结果与「直接减 weekday 天」完全一致。
+    """
+    day_start = day_floor(day_start)
+    shift: int = _tz_shift()
+    local: datetime = datetime.fromtimestamp(day_start + shift, tz=timezone.utc)
+    monday: datetime = local - timedelta(days=local.weekday())
+    return int(monday.timestamp()) - shift
 
 
 def month_start(day_start: int) -> int:
-    """返回 day_start 所在自然月的 1 日 UTC 00:00 时间戳。"""
-    moment: datetime = datetime.fromtimestamp(int(day_start), tz=timezone.utc)
-    first: datetime = moment.replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    )
-    return int(first.timestamp())
+    """返回 day_start 所在自然月 1 日，且与日切点对齐（保留本地日切小时）。"""
+    day_start = day_floor(day_start)
+    shift: int = _tz_shift()
+    local: datetime = datetime.fromtimestamp(day_start + shift, tz=timezone.utc)
+    first: datetime = local.replace(day=1, second=0, microsecond=0)
+    return int(first.timestamp()) - shift
 
 
 class Aggregator:
@@ -57,14 +69,28 @@ class Aggregator:
     def __init__(self) -> None:
         # simulate 模式由 main.lifespan 按 config.simulate_rollup_sec 覆盖
         self.rollup_interval_sec: int = SIMULATE_ROLLUP_SEC
+        # 历史重算等批量场景置 True：跳过每小时的 ROLLUP_HOUR_DONE，
+        # 否则重算 30 天会往 2 万条上限的事件表里灌 700 多条流水账
+        self.silent: bool = False
 
     def rollup_hour(self, hour_start: int) -> None:
         """汇总单个 UTC 整点：间隔法累计电量 -> energy_wh，power 点求 avg/max。
 
-        间隔法：以 hour_start 时刻（含）之前最后一条有效读数为基准，以 hour_end
-        之前最后一条为收口，二者相减即本小时电量。旧实现取窗口内首尾读数，跨小时
-        的那个采样间隔不属于任何小时，每小时固定少计一个间隔（60s 轮询约 1.7%，
-        300s 约 8.3%）。基准缺失（首个小时/新增点位/换表）时回退窗口首条并留痕。
+        窗口口径为**左开右闭** `(hour_start, hour_end]`，与相邻小时首尾相接、
+        无重叠也无遗漏：
+
+          base = ts <= hour_start 的最后一条（上一小时的收口）
+          end  = hour_start < ts <= hour_end 的最后一条（本小时的收口）
+
+        旧实现是 `[hour_start, hour_end)`：正好落在整点的那条读数只被下一小时
+        当成基准，本小时收口看不到它，于是跨整点的一个采样间隔两边都不算，
+        每小时固定少计（300s 轮询实测少 8.3%）。改成右闭后逐小时精确闭合。
+
+        本小时窗口内没有任何有效读数（设备掉线/点位新增）时不产出行——
+        旧实现会退化成「取几小时前的旧值相减 = 0」，把「没采到」记成「没用电」
+        并且照样参与定稿；不产出行后，覆盖率门槛才能真实拦住这种日子。
+
+        基准缺失（首个小时/新增点位/换表）时回退窗口首条并留痕。
 
         reading 点放宽为 quality IN (0,3)，使人工补录的累计读数参与计算；
         power 点仍只取 quality=0，避免人工值污染瞬时功率统计。
@@ -85,16 +111,16 @@ class Aggregator:
                 continue  # 未配置累计电量点，无法计算小时电量
             point_id: int = int(reading_point["id"])
 
-            # 收口：hour_end 之前最后一条有效读数（本小时必须至少有它，否则无数据）
+            # 收口：本小时窗口内最后一条；窗口为空即本小时无样本，不产出行
             end = db.query_one(
-                "SELECT value, ts FROM reading WHERE point_id=? AND ts<? "
+                "SELECT value, ts FROM reading WHERE point_id=? AND ts>? AND ts<=? "
                 "AND quality IN (0,3) ORDER BY ts DESC LIMIT 1",
-                (point_id, hour_end),
+                (point_id, hour_start, hour_end),
             )
             if end is None:
-                continue  # 该小时无有效读数，不产出汇总行
+                continue
 
-            # 基准：hour_start 及之前的最后一条；缺失则回退到窗口内首条
+            # 基准：hour_start 及之前的最后一条；缺失则回退到窗口内首条（首个小时/换表）
             base = db.query_one(
                 "SELECT value, ts FROM reading WHERE point_id=? AND ts<=? "
                 "AND quality IN (0,3) ORDER BY ts DESC LIMIT 1",
@@ -102,7 +128,7 @@ class Aggregator:
             )
             if base is None:
                 base = db.query_one(
-                    "SELECT value, ts FROM reading WHERE point_id=? AND ts>=? AND ts<? "
+                    "SELECT value, ts FROM reading WHERE point_id=? AND ts>? AND ts<=? "
                     "AND quality IN (0,3) ORDER BY ts ASC LIMIT 1",
                     (point_id, hour_start, hour_end),
                 )
@@ -120,7 +146,10 @@ class Aggregator:
                 delta_kwh = 0.0
             energy_wh: int = int(round(delta_kwh * MILLI_PER_KWH))
 
-            # 瞬时功率：同表所有 role='power' 的点的平均/最大值（仅 quality=0）
+            # 瞬时功率：同表所有 role='power' 的点的平均/最大值（仅 quality=0）。
+            # 功率用 [hour_start, hour_end) 左闭右开——它是「本小时内的采样」，
+            # 与电量的右闭窗口不同源：累计读数 v(hour_end) 是上一段区间的收口，
+            # 而瞬时功率 p(hour_end) 属于下一小时的第一个采样点。
             power_points = db.query(
                 "SELECT p.id FROM point p JOIN meter_point mp ON mp.point_id=p.id "
                 "WHERE mp.meter_id=? AND mp.role='power'",
@@ -163,16 +192,21 @@ class Aggregator:
                 f"hour_start={hour_start} 有 {fallback_meters} 块表缺基准读数，"
                 "已回退窗口内首条（该小时电量可能偏低）",
             )
-        db.log_event("info", "collector", "ROLLUP_HOUR_DONE", f"小时汇总完成 hour_start={hour_start}")
+        if not self.silent:
+            db.log_event(
+                "info", "collector", "ROLLUP_HOUR_DONE", f"小时汇总完成 hour_start={hour_start}"
+            )
 
     def settle_day(
         self, day_start: int, is_final: int = 1, enforce_coverage: bool = True
     ) -> None:
         """把某日 24 个 UTC 小时汇总成 daily 并计电费；is_final 可指定结算状态。
 
-        定稿门槛：只有「有数据的小时数 ≥ 24×90%」且「有数据的表数 ≥ 应结算表数×90%」
-        才允许写 is_final=1，否则保留 is_final=0 并记 SETTLE_INCOMPLETE 事件。
-        避免「一天只有 1 小时数据」「100 块表只到 3 块」也被当作最终数用于对账。
+        定稿门槛分两层：
+          · 表覆盖——有数据的表数须 ≥ 应结算表数×90%，否则整日都不定时稿；
+          · 单表小时覆盖——该表当日有数据的小时数须 ≥ 24×90%，不足则该表单独
+            保留 is_final=0。旧实现用「所有表的小时并集」判定，拦不住
+            「99 块表满 24 小时、1 块只有 1 小时」也被一并定稿的情况。
 
         模拟模式（is_final=0）与人工回填（enforce_coverage=False）不受门槛限制：
         前者本就只是当天实时视图，后者是操作员对历史数据的明确修正。
@@ -215,21 +249,22 @@ class Aggregator:
                 f"day_start={day_start} 尚未结束，按未结算保留",
             )
 
-        if final_flag and enforce_coverage and buckets:
+        day_final: int = final_flag
+        if final_flag and enforce_coverage:
             counted = db.query_one(
                 "SELECT COUNT(*) AS cnt FROM meter WHERE is_enabled=1 AND is_counted=1"
             )
             total_meters: int = int(counted["cnt"]) if counted is not None else 0
-            hour_ratio: float = len(hours_covered) / 24.0
             meter_ratio: float = len(buckets) / total_meters if total_meters else 0.0
-            if hour_ratio < SETTLE_MIN_COVERAGE or meter_ratio < SETTLE_MIN_COVERAGE:
-                final_flag = 0
+            if not buckets or meter_ratio < SETTLE_MIN_COVERAGE:
+                day_final = 0
                 db.log_event(
                     "warn", "collector", "SETTLE_INCOMPLETE",
                     f"day_start={day_start} 数据不完整，按未结算保留："
-                    f"小时覆盖 {len(hours_covered)}/24，表覆盖 {len(buckets)}/{total_meters}",
+                    f"表覆盖 {len(buckets)}/{total_meters}，小时并集 {len(hours_covered)}/24",
                 )
 
+        short_meters: list[str] = []
         for meter_id, bucket in buckets.items():
             energy_wh: int = int(bucket["energy_wh"])
             avg_power: float | None = (
@@ -238,6 +273,15 @@ class Aggregator:
             # 分时电价：按当天各小时电量逐段计价，并把「按什么价算的」存成快照
             cost: tariff.CostResult = tariff.cost_for_hourly(bucket["hours"])
             self._warn_if_reprice(meter_id, day_start, cost)
+            covered_hours: int = len(bucket["hours"])
+            meter_final: int = day_final
+            if (
+                meter_final
+                and enforce_coverage
+                and covered_hours / 24.0 < SETTLE_MIN_COVERAGE
+            ):
+                meter_final = 0
+                short_meters.append(f"{meter_id}({covered_hours}/24)")
             db.execute(
                 "INSERT OR REPLACE INTO daily "
                 "(meter_id, day_start, energy_wh, peak_power, avg_power, cost_cent, "
@@ -245,14 +289,22 @@ class Aggregator:
                 "VALUES (?,?,?,?,?,?,?,?,?)",
                 (
                     meter_id, day_start, energy_wh, bucket["peak"], avg_power,
-                    cost.cost_cent, final_flag, cost.price_cent,
-                    tariff.dumps(cost, len(bucket["hours"])),
+                    cost.cost_cent, meter_final, cost.price_cent,
+                    tariff.dumps(cost, covered_hours),
                 ),
+            )
+
+        if short_meters:
+            db.log_event(
+                "warn", "collector", "SETTLE_METER_INCOMPLETE",
+                f"day_start={day_start} 有 {len(short_meters)} 块表小时覆盖不足，"
+                f"单独保留未结算: {', '.join(short_meters[:10])}"
+                + (" ..." if len(short_meters) > 10 else ""),
             )
 
         db.log_event(
             "info", "collector", "SETTLE_DONE",
-            f"日结算完成 day_start={day_start}，is_final={final_flag}，结算表数={len(buckets)}",
+            f"日结算完成 day_start={day_start}，is_final={day_final}，结算表数={len(buckets)}",
         )
 
     @staticmethod

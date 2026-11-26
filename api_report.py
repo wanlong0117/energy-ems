@@ -29,7 +29,10 @@ PDF_MEDIA_TYPE: str = "application/pdf"
 
 EXPORT_DEFAULT_DAYS: int = 31      # 不传时间范围时默认导出最近 31 天
 EXPORT_MAX_SPAN_DAYS: int = 366    # 单次导出区间上限
-EXPORT_MAX_ROWS: int = 20000       # 单次导出行数硬上限，避免整表读入内存
+# 行数上限必须容得下「366 天 × 100 块表 = 36600 行」的年报，否则 366 天的跨度上限
+# 就是一句空话：旧值 20000 会让 100 块表的年报必然 400，而 55 块表以下却能导完。
+# xlsx 单表上限 1,048,576 行，20 万行留足余量同时仍能挡住无参全表导出。
+EXPORT_MAX_ROWS: int = 200000
 
 
 def _internal(code: str, action: str, exc: Exception) -> Any:

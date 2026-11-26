@@ -45,10 +45,17 @@ def _v3_daily_index(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_day ON daily(day_start)")
 
 
+def _v4_reading_ts_index(conn: sqlite3.Connection) -> None:
+    """原始读数按时间索引：reading 主键是 (point_id, ts)，90 天清理与按时段扫描
+    用不上主键前缀，只能全表扫——100 表 × 90 天可达数千万行。"""
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reading_ts ON reading(ts)")
+
+
 MIGRATIONS: list[Migration] = [
     (1, "baseline: 13 张表", _v1_baseline),
     (2, "daily 增加电价与价格快照字段", _v2_daily_price_snapshot),
     (3, "daily 增加 day_start 索引", _v3_daily_index),
+    (4, "reading 增加 ts 索引", _v4_reading_ts_index),
 ]
 
 SCHEMA_VERSION: int = MIGRATIONS[-1][0] if MIGRATIONS else 0

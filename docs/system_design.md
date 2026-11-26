@@ -523,6 +523,8 @@ sequenceDiagram
 - **认证**：session cookie 名 `ems_session`，httponly、samesite=lax、TTL 7 天；除 `/api/login`、`/api/session` 外所有 `/api/*` 经 `require_auth` 守卫，未登录返回 401。token → 过期时间戳存内存 `_sessions`（重启失效）。
 - **时间单位**：所有时间戳为 Unix 秒（UTC）。本地 UTC+8：`day_start` = 当日 UTC 00:00（= 本地 08:00）；`hour_start` = UTC 整点；08:10 自动结算 = UTC 00:10。DB 不存本地时间字符串。
 - **电量单位**：`energy_wh`/`cost_cent` 为整数；1 kWh = 1,000,000 毫度；电费 `cost_cent = round(energy_wh / 1e6 × price_cent)`。`reading.value` 为经 `scale`/`offset_const` 换算后的工程值，单位见 `point.unit`。
+- **小时电量取窗（关键）**：累计电量点用**左开右闭**区间 `(hour_start, hour_end]`——`base = ts <= hour_start` 的最后一条、`end = hour_start < ts <= hour_end` 的最后一条。相邻小时首尾相接，24 小时合计严格等于首末日读数差。**不要**改成 `[hour_start, hour_end)`：整点读数只被下一小时当基准，本小时收口取不到，每小时固定少计一个采样间隔（300s 约 8.3%）。功率点与 `sample_cnt` 仍用 `[hour_start, hour_end)`，因为瞬时值归入本小时的采样。窗口内没有任何有效读数时**不产出** `hourly` 行（掉线不能记成 0 电量）。
+- **结算定稿门槛**：表覆盖（有数据的表数 / 应结算表数 ≥ 90%）决定整日，小时覆盖（该表当日有数据的小时数 / 24 ≥ 90%）**逐表**决定；不达标的表单独 `is_final=0` 并记 `SETTLE_METER_INCOMPLETE`。不要用全局小时并集判定——那拦不住「99 块表满、1 块只有 1 小时」。
 - **点位校验（硬性）**：`reg_offset` ∈ [0,65535]；`reg_count` ∈ [1,125]；`data_type`↔`reg_count` = u16/s16:1、u32/s32/f32:2、u64:4；`func_code` ∈ {3,4}；`byte_order` ∈ {ABCD,CDAB,BADC,DCBA}；同 device + 同 slave + 同 func 的 `[reg_offset, reg_offset+reg_count)` 区间不得与已有记录重叠（更新时排除自身 id）。
 - **quality**：0=正常、1=超时、2=越界（超出 min/max）、3=人工。
 - **单一连接**：`db.py` 全局连接、`check_same_thread=False`；所有 DB 调用同步短事务，`execute()` 内 commit，避免在 `await` 间持有游标。

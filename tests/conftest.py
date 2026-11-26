@@ -5,6 +5,21 @@ import pytest
 
 import auth
 import db
+from collector import collector
+
+
+def _reset_module_state() -> None:
+    """清掉跨用例残留的进程内状态。
+
+    · 事件日志节流：同 (code, ref_id) 60 秒内只落一条，若不清，相邻用例
+      断言「本次写入了 READ_FAIL / COLLECTOR_REVIVE」会莫名其妙查不到。
+    · 采集器复活退避：device_id 在不同用例间重复，残留的 hold 会让新任务不重建。
+    """
+    db._log_throttle_at.clear()
+    db._log_suppressed.clear()
+    collector.tasks.clear()
+    collector._revive_hold.clear()
+    collector._revive_delay.clear()
 
 
 @pytest.fixture
@@ -16,12 +31,14 @@ def isolated_db(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "_conn", None)
     monkeypatch.setattr(auth, "CONFIG_PATH", tmp_path / "config.json")
     auth._sessions.clear()
+    _reset_module_state()
     db.init_db()
     yield tmp_path
     if db._conn is not None:
         db._conn.close()
     db._conn = None
     auth._sessions.clear()
+    _reset_module_state()
 
 
 @pytest.fixture
