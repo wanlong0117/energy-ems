@@ -21,15 +21,23 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 from aggregation import aggregator
 from api_data import data_service
+from settings import MILLI_PER_KWH
 
 HEADERS: tuple[str, ...] = (
-    "期间", "计量表", "用途", "节点", "电量(毫度)", "电费(分)", "峰值功率", "已结算",
+    "期间", "计量表", "用途", "节点", "电量(kWh)", "电费(元)", "峰值功率", "已结算",
 )
 KEYS: tuple[str, ...] = (
     "period", "meter_name", "purpose", "node_name",
-    "energy_wh", "cost_cent", "peak_power", "final_text",
+    "energy_kwh", "cost_yuan", "peak_power", "final_text",
 )
 COLUMN_WIDTHS_MM: tuple[float, ...] = (32.0, 46.0, 28.0, 32.0, 30.0, 26.0, 30.0, 22.0)
+
+# 报表页脚固定说明：先让人判断这张表能不能用，再判断数字对不对
+FOOTNOTE: str = (
+    "说明：日汇总口径为本地 08:00 至次日 08:00（期间列为区间起点）；"
+    "电量单位 kWh、电费单位 元，均已按两位小数折算；"
+    "“已结算=否”表示该期数据未达完整度门槛，仅供参考。"
+)
 
 KIND_TITLES: dict[str, str] = {
     "daily": "日能耗报表 / Daily Energy Report",
@@ -78,7 +86,11 @@ class ReportService:
 
     @staticmethod
     def _normalize(raw: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
-        """把 API 行映射成导出用行；数值字段保持与 API 完全一致。"""
+        """把 API 行映射成导出用行；电量折算 kWh、电费折算 元，保留两位小数。
+
+        原始整数字段 energy_wh / cost_cent 一并保留，供合计行按毫度/分累加，
+        避免逐行四舍五入后合计与明细对不上。
+        """
         rows: list[dict[str, Any]] = []
         for item in raw:
             if kind == "daily":
@@ -91,25 +103,32 @@ class ReportService:
             elif kind == "monthly":
                 period = period[:7]
             peak: Any = item.get("peak_power")
+            energy_wh: int = int(item.get("energy_wh") or 0)
+            cost_cent: int = int(item.get("cost_cent") or 0)
             rows.append(
                 {
                     "period": period,
                     "meter_name": str(item.get("meter_name") or ""),
                     "purpose": str(item.get("purpose") or ""),
                     "node_name": str(item.get("node_name") or ""),
-                    "energy_wh": int(item.get("energy_wh") or 0),
-                    "cost_cent": int(item.get("cost_cent") or 0),
-                    "peak_power": "" if peak is None else float(peak),
+                    "energy_wh": energy_wh,
+                    "cost_cent": cost_cent,
+                    "energy_kwh": round(energy_wh / MILLI_PER_KWH, 2),
+                    "cost_yuan": round(cost_cent / 100.0, 2),
+                    "peak_power": "" if peak is None else round(float(peak), 2),
                     "final_text": "是" if int(item.get("is_final") or 0) == 1 else "否",
                 }
             )
         return rows
 
     @staticmethod
-    def _totals(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    def _totals(rows: list[dict[str, Any]]) -> tuple[float, float]:
+        """合计按原始毫度/分累加后一次性折算，保证与明细求和一致。"""
+        energy_wh: int = sum(int(row.get("energy_wh") or 0) for row in rows)
+        cost_cent: int = sum(int(row.get("cost_cent") or 0) for row in rows)
         return (
-            sum(int(row.get("energy_wh") or 0) for row in rows),
-            sum(int(row.get("cost_cent") or 0) for row in rows),
+            round(energy_wh / MILLI_PER_KWH, 2),
+            round(cost_cent / 100.0, 2),
         )
 
     def to_xlsx(self, rows: list[dict[str, Any]], meta: dict[str, Any] | None = None) -> bytes:
@@ -146,6 +165,15 @@ class ReportService:
             cell = sheet.cell(row=total_idx, column=column, value=value)
             cell.font = Font(bold=True)
             cell.fill = PatternFill(fill_type="solid", fgColor="E8F0FE")
+
+        note_idx: int = sheet.max_row + 2
+        sheet.merge_cells(
+            start_row=note_idx, start_column=1, end_row=note_idx, end_column=len(HEADERS)
+        )
+        note_cell = sheet.cell(row=note_idx, column=1, value=FOOTNOTE)
+        note_cell.font = Font(size=9, color="666666")
+        note_cell.alignment = Alignment(wrap_text=True, vertical="top")
+        sheet.row_dimensions[note_idx].height = 32
 
         for index, width in enumerate((22, 28, 14, 18, 16, 14, 14, 12), start=1):
             sheet.column_dimensions[chr(64 + index)].width = width
@@ -242,8 +270,13 @@ class ReportService:
             )
         )
         # 表头中文需要用注册字体渲染，Paragraph 已使用 style；此处仅设置段落样式
+        note_style = ParagraphStyle(
+            "ems-note", fontName=font_name, fontSize=7, leading=9,
+            wordWrap="CJK", textColor=colors.HexColor("#666666"),
+        )
         document_items: list[Any] = [
             Paragraph(title, title_style), Spacer(1, 4 * mm), table,
+            Spacer(1, 3 * mm), Paragraph(FOOTNOTE, note_style),
         ]
         page.build(document_items, onFirstPage=draw_page, onLaterPages=draw_page)
         return buffer.getvalue()

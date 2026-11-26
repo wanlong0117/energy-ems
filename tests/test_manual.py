@@ -1,6 +1,7 @@
 """v2 手动录入验证：单事务三表一致、重复覆盖审计、历史补录回填且保留 is_final、API 增查与鉴权。"""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -12,10 +13,11 @@ from manual import manual_service
 
 from helpers import (
     add_reading, create_device, create_meter, create_node, create_point,
-    create_tariff, link_point, run,
+    create_tariff, fill_hourly, link_point, run,
 )
 
-DAY = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
+# 补录窗口只允许最近 90 天，取「3 天前的 UTC 零点」既满足历史回填又把时钟依赖降到最低
+DAY = (int(time.time()) // 86400) * 86400 - 3 * 86400
 
 
 def _client() -> httpx.AsyncClient:
@@ -36,7 +38,7 @@ def _manual_point() -> int:
                         unit="m³", point_role="other")
 
 
-def test_record_writes_manual_reading_reading_and_latest_in_one_txn(isolated_db):
+def test_record_writes_manual_reading_reading_and_latest_in_one_txn(ready_db):
     """Arrange: 手动点。Act: record。Assert: manual_reading + reading(q=3) + reading_latest 三表一致。"""
     point_id = _manual_point()
     result = manual_service.record({
@@ -57,7 +59,7 @@ def test_record_writes_manual_reading_reading_and_latest_in_one_txn(isolated_db)
     assert (latest["ts"], latest["value"], latest["quality"]) == (DAY, 12.5, 3)
 
 
-def test_duplicate_record_overwrites_and_logs_manual_overwrite(isolated_db):
+def test_duplicate_record_overwrites_and_logs_manual_overwrite(ready_db):
     """Arrange: 已录入一次。Act: 同 (point_id,ts) 再录。Assert: 覆盖且同事务写 MANUAL_OVERWRITE 审计。"""
     point_id = _manual_point()
     manual_service.record({"point_id": point_id, "ts": DAY, "value": 10.0,
@@ -81,7 +83,7 @@ def test_duplicate_record_overwrites_and_logs_manual_overwrite(isolated_db):
     assert event["source"] == "user" and event["ref_id"] == point_id
 
 
-def test_historical_backfill_recomputes_daily_and_keeps_is_final(isolated_db):
+def test_historical_backfill_recomputes_daily_and_keeps_is_final(ready_db):
     """Arrange: 历史日已 final 结算。Act: 补录该小时人工累计读数。Assert: hourly/daily 重算且 is_final 保留。"""
     node = create_node(name="A栋")
     device = create_device()
@@ -93,6 +95,7 @@ def test_historical_backfill_recomputes_daily_and_keeps_is_final(isolated_db):
     add_reading(reading_point, DAY, 100.0)
     add_reading(reading_point, DAY + 1800, 110.0)
     aggregator.rollup_hour(DAY)
+    fill_hourly(meter, DAY, skip=(0,))  # 补齐 24 小时，满足定稿门槛
     aggregator.settle_day(DAY, is_final=1)
     before = db.query_one("SELECT energy_wh, is_final FROM daily WHERE day_start=?", (DAY,))
     assert (before["energy_wh"], before["is_final"]) == (10_000_000, 1)
@@ -114,7 +117,7 @@ def test_historical_backfill_recomputes_daily_and_keeps_is_final(isolated_db):
         (reading_point, DAY + 2700))["quality"] == 3
 
 
-def test_manual_api_post_get_and_auth_and_validation(isolated_db):
+def test_manual_api_post_get_and_auth_and_validation(ready_db):
     """Arrange: 登录/匿名客户端。Act: POST/GET /api/manual。Assert: 401/200、三表一致、非法参数 422。"""
     point_id = _manual_point()
 
@@ -150,7 +153,7 @@ def test_manual_api_post_get_and_auth_and_validation(isolated_db):
     run(scenario())
 
 
-def test_manual_list_returns_most_recent_first(isolated_db):
+def test_manual_list_returns_most_recent_first(ready_db):
     """Arrange: 三个时间点录入。Act: list。Assert: 按 ts 倒序返回最近记录。"""
     point_id = _manual_point()
     for ts, value in ((DAY, 1.0), (DAY + 100, 2.0), (DAY + 200, 3.0)):

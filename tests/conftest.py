@@ -22,3 +22,16 @@ def isolated_db(tmp_path, monkeypatch):
         db._conn.close()
     db._conn = None
     auth._sessions.clear()
+
+
+@pytest.fixture
+def ready_db(isolated_db):
+    """已投运实例：默认密码已改过，业务接口不再被强制改密拦截。
+
+    「默认密码状态下业务接口一律 403」由 test_password.py 单独覆盖，
+    其余用例测的是业务逻辑，应运行在已完成首次改密的状态下。
+    """
+    config = auth.load_config()
+    config["password_changed"] = True
+    auth.save_config(config)
+    return isolated_db

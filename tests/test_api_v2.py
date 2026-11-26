@@ -23,7 +23,7 @@ def _client() -> httpx.AsyncClient:
     ("POST", "/api/manual", {"point_id": 1, "ts": 1, "value": 1.0, "operator": "x"}),
     ("GET", "/api/manual", None),
 ])
-def test_new_endpoints_require_auth(isolated_db, method, path, body):
+def test_new_endpoints_require_auth(ready_db, method, path, body):
     """Arrange: 匿名客户端。Act: 请求 7 个新增端点。Assert: 一律 401 + {ok:false,error}。"""
     async def scenario():
         async with _client() as client:
@@ -36,7 +36,7 @@ def test_new_endpoints_require_auth(isolated_db, method, path, body):
     run(scenario())
 
 
-def test_mode_endpoints_return_unified_envelope(isolated_db):
+def test_mode_endpoints_return_unified_envelope(ready_db):
     """Arrange: 登录。Act: GET /api/mode 与 POST /api/mode/switch。Assert: {ok,data}，非法模式 400/422。"""
     async def scenario():
         async with _client() as client:
@@ -66,7 +66,7 @@ def test_mode_endpoints_return_unified_envelope(isolated_db):
     "/api/report/export?kind=daily&fmt=pdf&to=bad",
     "/api/manual?limit=abc",
 ])
-def test_new_endpoints_reject_bad_query_types(isolated_db, path):
+def test_new_endpoints_reject_bad_query_types(ready_db, path):
     """Arrange: 登录 + 非法查询参数类型。Act: 请求。Assert: 400/422 且统一错误格式。"""
     async def scenario():
         async with _client() as client:
@@ -78,7 +78,7 @@ def test_new_endpoints_reject_bad_query_types(isolated_db, path):
     run(scenario())
 
 
-def test_weekly_monthly_empty_range_returns_ok_empty_array(isolated_db):
+def test_weekly_monthly_empty_range_returns_ok_empty_array(ready_db):
     """Arrange: 空库。Act: 登录查周/月。Assert: {ok:true,data:[]} 而非报错。"""
     async def scenario():
         async with _client() as client:

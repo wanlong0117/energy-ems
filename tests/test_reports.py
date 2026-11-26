@@ -44,7 +44,7 @@ def _seed_daily() -> None:
 
 @pytest.mark.parametrize("kind", ["daily", "weekly", "monthly"])
 @pytest.mark.parametrize("fmt", ["xlsx", "pdf"])
-def test_export_returns_nonempty_file_with_correct_headers(isolated_db, kind, fmt):
+def test_export_returns_nonempty_file_with_correct_headers(ready_db, kind, fmt):
     """Arrange: 真实 daily 数据 + 登录。Act: 导出 6 种组合。Assert: 200、非空、文件头/Content-Disposition 正确。"""
     _seed_daily()
 
@@ -72,7 +72,7 @@ def test_export_returns_nonempty_file_with_correct_headers(isolated_db, kind, fm
     run(scenario())
 
 
-def test_xlsx_has_chinese_headers_and_total_row_matching_api(isolated_db):
+def test_xlsx_has_chinese_headers_and_total_row_matching_api(ready_db):
     """Arrange: 两天真实数据。Act: 导出 xlsx 并重开。Assert: 中文表头齐全、合计行数值等于 API 汇总。"""
     _seed_daily()
     captured: dict[str, object] = {}
@@ -81,7 +81,8 @@ def test_xlsx_has_chinese_headers_and_total_row_matching_api(isolated_db):
         async with _client() as client:
             await _login(client)
             captured["xlsx"] = (await client.get(
-                "/api/report/export?kind=daily&fmt=xlsx")).content
+                f"/api/report/export?kind=daily&fmt=xlsx&from={DAY_START}&to={DAY_START + DAY}"
+            )).content
             captured["api_rows"] = (await client.get("/api/daily")).json()["data"]
 
     run(scenario())
@@ -95,14 +96,15 @@ def test_xlsx_has_chinese_headers_and_total_row_matching_api(isolated_db):
         assert header in grid[header_idx], f"缺中文表头: {header}"
 
     total_idx = next(i for i, row in enumerate(grid) if row and row[0] == "合计")
-    total_energy = sum(int(r["energy_wh"]) for r in api_rows)
-    total_cost = sum(int(r["cost_cent"]) for r in api_rows)
-    assert total_energy == 3_000_000 and total_cost == 240
-    assert grid[total_idx][4] == total_energy, "合计行电量应等于 API 汇总"
-    assert grid[total_idx][5] == total_cost, "合计行电费应等于 API 汇总"
+    # 报表电量折算 kWh、电费折算 元（两位小数），合计按原始毫度/分累加后一次性折算
+    total_energy = round(sum(int(r["energy_wh"]) for r in api_rows) / 1_000_000, 2)
+    total_cost = round(sum(int(r["cost_cent"]) for r in api_rows) / 100.0, 2)
+    assert (total_energy, total_cost) == (3.0, 2.4)
+    assert grid[total_idx][4] == total_energy, "合计行电量应等于 API 汇总折算后的 kWh"
+    assert grid[total_idx][5] == total_cost, "合计行电费应等于 API 汇总折算后的元"
 
 
-def test_empty_range_returns_valid_empty_report(isolated_db):
+def test_empty_range_returns_valid_empty_report(ready_db):
     """Arrange: 无数据的未来区间。Act: xlsx/pdf 导出。Assert: 200 且为有效空报表，不报错。"""
     _seed_daily()
     future = DAY_START + 365 * DAY
@@ -124,7 +126,7 @@ def test_empty_range_returns_valid_empty_report(isolated_db):
     run(scenario())
 
 
-def test_export_rejects_invalid_kind_and_fmt(isolated_db):
+def test_export_rejects_invalid_kind_and_fmt(ready_db):
     """Arrange/Act: 非法 kind/fmt。Assert: 400 且统一错误格式。"""
     async def scenario():
         async with _client() as client:
@@ -138,7 +140,7 @@ def test_export_rejects_invalid_kind_and_fmt(isolated_db):
     run(scenario())
 
 
-def test_report_service_build_uses_real_data_service(isolated_db):
+def test_report_service_build_uses_real_data_service(ready_db):
     """Arrange: 真实 daily。Act: ReportService.build 三类型。Assert: 数值与 API 一致、无 mock。"""
     _seed_daily()
     for kind in ("daily", "weekly", "monthly"):

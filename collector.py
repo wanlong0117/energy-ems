@@ -123,17 +123,40 @@ class Collector:
                     await asyncio.sleep(int(device.get("poll_interval") or DEFAULT_POLL_INTERVAL))
                     continue
 
+                # 一轮采集共用一个时间戳，便于按轮次对齐与缺口判定
+                now_ts: int = int(time.time())
                 groups: list[dict[str, Any]] = self.merge_reads(device, points)
                 rows: list[tuple[int, int, float, int]] = []
+                any_ok: bool = False
                 for group in groups:
                     client: BaseModbusClient = self._client_for(device)
                     try:
                         registers: list[int] = await client.read_registers(
                             group["slave_id"], group["func_code"], group["offset"], group["count"]
                         )
+                    except (ModbusError, OSError, ValueError) as exc:
+                        # 读取失败只影响本组：其余分组照常采集，不整轮丢弃；
+                        # 本组点位按「保持上一值 + 质量码 1」补点，缺口在看板上可见
+                        carried: list[tuple[int, int, float, int]] = self._carry_forward(
+                            group["points"], now_ts
+                        )
+                        rows.extend(carried)
+                        code: str = (
+                            "READ_TIMEOUT" if isinstance(exc, ModbusTimeoutError) else "READ_FAIL"
+                        )
+                        db.log_event(
+                            "warn", "collector", code,
+                            f"设备 {device_id} 分组读取失败，{len(carried)} 个点位保持上一值"
+                            f"并标记超时: {exc}", device_id,
+                        )
+                        db.execute(
+                            "UPDATE device SET last_error=? WHERE id=?", (str(exc), device_id)
+                        )
+                        continue
                     finally:
                         await client.close()  # read_registers 已关，双重保护
 
+                    any_ok = True
                     for point in group["points"]:
                         start: int = int(point["reg_offset"]) - group["offset"]
                         count: int = int(point["reg_count"])
@@ -146,7 +169,7 @@ class Collector:
                                 f"点位 {point['id']} 解析失败: {exc}", int(point["id"]),
                             )
                             continue
-                        rows.append((int(point["id"]), int(time.time()), value, quality))
+                        rows.append((int(point["id"]), now_ts, value, quality))
                         if quality == QUALITY_TIMEOUT:
                             db.log_event(
                                 "warn", "collector", "READ_TIMEOUT",
@@ -159,12 +182,19 @@ class Collector:
                             )
 
                 self.write_batch(rows)
-                db.execute(
-                    "UPDATE device SET last_ok_at=?, last_error=NULL WHERE id=?",
-                    (int(time.time()), device_id),
-                )
-                backoff = RECONNECT_BACKOFF_BASE_SEC
-                await asyncio.sleep(max(1, int(device.get("poll_interval") or DEFAULT_POLL_INTERVAL)))
+                if any_ok:
+                    db.execute(
+                        "UPDATE device SET last_ok_at=?, last_error=NULL WHERE id=?",
+                        (now_ts, device_id),
+                    )
+                    backoff = RECONNECT_BACKOFF_BASE_SEC
+                    await asyncio.sleep(
+                        max(1, int(device.get("poll_interval") or DEFAULT_POLL_INTERVAL))
+                    )
+                else:
+                    # 整轮全部失败：按指数退避重连，避免对掉线设备高频打点
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2.0, RECONNECT_BACKOFF_MAX_SEC)
 
             except asyncio.CancelledError:
                 raise  # 热生效/关停时正常退出
@@ -242,23 +272,43 @@ class Collector:
         """同步短事务写原始读数与最新值；latest 仅在时间戳更新时覆盖。"""
         if not rows:
             return
-        conn = db.get_conn()
         try:
-            conn.executemany(
-                "INSERT OR REPLACE INTO reading (point_id, ts, value, quality) VALUES (?,?,?,?)",
-                rows,
-            )
-            conn.executemany(
-                "INSERT INTO reading_latest (point_id, ts, value, quality) VALUES (?,?,?,?) "
-                "ON CONFLICT(point_id) DO UPDATE SET "
-                "ts=excluded.ts, value=excluded.value, quality=excluded.quality "
-                "WHERE excluded.ts >= reading_latest.ts",
-                rows,
-            )
-            conn.commit()
+            with db.locked_conn() as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO reading (point_id, ts, value, quality) VALUES (?,?,?,?)",
+                    rows,
+                )
+                conn.executemany(
+                    "INSERT INTO reading_latest (point_id, ts, value, quality) VALUES (?,?,?,?) "
+                    "ON CONFLICT(point_id) DO UPDATE SET "
+                    "ts=excluded.ts, value=excluded.value, quality=excluded.quality "
+                    "WHERE excluded.ts >= reading_latest.ts",
+                    rows,
+                )
+                conn.commit()
         except sqlite3.Error as exc:
-            conn.rollback()
             db.log_event("error", "collector", "WRITE_FAIL", f"写读数失败: {exc}")
+
+    def _carry_forward(
+        self, points: list[dict[str, Any]], ts: int
+    ) -> list[tuple[int, int, float, int]]:
+        """读取失败时按「保持上一值 + 质量码 1」补点，让缺口在看板上可见。
+
+        没有历史读数的点位无法伪造，直接跳过（由覆盖不足判定兜底）。
+        """
+        point_ids: list[int] = [int(point["id"]) for point in points]
+        if not point_ids:
+            return []
+        placeholders: str = ",".join("?" for _ in point_ids)
+        latest: list[Any] = db.query(
+            f"SELECT point_id, value FROM reading_latest WHERE point_id IN ({placeholders}) "
+            "AND quality IN (0,3)",
+            tuple(point_ids),
+        )
+        return [
+            (int(row["point_id"]), int(ts), float(row["value"]), QUALITY_TIMEOUT)
+            for row in latest
+        ]
 
     def reload(self) -> None:
         """配置变更后调用：置事件，调度器在下一轮起点重建采集任务。"""

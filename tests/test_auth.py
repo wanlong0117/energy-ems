@@ -11,10 +11,10 @@ import auth
 import db
 
 
-def _request(cookie: str | None = None) -> Request:
+def _request(cookie: str | None = None, path: str = "/") -> Request:
     headers = [] if cookie is None else [(b"cookie", cookie.encode())]
     return Request({
-        "type": "http", "method": "GET", "path": "/", "headers": headers,
+        "type": "http", "method": "GET", "path": path, "headers": headers,
         "query_string": b"", "client": ("127.0.0.1", 12345),
     })
 
@@ -63,7 +63,16 @@ def test_require_auth_guards_unauthenticated_request(isolated_db):
 
     response = auth.login("ems2026", Response())
     token = _cookie_value(response)
-    assert auth.require_auth(_request(f"ems_session={token}")) is True
+    # 仍用默认密码：业务路径必须 403，只有改密/登出/会话查询放行
+    with pytest.raises(HTTPException) as gate:
+        auth.require_auth(_request(f"ems_session={token}"))
+    assert gate.value.status_code == 403
+    assert auth.require_auth(_request(f"ems_session={token}", path="/api/password")) is True
+
+    # 改密后可正常访问业务路径
+    assert auth.change_password("ems2026", "NewPass2026").status_code == 200
+    relogin = auth.login("NewPass2026", Response())
+    assert auth.require_auth(_request(f"ems_session={_cookie_value(relogin)}")) is True
 
 
 def test_expired_session_is_rejected_and_removed(isolated_db):

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import sqlite3
 import time
 from typing import Any, Callable, Coroutine
 
@@ -45,6 +46,27 @@ MODEL_MAP: dict[str, type[BaseModel]] = {
 class ConfigService:
     """配置资源服务层：通用 CRUD + 点位校验 + 设备连接测试。"""
 
+    # 外键前置校验表：字段 -> 被引用表。写入前显式查一次，错误码从 500 降到 400。
+    FK_RULES: dict[str, dict[str, str]] = {
+        "node": {"parent_id": "node"},
+        "device": {"node_id": "node"},
+        "point": {"device_id": "device"},
+        "meter": {"node_id": "node", "category_id": "energy_category"},
+        "meter_point": {"meter_id": "meter", "point_id": "point"},
+    }
+
+    @classmethod
+    def _check_refs(cls, resource: str, data: dict[str, Any]) -> None:
+        """校验被引用记录是否存在；不存在抛 ValueError（映射为 400）。"""
+        for field, table in cls.FK_RULES.get(resource, {}).items():
+            if field not in data:
+                continue
+            value: Any = data.get(field)
+            if value is None:
+                continue
+            if db.query_one(f"SELECT 1 FROM {table} WHERE id=?", (int(value),)) is None:
+                raise ValueError(f"{field} 指向的 {table} id={value} 不存在")
+
     @staticmethod
     def _check_resource(resource: str) -> None:
         if resource not in RESOURCES:
@@ -85,11 +107,12 @@ class ConfigService:
         return dict(row)
 
     def create(self, resource: str, body: dict[str, Any]) -> dict[str, Any]:
-        """新增记录；point 保存时执行硬性校验。"""
+        """新增记录；point 保存时执行硬性校验，写入前校验外键存在性。"""
         self._check_resource(resource)
         data: dict[str, Any] = MODEL_MAP[resource](**body).model_dump()
         if resource == "point":
             validate_point(data)
+        self._check_refs(resource, data)
         columns: list[str] = list(data.keys())
         placeholders: str = ", ".join("?" for _ in columns)
         sql: str = (
@@ -113,6 +136,7 @@ class ConfigService:
         fields: dict[str, Any] = {
             key: value for key, value in data.items() if key in body and key != "id"
         }
+        self._check_refs(resource, fields)
         if fields:
             assignments: str = ", ".join(f"{key}=?" for key in fields)
             db.execute(
@@ -195,18 +219,28 @@ def _err_text(exc: Exception) -> str:
     return str(exc)
 
 
+def _fail_internal(code: str, exc: Exception) -> JSONResponse:
+    """内部错误统一对外话术：原文只进事件日志，不回显给调用方。"""
+    db.log_event("error", "api", code, f"未预期的内部错误: {type(exc).__name__}: {exc}")
+    return fail("服务器内部错误", 500)
+
+
 def _run(action: Callable[[], Any]) -> Any:
     """同步动作统一错误映射。"""
     try:
         return ok(action())
     except LookupError as exc:
         return fail(str(exc), 404)
+    except sqlite3.IntegrityError as exc:
+        # 被其它表引用时删除/改键：明确 409，不把 SQLite 原文抛给前端
+        db.log_event("warn", "api", "FK_CONFLICT", f"外键约束冲突: {exc}")
+        return fail("该记录仍被其它数据引用，请先解除关联后再操作", 409)
     except (ValueError, TypeError, ValidationError) as exc:
         return fail(_err_text(exc), 400)
     except RuntimeError as exc:
         return fail(str(exc), 502)
     except Exception as exc:
-        return fail(f"操作失败: {exc}", 500)
+        return _fail_internal("CONFIG_OP_FAIL", exc)
 
 
 async def _arun(action: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
@@ -215,12 +249,15 @@ async def _arun(action: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
         return ok(await action())
     except LookupError as exc:
         return fail(str(exc), 404)
+    except sqlite3.IntegrityError as exc:
+        db.log_event("warn", "api", "FK_CONFLICT", f"外键约束冲突: {exc}")
+        return fail("该记录仍被其它数据引用，请先解除关联后再操作", 409)
     except (ValueError, TypeError, ValidationError) as exc:
         return fail(_err_text(exc), 400)
     except RuntimeError as exc:
         return fail(str(exc), 502)
     except Exception as exc:
-        return fail(f"操作失败: {exc}", 500)
+        return _fail_internal("CONFIG_OP_FAIL", exc)
 
 
 @router.get("/config/{resource}")

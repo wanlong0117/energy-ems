@@ -10,6 +10,7 @@ v2 新增 frozen 双路径规则：
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -79,7 +80,14 @@ DATA_MODE_DEFAULT: str = "simulate"
 DATA_MODES: tuple[str, ...] = ("simulate", "live")
 SIMULATE_INTERVAL_SEC: int = 300     # 模拟器写读数间隔，默认 5 分钟
 SIMULATE_ROLLUP_SEC: int = 600       # 模拟模式小时/日汇总间隔，默认 10 分钟
+LIVE_ROLLUP_SEC: int = 300           # 真实模式小时汇总间隔，默认 5 分钟
 DEFAULT_BAUDRATE: int = 9600         # modbus_rtu_serial 默认波特率
+
+# ---------- 数据保留与结算门槛 ----------
+RETENTION_DAYS: int = 90             # 原始读数保留天数（超期按批删除）
+RETENTION_BATCH: int = 5000          # 单批删除行数，避免长事务锁库
+EVENT_LOG_MAX_ROWS: int = 20000      # 事件日志保留条数上限
+SETTLE_MIN_COVERAGE: float = 0.9     # 日结算定稿门槛：小时覆盖与表覆盖均需 ≥90%
 
 # ---------- 寄存器解析（data_type × byte_order） ----------
 TYPE_COUNT: dict[str, int] = {
@@ -135,6 +143,9 @@ PURPOSES: frozenset[str] = frozenset({
 })
 SESSION_COOKIE_NAME: str = "ems_session"
 SESSION_TTL_SEC: int = 7 * SECONDS_PER_DAY
+# 会话 Cookie 的 Secure 标志：纯内网 HTTP 下必须为 False，否则浏览器不回传 Cookie；
+# 叠反向代理启用 HTTPS 后设 EMS_COOKIE_SECURE=1 即可打开。
+SESSION_COOKIE_SECURE: bool = os.environ.get("EMS_COOKIE_SECURE", "") not in ("", "0", "false")
 
 # ---------- HTTP 入口（单进程 uvicorn） ----------
 HTTP_HOST: str = "0.0.0.0"

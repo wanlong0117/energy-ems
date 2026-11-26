@@ -19,10 +19,15 @@ from typing import Any
 import db
 from settings import (
     CATCHUP_LOOKBACK_DAYS,
+    EVENT_LOG_MAX_ROWS,
+    LIVE_ROLLUP_SEC,
     MILLI_PER_KWH,
+    RETENTION_BATCH,
+    RETENTION_DAYS,
     SECONDS_PER_DAY,
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
+    SETTLE_MIN_COVERAGE,
     SETTLE_UTC_HOUR,
     SETTLE_UTC_MINUTE,
     SIMULATE_ROLLUP_SEC,
@@ -53,14 +58,20 @@ class Aggregator:
         self.rollup_interval_sec: int = SIMULATE_ROLLUP_SEC
 
     def rollup_hour(self, hour_start: int) -> None:
-        """汇总单个 UTC 整点：累计电量首尾差 -> energy_wh，power 点求 avg/max。
+        """汇总单个 UTC 整点：间隔法累计电量 -> energy_wh，power 点求 avg/max。
 
-        reading 点放宽为 quality IN (0,3)，使人工补录的累计读数参与首尾差；
+        间隔法：以 hour_start 时刻（含）之前最后一条有效读数为基准，以 hour_end
+        之前最后一条为收口，二者相减即本小时电量。旧实现取窗口内首尾读数，跨小时
+        的那个采样间隔不属于任何小时，每小时固定少计一个间隔（60s 轮询约 1.7%，
+        300s 约 8.3%）。基准缺失（首个小时/新增点位/换表）时回退窗口首条并留痕。
+
+        reading 点放宽为 quality IN (0,3)，使人工补录的累计读数参与计算；
         power 点仍只取 quality=0，避免人工值污染瞬时功率统计。
         """
         hour_start = int(hour_start)
         hour_end: int = hour_start + SECONDS_PER_HOUR
         meters = db.query("SELECT id FROM meter WHERE is_enabled=1 AND is_counted=1")
+        fallback_meters: int = 0
 
         for meter in meters:
             meter_id: int = int(meter["id"])
@@ -73,20 +84,32 @@ class Aggregator:
                 continue  # 未配置累计电量点，无法计算小时电量
             point_id: int = int(reading_point["id"])
 
-            first = db.query_one(
-                "SELECT value FROM reading WHERE point_id=? AND ts>=? AND ts<? "
-                "AND quality IN (0,3) ORDER BY ts ASC LIMIT 1",
-                (point_id, hour_start, hour_end),
-            )
-            last = db.query_one(
-                "SELECT value FROM reading WHERE point_id=? AND ts>=? AND ts<? "
+            # 收口：hour_end 之前最后一条有效读数（本小时必须至少有它，否则无数据）
+            end = db.query_one(
+                "SELECT value, ts FROM reading WHERE point_id=? AND ts<? "
                 "AND quality IN (0,3) ORDER BY ts DESC LIMIT 1",
-                (point_id, hour_start, hour_end),
+                (point_id, hour_end),
             )
-            if first is None or last is None:
+            if end is None:
                 continue  # 该小时无有效读数，不产出汇总行
 
-            delta_kwh: float = float(last["value"]) - float(first["value"])
+            # 基准：hour_start 及之前的最后一条；缺失则回退到窗口内首条
+            base = db.query_one(
+                "SELECT value, ts FROM reading WHERE point_id=? AND ts<=? "
+                "AND quality IN (0,3) ORDER BY ts DESC LIMIT 1",
+                (point_id, hour_start),
+            )
+            if base is None:
+                base = db.query_one(
+                    "SELECT value, ts FROM reading WHERE point_id=? AND ts>=? AND ts<? "
+                    "AND quality IN (0,3) ORDER BY ts ASC LIMIT 1",
+                    (point_id, hour_start, hour_end),
+                )
+                fallback_meters += 1
+            if base is None:
+                continue
+
+            delta_kwh: float = float(end["value"]) - float(base["value"])
             if delta_kwh < 0:
                 # 累计值回退（换表/溢出）：本小时记 0 并留审计痕迹
                 db.log_event(
@@ -133,24 +156,38 @@ class Aggregator:
                 (meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt),
             )
 
+        if fallback_meters:
+            db.log_event(
+                "warn", "collector", "ROLLUP_NO_BASE",
+                f"hour_start={hour_start} 有 {fallback_meters} 块表缺基准读数，"
+                "已回退窗口内首条（该小时电量可能偏低）",
+            )
         db.log_event("info", "collector", "ROLLUP_HOUR_DONE", f"小时汇总完成 hour_start={hour_start}")
 
-    def settle_day(self, day_start: int, is_final: int = 1) -> None:
+    def settle_day(
+        self, day_start: int, is_final: int = 1, enforce_coverage: bool = True
+    ) -> None:
         """把某日 24 个 UTC 小时汇总成 daily 并计电费；is_final 可指定结算状态。
 
-        正式结算默认 is_final=1；模拟模式用 is_final=0 保证看板当天有数；
-        手动录入回填时保留当日原 is_final 值。
+        定稿门槛：只有「有数据的小时数 ≥ 24×90%」且「有数据的表数 ≥ 应结算表数×90%」
+        才允许写 is_final=1，否则保留 is_final=0 并记 SETTLE_INCOMPLETE 事件。
+        避免「一天只有 1 小时数据」「100 块表只到 3 块」也被当作最终数用于对账。
+
+        模拟模式（is_final=0）与人工回填（enforce_coverage=False）不受门槛限制：
+        前者本就只是当天实时视图，后者是操作员对历史数据的明确修正。
         """
         day_start = int(day_start)
         final_flag: int = 1 if int(is_final) else 0
         day_end: int = day_start + SECONDS_PER_DAY
         rows = db.query(
-            "SELECT meter_id, energy_wh, avg_power, max_power, sample_cnt "
+            "SELECT meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt "
             "FROM hourly WHERE hour_start>=? AND hour_start<?",
             (day_start, day_end),
         )
         buckets: dict[int, dict[str, Any]] = {}
+        hours_covered: set[int] = set()
         for row in rows:
+            hours_covered.add(int(row["hour_start"]))
             bucket: dict[str, Any] = buckets.setdefault(
                 int(row["meter_id"]),
                 {"energy_wh": 0, "weighted_sum": 0.0, "samples": 0, "peak": None},
@@ -164,6 +201,21 @@ class Aggregator:
                 peak: float = float(row["max_power"])
                 if bucket["peak"] is None or peak > bucket["peak"]:
                     bucket["peak"] = peak
+
+        if final_flag and enforce_coverage and buckets:
+            counted = db.query_one(
+                "SELECT COUNT(*) AS cnt FROM meter WHERE is_enabled=1 AND is_counted=1"
+            )
+            total_meters: int = int(counted["cnt"]) if counted is not None else 0
+            hour_ratio: float = len(hours_covered) / 24.0
+            meter_ratio: float = len(buckets) / total_meters if total_meters else 0.0
+            if hour_ratio < SETTLE_MIN_COVERAGE or meter_ratio < SETTLE_MIN_COVERAGE:
+                final_flag = 0
+                db.log_event(
+                    "warn", "collector", "SETTLE_INCOMPLETE",
+                    f"day_start={day_start} 数据不完整，按未结算保留："
+                    f"小时覆盖 {len(hours_covered)}/24，表覆盖 {len(buckets)}/{total_meters}",
+                )
 
         for meter_id, bucket in buckets.items():
             energy_wh: int = int(bucket["energy_wh"])
@@ -378,9 +430,9 @@ class Aggregator:
         return max(1.0, target - now)
 
     async def run_loop(self) -> None:
-        """启动即补算遗漏日，此后每天 UTC 00:10 结算昨日并兜底补算。"""
+        """启动即补算遗漏日，此后每天 UTC 00:10 结算昨日、兜底补算并清理超期读数。"""
         try:
-            self._catch_up()
+            await asyncio.to_thread(self._catch_up)
         except Exception as exc:  # 启动补算失败不能阻断后台任务
             db.log_event("error", "collector", "CATCHUP_FAIL", f"补算遗漏日失败: {exc}")
 
@@ -388,12 +440,76 @@ class Aggregator:
             await asyncio.sleep(self._seconds_to_settle())
             try:
                 yesterday: int = (int(time.time()) // SECONDS_PER_DAY) * SECONDS_PER_DAY - SECONDS_PER_DAY
-                self.settle_day(yesterday)
-                self._catch_up()
+                # 结算涉及上百次查询与写入，放线程执行，避免阻塞事件循环里的 HTTP 请求
+                await asyncio.to_thread(self.settle_day, yesterday)
+                await asyncio.to_thread(self._catch_up)
+                await asyncio.to_thread(self.purge_old_readings)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 db.log_event("error", "collector", "SETTLE_FAIL", f"自动结算失败: {exc}")
+
+    def rollup_recent_hours(self, now: int | None = None) -> int:
+        """收口上一小时并滚动更新当前小时，返回本次汇总的小时数。
+
+        单独抽成同步方法，既供 run_hourly_loop 放线程执行，也便于用例直接验证
+        「读数 -> 小时表」这一步（不必等待 5 分钟轮询）。
+        """
+        moment: int = int(now if now is not None else time.time())
+        hour_start: int = (moment // SECONDS_PER_HOUR) * SECONDS_PER_HOUR
+        self.rollup_hour(hour_start - SECONDS_PER_HOUR)
+        self.rollup_hour(hour_start)
+        return 2
+
+    async def run_hourly_loop(self, interval_sec: int = LIVE_ROLLUP_SEC) -> None:
+        """真实采集模式的小时汇总：每 interval_sec 收口上一小时并滚动更新当前小时。
+
+        live 模式此前只起采集器与日结算循环，hourly 没有任何写入者，
+        导致日/周/月汇总与报表全部为空；此循环补齐该环节。
+        """
+        while True:
+            try:
+                await asyncio.to_thread(self.rollup_recent_hours)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                db.log_event(
+                    "error", "collector", "HOURLY_ROLLUP_FAIL", f"小时汇总失败: {exc}"
+                )
+            await asyncio.sleep(max(60, int(interval_sec)))
+
+    def purge_old_readings(self, now: int | None = None) -> int:
+        """删除超期原始读数并裁剪事件日志，返回删除的读数行数。
+
+        原始读数按 RETENTION_DAYS 保留、按 RETENTION_BATCH 分批删除（每批独立提交），
+        避免一次性大事务长时间锁库；事件日志按 EVENT_LOG_MAX_ROWS 保留最新若干条。
+        """
+        base: int = int(now if now is not None else time.time())
+        cutoff: int = (base // SECONDS_PER_DAY) * SECONDS_PER_DAY - RETENTION_DAYS * SECONDS_PER_DAY
+        removed: int = 0
+        while True:
+            with db.transaction() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM reading WHERE (point_id, ts) IN "
+                    "(SELECT point_id, ts FROM reading WHERE ts<? LIMIT ?)",
+                    (cutoff, RETENTION_BATCH),
+                )
+                batch: int = int(cursor.rowcount or 0)
+            removed += batch
+            if batch < RETENTION_BATCH:
+                break
+        with db.transaction() as conn:
+            conn.execute(
+                "DELETE FROM event_log WHERE id IN "
+                "(SELECT id FROM event_log ORDER BY id DESC LIMIT -1 OFFSET ?)",
+                (EVENT_LOG_MAX_ROWS,),
+            )
+        if removed:
+            db.log_event(
+                "info", "collector", "RETENTION_PURGE",
+                f"清理 {RETENTION_DAYS} 天前原始读数 {removed} 行",
+            )
+        return removed
 
     async def run_simulate_loop(self) -> None:
         """模拟模式专用：每 rollup_interval_sec 汇总当前小时 + 当天非 final 日汇总。"""
@@ -403,9 +519,9 @@ class Aggregator:
                 hour_start: int = (now // SECONDS_PER_HOUR) * SECONDS_PER_HOUR
                 day_start: int = (now // SECONDS_PER_DAY) * SECONDS_PER_DAY
                 # 启动回填可能跨小时，前一小时也汇总一次保证趋势连续
-                self.rollup_hour(hour_start - SECONDS_PER_HOUR)
-                self.rollup_hour(hour_start)
-                self.settle_day(day_start, is_final=0)
+                await asyncio.to_thread(self.rollup_hour, hour_start - SECONDS_PER_HOUR)
+                await asyncio.to_thread(self.rollup_hour, hour_start)
+                await asyncio.to_thread(self.settle_day, day_start, 0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

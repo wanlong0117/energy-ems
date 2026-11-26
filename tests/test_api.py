@@ -9,7 +9,7 @@ import httpx
 import main
 from helpers import (
     FakeGateway, add_reading, create_device, create_meter, create_node,
-    create_point, create_tariff, link_point, run,
+    create_point, create_tariff, fill_hourly, link_point, run,
 )
 
 DAY_START = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
@@ -34,7 +34,7 @@ def _envelope(response: httpx.Response, status: int = 200) -> dict:
     return body
 
 
-def test_login_session_protection_and_logout_flow(isolated_db):
+def test_login_session_protection_and_logout_flow(ready_db):
     async def scenario():
         async with _client() as client:
             unauth = _envelope(await client.get("/api/config/node"), 401)
@@ -62,7 +62,7 @@ def test_login_session_protection_and_logout_flow(isolated_db):
     run(scenario())
 
 
-def test_logout_is_protected_endpoint_per_design(isolated_db):
+def test_logout_is_protected_endpoint_per_design(ready_db):
     """设计 §3.2 端点清单：POST /api/logout 需要认证。"""
     async def scenario():
         async with _client() as client:
@@ -73,7 +73,7 @@ def test_logout_is_protected_endpoint_per_design(isolated_db):
     run(scenario())
 
 
-def test_crud_for_all_seven_config_resources(isolated_db):
+def test_crud_for_all_seven_config_resources(ready_db):
     async def scenario():
         async with _client() as client:
             await _login(client)
@@ -172,7 +172,7 @@ def test_crud_for_all_seven_config_resources(isolated_db):
     run(scenario())
 
 
-def test_point_validation_via_api_rejects_all_invalid_cases(isolated_db):
+def test_point_validation_via_api_rejects_all_invalid_cases(ready_db):
     async def scenario():
         async with _client() as client:
             await _login(client)
@@ -215,7 +215,7 @@ def test_point_validation_via_api_rejects_all_invalid_cases(isolated_db):
     run(scenario())
 
 
-def test_point_read_device_test_reload_and_events(isolated_db):
+def test_point_read_device_test_reload_and_events(ready_db):
     async def scenario():
         async with FakeGateway(values=[0x0000, 0x4148]) as gateway:
             async with _client() as client:
@@ -255,7 +255,7 @@ def test_point_read_device_test_reload_and_events(isolated_db):
     run(scenario())
 
 
-def test_latest_hourly_daily_and_settle_endpoints(isolated_db):
+def test_latest_hourly_daily_and_settle_endpoints(ready_db):
     from aggregation import aggregator
 
     node_id = create_node(name="A栋")
@@ -292,6 +292,8 @@ def test_latest_hourly_daily_and_settle_endpoints(isolated_db):
             assert len(hourly) == 1
             assert hourly[0]["energy_wh"] == 1_234_000
 
+            # 补齐其余 23 小时，构造「数据完整」的日，否则日结算不会定稿
+            fill_hourly(meter_id, DAY_START, skip=(0,))
             settled = _envelope(await client.post(
                 "/api/settle", json={"day_start": DAY_START}
             ))["data"]
@@ -310,7 +312,7 @@ def test_latest_hourly_daily_and_settle_endpoints(isolated_db):
     run(scenario())
 
 
-def test_api_failure_status_codes_and_response_shape(isolated_db):
+def test_api_failure_status_codes_and_response_shape(ready_db):
     async def scenario():
         async with _client() as client:
             await _login(client)

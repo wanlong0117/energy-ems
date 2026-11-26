@@ -54,5 +54,7 @@ def test_change_password_rejects_bad_input(isolated_db):
 def test_env_password_used_on_first_boot(isolated_db, monkeypatch):
     auth.CONFIG_PATH.unlink(missing_ok=True)
     monkeypatch.setenv("EMS_PASSWORD", "EnvPass2026")
-    assert auth.load_password() == "EnvPass2026"
+    assert auth.verify_login_password("EnvPass2026") is True
+    assert auth.verify_login_password("ems2026") is False
+    # 环境变量指定的初始密码不是公开默认值，不应强制改密
     assert auth.must_change_password() is False

@@ -98,6 +98,30 @@ def create_tariff(price_cent: int = 80, is_default: int = 1, name: str = "平价
     ))
 
 
+def fill_hourly(
+    meter_id: int,
+    day_start: int,
+    *,
+    energy_wh: int = 0,
+    skip: tuple[int, ...] = (),
+    sample_cnt: int = 0,
+) -> None:
+    """补齐某日 24 条小时汇总（默认电量 0），用于构造「数据完整」的日。
+
+    日结算要求小时覆盖与表覆盖均达 90%，只有单个小时的用例必须调用本函数，
+    否则会被判为不完整、is_final 保持 0。
+    """
+    for hour in range(24):
+        if hour in skip:
+            continue
+        db.execute(
+            "INSERT OR REPLACE INTO hourly "
+            "(meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt) "
+            "VALUES (?,?,?,NULL,NULL,?)",
+            (meter_id, day_start + hour * 3600, energy_wh, sample_cnt),
+        )
+
+
 class FakeGateway:
     """本地 asyncio TCP 假网关，按 MBAP 帧回答寄存器，并记录收到的请求。"""
 

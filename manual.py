@@ -18,10 +18,26 @@ from settings import QUALITY_MANUAL, SECONDS_PER_DAY, SECONDS_PER_HOUR
 class ManualService:
     """人工读数服务：事务写入 + 最近列表 + 受影响小时/日回填。"""
 
+    # 补录窗口：只允许最近 90 天至当前时间后 5 分钟，避免凭空生成 1970 或未来日期的汇总
+    MAX_LOOKBACK_DAYS: int = 90
+    MAX_FUTURE_SEC: int = 300
+
+    def _check_ts(self, ts: int) -> int:
+        """校验时间戳落在允许区间内，返回规范化后的整数秒。"""
+        if ts <= 0:
+            raise ValueError("ts 必须为正整数时间戳")
+        now: int = int(time.time())
+        earliest: int = now - self.MAX_LOOKBACK_DAYS * SECONDS_PER_DAY
+        if ts < earliest:
+            raise ValueError(f"ts 超出可补录范围（仅支持最近 {self.MAX_LOOKBACK_DAYS} 天）")
+        if ts > now + self.MAX_FUTURE_SEC:
+            raise ValueError("ts 不得晚于当前时间 5 分钟以上")
+        return ts
+
     def record(self, body: dict[str, Any]) -> dict[str, Any]:
         """录入一条人工读数，返回写入结果与是否覆盖。"""
         point_id: int = int(body.get("point_id", 0))
-        ts: int = int(body.get("ts", 0))
+        ts: int = self._check_ts(int(body.get("ts", 0)))
         value: float = float(body.get("value", 0.0))
         operator: str = str(body.get("operator") or "").strip()
         remark: str | None = body.get("remark")
@@ -55,10 +71,12 @@ class ManualService:
         }
 
     def _write_in_txn(self, row: dict[str, Any]) -> bool:
-        """单事务写三表；返回是否存在被覆盖的原记录。"""
-        conn = db.get_conn()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        """单事务写三表；返回是否存在被覆盖的原记录。
+
+        事务跑在独立连接上（db.transaction），期间全局连接被锁挡住，
+        不会出现「别的线程提交时把本次未提交写入一并提交」的串味。
+        """
+        with db.transaction() as conn:
             existing = conn.execute(
                 "SELECT 1 FROM manual_reading WHERE point_id=? AND ts=?",
                 (row["point_id"], row["ts"]),
@@ -96,14 +114,14 @@ class ManualService:
                         row["point_id"],
                     ),
                 )
-            conn.commit()
             return overwritten
-        except Exception:
-            conn.rollback()
-            raise
 
     def recompute(self, ts: int) -> None:
-        """回填受影响小时与当日汇总；当日原 is_final 状态保留。"""
+        """回填受影响小时与当日汇总；当日原 is_final 状态保留。
+
+        操作员对历史数据的明确修正不再受自动结算的覆盖率门槛约束，
+        因此传 enforce_coverage=False，保持原 is_final 语义。
+        """
         ts = int(ts)
         hour_start: int = (ts // SECONDS_PER_HOUR) * SECONDS_PER_HOUR
         day_start: int = (ts // SECONDS_PER_DAY) * SECONDS_PER_DAY
@@ -118,7 +136,7 @@ class ManualService:
         else:
             today_start: int = (int(time.time()) // SECONDS_PER_DAY) * SECONDS_PER_DAY
             is_final = 0 if day_start == today_start else 1
-        aggregator.settle_day(day_start, is_final=is_final)
+        aggregator.settle_day(day_start, is_final=is_final, enforce_coverage=False)
 
     def list(self, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """最近录入列表（point_id / limit 过滤）。"""

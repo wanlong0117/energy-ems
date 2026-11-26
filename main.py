@@ -5,8 +5,9 @@
 
 v2 模式编排：
   simulate -> Simulator.ensure_baseline() + start()，不启动 Collector，额外启 Aggregator.run_simulate_loop()
-  live     -> Collector.start()，不启动 Simulator
-  两种模式都启动 Aggregator.run_loop()；Aggregator 为周/月按需聚合视图，不落新表。
+  live     -> Collector.start() + Aggregator.run_hourly_loop()（小时汇总的唯一写入者），不启动 Simulator
+  两种模式都启动 Aggregator.run_loop()（日结算 + 补算 + 超期读数清理）。
+  FastAPI 自带文档路由已关闭，/docs 与 /openapi.json 改为带 require_auth 的入口。
 """
 from __future__ import annotations
 
@@ -16,9 +17,10 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import auth
@@ -28,6 +30,7 @@ from api_auth import router as auth_router
 from api_config import router as config_router
 from api_data import router as data_router
 from api_report import router as report_router
+from auth import require_auth
 from collector import collector
 from settings import (
     DATA_MODE_DEFAULT,
@@ -71,8 +74,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         db.log_event("info", "api", "MODE_RUN", f"启动模拟模式，间隔 {interval_sec}s")
     else:
-        # 真实模式：模拟器完全不启动
+        # 真实模式：模拟器完全不启动，但必须起小时汇总，否则 hourly 无写入者
         background.append(asyncio.create_task(collector.start(), name="ems-collector"))
+        background.append(
+            asyncio.create_task(aggregator.run_hourly_loop(), name="ems-hourly-rollup")
+        )
         db.log_event("info", "api", "MODE_RUN", "启动真实采集模式")
 
     # 两种模式都启动正式结算循环（UTC 00:10 结算昨日 + 补算遗漏日）
@@ -91,13 +97,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db.log_event("info", "api", "SHUTDOWN", "energy_ems 服务停止")
 
 
-app: FastAPI = FastAPI(title="energy_ems", version="0.1.0", lifespan=lifespan)
+app: FastAPI = FastAPI(
+    title="energy_ems",
+    version="0.1.1",
+    lifespan=lifespan,
+    # 关闭 FastAPI 自带的免鉴权文档路由，改用下方带 require_auth 的入口
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 # 路由注册：认证路由在前，其余均挂 require_auth
 app.include_router(auth_router)
 app.include_router(config_router)
 app.include_router(data_router)
 app.include_router(report_router)
+
+
+@app.get("/openapi.json", include_in_schema=False, dependencies=[Depends(require_auth)])
+async def openapi_spec() -> JSONResponse:
+    """带鉴权的 OpenAPI 描述：未登录返回 401，登录后才对外暴露接口清单。"""
+    return JSONResponse(app.openapi())
+
+
+@app.get("/docs", include_in_schema=False, dependencies=[Depends(require_auth)])
+async def swagger_docs() -> HTMLResponse:
+    """带鉴权的接口文档页（Swagger UI 静态资源取自 CDN，纯内网可能渲染不出）。"""
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="energy_ems API")
 
 
 @app.exception_handler(HTTPException)

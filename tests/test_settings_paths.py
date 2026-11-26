@@ -62,6 +62,7 @@ def test_existing_user_keys_are_not_overwritten_by_defaults(isolated_db):
     config_path = auth.CONFIG_PATH
     original = {
         "password": "p",
+        "password_changed": True,
         "data_mode": "live",
         "simulate_interval_sec": 77,
         "simulate_rollup_sec": 99,

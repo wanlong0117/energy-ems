@@ -7,7 +7,7 @@ import db
 from aggregation import Aggregator
 from helpers import (
     add_reading, create_device, create_meter, create_node, create_point,
-    create_tariff, link_point,
+    create_tariff, fill_hourly, link_point,
 )
 
 DAY_START = int(datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp())
@@ -62,15 +62,23 @@ def test_settle_day_uses_utc_midnight_final_flag_and_cost(isolated_db):
                        (meter_id, DAY_START))
     assert row is not None
     assert row["energy_wh"] == 1_234_000
-    assert row["is_final"] == 1
     assert row["cost_cent"] == round(1.234 * 80)
     assert row["peak_power"] == 300.0
     assert row["avg_power"] == 200.0
     assert DAY_START % 86400 == 0  # UTC 00:00 == 本地 08:00
 
+    # 只有 1 小时数据：不满足 90% 覆盖门槛，必须保留未结算并留痕
+    assert row["is_final"] == 0
+    assert db.query_one("SELECT 1 FROM event_log WHERE code='SETTLE_INCOMPLETE'") is not None
+
+    # 补齐 24 小时后重结算：定稿，且不重复写行
+    fill_hourly(meter_id, DAY_START)
     aggregator.settle_day(DAY_START)
     assert len(db.query("SELECT 1 FROM daily WHERE meter_id=? AND day_start=?",
                         (meter_id, DAY_START))) == 1
+    assert db.query_one(
+        "SELECT is_final FROM daily WHERE meter_id=? AND day_start=?", (meter_id, DAY_START)
+    )["is_final"] == 1
     assert db.query_one("SELECT 1 FROM event_log WHERE code='SETTLE_DONE'") is not None
 
 

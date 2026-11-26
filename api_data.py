@@ -126,6 +126,12 @@ class DataService:
 data_service: DataService = DataService()
 
 
+def _internal(code: str, action: str, exc: Exception) -> Any:
+    """内部错误不回显原文：原文进事件日志，对外只给通用话术。"""
+    db.log_event("error", "api", code, f"{action}失败: {type(exc).__name__}: {exc}")
+    return fail(f"{action}失败，请查看事件日志", 500)
+
+
 @router.get("/latest")
 def latest(
     point_id: int | None = None, meter_id: int | None = None
@@ -134,7 +140,7 @@ def latest(
     try:
         return ok(data_service.latest(point_id, meter_id))
     except Exception as exc:
-        return fail(f"查询最新读数失败: {exc}", 500)
+        return _internal("LATEST_QUERY_FAIL", "查询最新读数", exc)
 
 
 @router.get("/hourly")
@@ -149,7 +155,7 @@ def hourly(
     try:
         return ok(data_service.hourly(meter_id, from_, to, purpose, node_id))
     except Exception as exc:
-        return fail(f"查询小时汇总失败: {exc}", 500)
+        return _internal("HOURLY_QUERY_FAIL", "查询小时汇总", exc)
 
 
 @router.get("/daily")
@@ -165,7 +171,7 @@ def daily(
     try:
         return ok(data_service.daily(meter_id, from_, to, purpose, node_id, is_final))
     except Exception as exc:
-        return fail(f"查询日汇总失败: {exc}", 500)
+        return _internal("DAILY_QUERY_FAIL", "查询日汇总", exc)
 
 
 @router.get("/weekly")
@@ -181,7 +187,7 @@ def weekly(
     try:
         return ok(aggregator.weekly(meter_id, from_, to, purpose, node_id, is_final))
     except Exception as exc:
-        return fail(f"查询周汇总失败: {exc}", 500)
+        return _internal("WEEKLY_QUERY_FAIL", "查询周汇总", exc)
 
 
 @router.get("/monthly")
@@ -197,7 +203,7 @@ def monthly(
     try:
         return ok(aggregator.monthly(meter_id, from_, to, purpose, node_id, is_final))
     except Exception as exc:
-        return fail(f"查询月汇总失败: {exc}", 500)
+        return _internal("MONTHLY_QUERY_FAIL", "查询月汇总", exc)
 
 
 @router.get("/mode")
@@ -211,24 +217,35 @@ def mode() -> Any:
             "simulate_rollup_sec": int(config.get("simulate_rollup_sec", 600)),
         })
     except Exception as exc:
-        return fail(f"查询数据模式失败: {exc}", 500)
+        return _internal("MODE_QUERY_FAIL", "查询数据模式", exc)
 
 
 @router.post("/settle")
 def settle(body: SettleIn | None = None) -> Any:
-    """POST /api/settle：手动结算；省略 day_start 时结算最近一个完整日。"""
+    """POST /api/settle：手动结算；省略 day_start 时结算最近一个完整日。
+
+    结算是否定稿由覆盖率决定：数据不完整时保留 is_final=0，响应里如实回传。
+    """
     try:
+        today_start: int = (int(time.time()) // SECONDS_PER_DAY) * SECONDS_PER_DAY
         if body is not None and body.day_start is not None:
             day_start: int = int(body.day_start)
+            if day_start > today_start:
+                return fail("不允许结算未来日期", 400)
         else:
-            day_start = (int(time.time()) // SECONDS_PER_DAY) * SECONDS_PER_DAY - SECONDS_PER_DAY
+            day_start = today_start - SECONDS_PER_DAY
         aggregator.settle_day(day_start)
+        final_row = db.query_one(
+            "SELECT MIN(is_final) AS final_flag FROM daily WHERE day_start=?", (day_start,)
+        )
+        settled: bool = bool(final_row and int(final_row["final_flag"] or 0) == 1)
         return ok({
             "day_start": day_start,
-            "settled": True,
+            "settled": settled,
+            "is_final": 1 if settled else 0,
             "purposes": aggregator.split_by_purpose(day_start),
         })
     except ValueError as exc:
         return fail(str(exc), 400)
     except Exception as exc:
-        return fail(f"手动结算失败: {exc}", 500)
+        return _internal("SETTLE_FAIL", "手动结算", exc)
