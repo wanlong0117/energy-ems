@@ -8,7 +8,7 @@ energy_ems/
 ├── _internal/            # PyInstaller 运行依赖
 ├── schema.sql            # 已内嵌只读资源（无需单独放置）
 ├── dashboard/            # 已内嵌单文件看板（无需单独放置）
-├── build_win11.bat       # 双击启动脚本
+├── build_win11.bat       # 备用启动脚本（主启动双击 energy_ems.exe）
 ├── README_DEPLOY.md      # 本说明
 ├── config.json           # 首次运行自动生成（可写，exe 同级）
 └── energy.db             # 首次运行自动生成（可写，exe 同级）
@@ -22,7 +22,7 @@ energy_ems/
 
 1. 解压 `energy-ems-win11-x64-<YYYYMMDD>.zip` 到任意目录（建议非中文路径、非 C:\Program Files，
    避免权限问题）。
-2. **双击 `build_win11.bat`**。脚本会把工作目录切到 exe 所在目录并启动服务。
+2. **双击 `energy_ems.exe`** 启动（`build_win11.bat` 为可选备用脚本）。
 3. 打开浏览器访问 `http://127.0.0.1:8000/`，即可看到单文件看板。
 4. 默认密码 `ems2026`（见 config.json 的 `password`，可自行修改后重启）。
 
@@ -70,7 +70,9 @@ energy_ems/
 ## 5. 备份与恢复
 
 - 停服务后直接复制 `energy.db` 即可完整备份（含 WAL 数据）。
-- 不停机备份：先执行检查点把 WAL 合并进主库，再复制 `energy.db`：
+- 推荐停服后复制：`energy.db` 在服务关闭时会自动检查点，直接复制最稳妥。
+- 若确实需要不停机备份：exe 包不含 Python 解释器，请在装有 Python 的机器上执行检查点，
+  再把 `energy.db` 复制过来：
 
   ```bat
   python -c "import sqlite3; c=sqlite3.connect('energy.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()"
@@ -79,18 +81,19 @@ energy_ems/
 
 - 恢复：停服务 → 用备份覆盖 `energy.db` → 重新启动。
 - 旧版本库升级：直接替换程序，启动会自动重跑 schema.sql 幂等补表（`manual_reading`）
-  并保留原有 12 表全部数据。
+  并保留原有 13 张表全部数据。
 
 ## 6. 常见问题
 
-**Q：双击 bat 后窗口一闪而过 / 提示缺少 DLL**
-A：目标机缺少 Visual C++ 运行库时安装 `vc_redist.x64.exe`（Microsoft Visual C++
-Redistributable 2015-2022 x64），安装后重启电脑再试。Win11 通常已自带，
-如仍报错请查看黑框中的具体缺失模块名。
+**Q：双击 exe 后窗口一闪而过 / 提示缺少 DLL**
+A：包内 `_internal/` 已内置 `VCRUNTIME140.dll`，Win11 通常无需另装 VC++ 运行库。
+请先确认 zip 已完整解压（`energy_ems.exe` 与 `_internal/` 同级），并检查 Windows Defender
+是否误删了 exe（可加白名单后重新解压）。如仍报错，查看黑框里的具体缺失模块名。
 
 **Q：端口 8000 被占用**
-A：以命令行方式启动并指定端口：
-`energy_ems.exe` 内部使用 settings.HTTP_PORT，源码运行时可用环境变量或直接修改源码常量后重新打包。
+A：exe 版端口固定为 8000，先关闭占用它的程序（在 exe 目录打开 cmd 运行
+`netstat -ano | findstr :8000`，再按 PID 结束进程）。若必须使用其他端口，
+可用 Windows 端口转发：`netsh interface portproxy add v4tov4 listenport=8080 connectport=8000 connectaddress=127.0.0.1`。
 
 **Q：看板为空**
 A：确认已登录；simulate 模式首屏会立即产数，若仍为空检查 `energy.db` 是否可写、
