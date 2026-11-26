@@ -12,6 +12,7 @@ v2：新增 week_start()/month_start() 与 Aggregator.weekly()/monthly()——
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -34,6 +35,24 @@ from settings import (
     SIMULATE_ROLLUP_SEC,
     day_floor,
 )
+
+
+def _shutdown_threshold(per_meter: Any) -> float:
+    """单表停机阈值（W）：表上填了就用表上的，否则回退全局 EMS_SHUTDOWN_POWER_W。
+
+    返回 0 表示**关闭判定**。负数、inf、nan 一律当关闭——这些值只会来自手误，
+    若放行会让「功率 < 阈值」恒成立，把整天判成停机、覆盖率分母归零。
+    """
+    value: Any = per_meter
+    if value is None:
+        value = getattr(settings_module, "SHUTDOWN_POWER_W", 0.0)
+    try:
+        threshold: float = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(threshold) or threshold <= 0:
+        return 0.0
+    return threshold
 
 
 def _tz_shift() -> int:
@@ -227,11 +246,15 @@ class Aggregator:
     ) -> None:
         """把某日 24 个 UTC 小时汇总成 daily 并计电费；is_final 可指定结算状态。
 
-        定稿门槛分两层：
+        定稿门槛分三层：
           · 表覆盖——有数据的表数须 ≥ 应结算表数×90%，否则整日都不定时稿；
-          · 单表小时覆盖——该表当日有数据的小时数须 ≥ 24×90%，不足则该表单独
-            保留 is_final=0。旧实现用「所有表的小时并集」判定，拦不住
-            「99 块表满 24 小时、1 块只有 1 小时」也被一并定稿的情况。
+          · 单表小时覆盖——该表当日有数据的小时数须 ≥ 应覆盖小时数×90%，
+            不足则该表单独保留 is_final=0。旧实现用「所有表的小时并集」判定，
+            拦不住「99 块表满 24 小时、1 块只有 1 小时」也被一并定稿的情况；
+          · 应覆盖小时数 = 24 − 停机小时。停机小时按「该小时平均功率 < 阈值」
+            判定（阈值逐表：meter.shutdown_power_w，回退全局 EMS_SHUTDOWN_POWER_W）。
+            夜间停产、周末停线、设备待机这类小时本来就不该有生产电量，把它们算进
+            分母等于要求「停产也得报数」，结果是 0 度停产日永远定不了稿。
 
         模拟模式（is_final=0）与人工回填（enforce_coverage=False）不受门槛限制：
         前者本就只是当天实时视图，后者是操作员对历史数据的明确修正。
@@ -242,10 +265,17 @@ class Aggregator:
         # 应结算表集合：启用 + 计入，且接入真表后排除演示表（P0）。
         # 覆盖率分母必须与「谁应该报数」一致，否则演示数据会把分母撑爆。
         target_rows = db.query(
-            "SELECT id FROM meter WHERE is_enabled=1 AND is_counted=1" + db.demo_guard("meter")
+            "SELECT id, shutdown_power_w FROM meter WHERE is_enabled=1 AND is_counted=1"
+            + db.demo_guard("meter")
         )
         target_ids: list[int] = [int(row["id"]) for row in target_rows]
         target_set: set[int] = set(target_ids)
+        # 停机阈值逐表解析：同一厂区里注塑机待机 3 kW、照明回路待机 20 W，
+        # 一个全局阈值不可能同时正确，所以表级配置优先、全局只当兜底。
+        thresholds: dict[int, float] = {
+            int(row["id"]): _shutdown_threshold(row["shutdown_power_w"])
+            for row in target_rows
+        }
         rows = db.query(
             "SELECT meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt "
             "FROM hourly WHERE hour_start>=? AND hour_start<?",
@@ -261,11 +291,14 @@ class Aggregator:
                 int(row["meter_id"]),
                 {
                     "energy_wh": 0, "weighted_sum": 0.0, "samples": 0,
-                    "peak": None, "hours": [],
+                    "peak": None, "hours": [], "power_by_hour": {},
                 },
             )
             bucket["energy_wh"] += int(row["energy_wh"])
             bucket["hours"].append((int(row["hour_start"]), int(row["energy_wh"])))
+            bucket["power_by_hour"][int(row["hour_start"])] = (
+                None if row["avg_power"] is None else float(row["avg_power"])
+            )
             samples: int = int(row["sample_cnt"] or 0)
             if row["avg_power"] is not None:
                 bucket["weighted_sum"] += float(row["avg_power"]) * samples
@@ -297,6 +330,7 @@ class Aggregator:
 
         short_meters: list[str] = []
         settled_meters: int = 0
+        shutdown_meters: list[str] = []
         # 正式结算时，应结算但整日无数据的表也要落一行零值（P2-4）：
         # 旧行为是「没数据就不产行」，报表按行求和会静默少计，而页面仍显示「已结算」。
         # 补零行 + covered_hours=0 + is_final=0，缺哪块表一眼能看出来。
@@ -316,23 +350,45 @@ class Aggregator:
             if bucket:
                 self._warn_if_reprice(meter_id, day_start, cost)
             covered_hours: int = len(hours)
+            # 停机小时：该小时功率点均值低于阈值 → 现场没在生产，不该要求「有数据」。
+            # 只认有功率读数的小时：没有功率点、或该小时没采到功率，一律不当停机，
+            # 否则「采不到数据」会被自己判成「停机」，覆盖率门槛就形同虚设。
+            threshold: float = thresholds.get(meter_id, 0.0)
+            power_by_hour: dict[int, float | None] = bucket["power_by_hour"] if bucket else {}
+            shutdown_hours: int = 0
+            if threshold > 0:
+                shutdown_hours = sum(
+                    1
+                    for power in power_by_hour.values()
+                    if power is not None and power < threshold
+                )
+            if shutdown_hours:
+                shutdown_meters.append(f"{meter_id}({shutdown_hours}h)")
+            # 覆盖率分母按「真实生产小时」算；整日停机时分母为 0，置 1 处理，
+            # 使「全天停产、当天 0 度」能正常定稿，而不是永远卡在未结算。
+            expected_hours: int = max(24 - shutdown_hours, 1)
             meter_final: int = day_final
             if (
                 meter_final
                 and enforce_coverage
-                and covered_hours / 24.0 < SETTLE_MIN_COVERAGE
+                and covered_hours / expected_hours < SETTLE_MIN_COVERAGE
             ):
                 meter_final = 0
-                short_meters.append(f"{meter_id}({covered_hours}/24)")
+                short_meters.append(
+                    f"{meter_id}({covered_hours}/{expected_hours}"
+                    + (f",停机{shutdown_hours}" if shutdown_hours else "")
+                    + ")"
+                )
             db.execute(
                 "INSERT OR REPLACE INTO daily "
                 "(meter_id, day_start, energy_wh, peak_power, avg_power, cost_cent, "
-                "is_final, covered_hours, price_cent, tariff_snapshot) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "is_final, covered_hours, shutdown_hours, price_cent, tariff_snapshot) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     meter_id, day_start, energy_wh,
                     bucket["peak"] if bucket else None, avg_power,
-                    cost.cost_cent, meter_final, covered_hours, cost.price_cent,
+                    cost.cost_cent, meter_final, covered_hours, shutdown_hours,
+                    cost.price_cent,
                     tariff.dumps(cost, covered_hours),
                 ),
             )
@@ -346,10 +402,20 @@ class Aggregator:
                 + (" ..." if len(short_meters) > 10 else ""),
             )
 
+        if shutdown_meters:
+            # 留一条痕：日报"定稿了但看起来只有几个小时数据"时，读表的人要靠它解释。
+            db.log_event(
+                "info", "collector", "SETTLE_SHUTDOWN",
+                f"day_start={day_start} 有 {len(shutdown_meters)} 块表存在停机小时，"
+                f"已从覆盖率分母剔除: {', '.join(shutdown_meters[:10])}"
+                + (" ..." if len(shutdown_meters) > 10 else ""),
+            )
+
         db.log_event(
             "info", "collector", "SETTLE_DONE",
             f"日结算完成 day_start={day_start}，is_final={day_final}，"
-            f"应结算表数={len(target_ids)}，有数据表数={len(buckets)}，写入行数={settled_meters}",
+            f"应结算表数={len(target_ids)}，有数据表数={len(buckets)}，"
+            f"写入行数={settled_meters}，含停机时段表数={len(shutdown_meters)}",
         )
 
     @staticmethod

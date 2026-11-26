@@ -10,6 +10,7 @@ v2 新增 frozen 双路径规则：
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -51,6 +52,19 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, "") or default)
     except (TypeError, ValueError):
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """读取浮点型环境变量；非法值与 inf/nan 一律回退默认值。
+
+    inf 必须挡住：`EMS_SHUTDOWN_POWER_W=inf` 会让「功率 < 阈值」恒成立，
+    全天 24 小时都被判成停机、覆盖率分母变成 0，报表直接失去意义。
+    """
+    try:
+        value: float = float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
 
 
 # 时区偏移：现场默认 UTC+8。报表的「本地时刻」「分时电价时段」都按它换算。
@@ -118,6 +132,16 @@ SIMULATE_INTERVAL_SEC: int = 300     # 模拟器写读数间隔，默认 5 分�
 SIMULATE_ROLLUP_SEC: int = 600       # 模拟模式小时/日汇总间隔，默认 10 分钟
 LIVE_ROLLUP_SEC: int = 300           # 真实模式小时汇总间隔，默认 5 分钟
 DEFAULT_BAUDRATE: int = 9600         # modbus_rtu_serial 默认波特率
+
+# ---------- 停机判定（影响日结算覆盖率） ----------
+# 现场口径：车间夜间停产时设备照常在线，功率掉到待机值（几十瓦），电量≈0。
+# 这种小时不该算进「应有数据」的分母，否则 24 小时里 22 小时停机的一天永远定稿不了。
+# 判定依据是 hourly.avg_power（该小时功率点均值）< 阈值 → 该小时计入停机。
+# 全局默认 0 表示**关闭**：升级后行为与旧版完全一致，需现场显式给阈值才生效。
+# 单表可在「计量表」里填 shutdown_power_w 覆盖（不同产线待机功率差很多）。
+SHUTDOWN_POWER_W: float = _env_float("EMS_SHUTDOWN_POWER_W", 0.0)
+if SHUTDOWN_POWER_W < 0:
+    SHUTDOWN_POWER_W = 0.0
 
 # ---------- 数据保留与结算门槛 ----------
 RETENTION_DAYS: int = 90             # 原始读数保留天数（超期按批删除）
@@ -201,4 +225,4 @@ HTTP_PORT: int = _env_int("EMS_PORT", 8000)
 
 # ---------- 版本 ----------
 # 单一事实源：FastAPI 元信息、/healthz、看板侧栏都读它，避免三处各写一个版本号
-APP_VERSION: str = "0.1.4"
+APP_VERSION: str = "0.1.5"

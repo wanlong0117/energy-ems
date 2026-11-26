@@ -122,6 +122,7 @@ classDiagram
         +int is_counted
         +int is_demo
         +int is_enabled
+        +float shutdown_power_w
     }
     class MeterPoint {
         +int meter_id
@@ -156,6 +157,7 @@ classDiagram
         +float avg_power
         +int cost_cent
         +int covered_hours
+        +int shutdown_hours
         +int is_final
     }
     class Tariff {
@@ -529,6 +531,7 @@ sequenceDiagram
 - **点位校验（硬性）**：`reg_offset` ∈ [0,65535]；`reg_count` ∈ [1,125]；`data_type`↔`reg_count` = u16/s16:1、u32/s32/f32:2、u64:4；`func_code` ∈ {3,4}；`byte_order` ∈ {ABCD,CDAB,BADC,DCBA}；同 device + 同 slave + 同 func 的 `[reg_offset, reg_offset+reg_count)` 区间不得与已有记录重叠（更新时排除自身 id）。
 - **演示数据隔离（关键）**：`node`/`device`/`point`/`meter` 带 `is_demo` 标记。只要存在一块「真实且启用」的表（`is_enabled=1 AND is_counted=1 AND is_demo=0`），所有汇总与查询都要经 `db.demo_guard()` 追加 `AND is_demo=0`；否则演示表会被计入覆盖率分母，把真表当天的定稿率从 100% 压到 1/101。切 live 时启动阶段调 `db.disable_demo_data()` 停用演示实体而不是删除——现场需要能回看演示库长什么样。
 - **手工补录的重算范围**：补录落在整点（`ts == hour_start`）时必须连带重算**上一小时**——左开右闭窗口下，整点读数同时是上一小时的收口基准；同时重算所属日的日报。只写新行不改旧行，就是「补录成功了但报表没动」的经典事故。
+- **停机判定与覆盖率分母**：某个小时 `hourly.avg_power` 低于阈值即判为停机，覆盖分母取 `24 − 停机小时`（整日停机时按 1 兜底，使 0 度停产日也能定稿）。阈值逐表解析：`meter.shutdown_power_w` 优先，`NULL` 回退全局 `EMS_SHUTDOWN_POWER_W`，`0` 表示关闭。三条不能松的口子：① 只认有功率读数的小时——采不到数据不能算停机，否则「采集断了」会被伪装成「停机」；② 停机只改覆盖率口径，不改电量与电费；③ 无数据的小时无从判定，仍计入分母。结算结果把 `shutdown_hours` 落到 `daily`，并记 `SETTLE_SHUTDOWN` 事件，供事后解释「为什么这天定稿了」。
 - **quality**：0=正常、1=超时、2=越界（超出 min/max）、3=人工。
 - **单一连接**：`db.py` 全局连接、`check_same_thread=False`；所有 DB 调用同步短事务，`execute()` 内 commit，避免在 `await` 间持有游标。
 - **寄存器合并**：同 (device, slave, func) 按 offset 排序，相邻/重叠合并为单次请求，单次 `reg_count ≤ 125`，超限拆分。

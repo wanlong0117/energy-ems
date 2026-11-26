@@ -24,13 +24,17 @@ from api_data import data_service
 from settings import MILLI_PER_KWH
 
 HEADERS: tuple[str, ...] = (
-    "期间", "计量表", "用途", "节点", "电量(kWh)", "电费(元)", "峰值功率", "覆盖小时", "已结算",
+    "期间", "计量表", "用途", "节点", "电量(kWh)", "电费(元)", "峰值功率", "覆盖小时",
+    "停机小时", "已结算",
 )
 KEYS: tuple[str, ...] = (
     "period", "meter_name", "purpose", "node_name",
-    "energy_kwh", "cost_yuan", "peak_power", "covered_hours", "final_text",
+    "energy_kwh", "cost_yuan", "peak_power", "covered_hours", "shutdown_hours",
+    "final_text",
 )
-COLUMN_WIDTHS_MM: tuple[float, ...] = (30.0, 44.0, 26.0, 30.0, 28.0, 24.0, 26.0, 22.0, 20.0)
+COLUMN_WIDTHS_MM: tuple[float, ...] = (
+    30.0, 44.0, 26.0, 30.0, 28.0, 24.0, 26.0, 22.0, 22.0, 20.0,
+)
 
 def footnote() -> str:
     """报表页脚说明：日切点可配，文案必须跟着配置走，不能写死 08:00。
@@ -46,6 +50,7 @@ def footnote() -> str:
         f"说明：日汇总口径为本地 {start:02d}:00 至次日 {end:02d}:00（期间列为区间起点）；"
         "电量单位 kWh、电费单位 元，均已按两位小数折算；"
         "“覆盖小时”为该表当期有数据的小时数（满值 24），"
+        "“停机小时”为功率低于停机阈值的时段，不计入完整度分母；"
         "“已结算=否”表示该期数据未达完整度门槛，仅供参考。"
     )
 
@@ -139,6 +144,13 @@ class ReportService:
                         if kind == "daily" and item.get("covered_hours") is not None
                         else ""
                     ),
+                    # 停机小时：结算时从覆盖率分母里剔除的小时数，用来解释
+                    # 「这天只有 2 小时数据为什么已结算」
+                    "shutdown_hours": (
+                        int(item["shutdown_hours"])
+                        if kind == "daily" and item.get("shutdown_hours") is not None
+                        else ""
+                    ),
                     "final_text": "是" if int(item.get("is_final") or 0) == 1 else "否",
                 }
             )
@@ -180,7 +192,7 @@ class ReportService:
             sheet.append([row.get(key, "") for key in KEYS])
 
         energy_total, cost_total = self._totals(rows)
-        total_row: list[Any] = ["合计", "", "", "", energy_total, cost_total, "", "", ""]
+        total_row: list[Any] = ["合计", "", "", "", energy_total, cost_total, "", "", "", ""]
         # 必须先固定行号：sheet.max_row 会随循环内写入单元格递增，
         # 逐格取 max_row+1 会把 8 个字段散落到 8 行，导致合计值与标签分离。
         total_idx: int = sheet.max_row + 1
@@ -276,7 +288,7 @@ class ReportService:
             data.append(empty)
         energy_total, cost_total = self._totals(rows)
         data.append(
-            [cell(value) for value in ("合计", "", "", "", energy_total, cost_total, "", "", "")]
+            [cell(value) for value in ("合计", "", "", "", energy_total, cost_total, "", "", "", "")]
         )
 
         table = Table(data, colWidths=[width * mm for width in COLUMN_WIDTHS_MM], repeatRows=1)

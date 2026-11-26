@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS meter (
   daily_8am     INTEGER NOT NULL DEFAULT 1,        -- 已废弃：日切点由 EMS_DAY_START_HOUR 全局配置
   is_enabled    INTEGER NOT NULL DEFAULT 1,
   is_demo       INTEGER NOT NULL DEFAULT 0,        -- 1=模拟器预置表，live 模式下自动停用并排除结算
+  shutdown_power_w REAL,                           -- 停机功率阈值(W)；NULL=用全局 EMS_SHUTDOWN_POWER_W
   remark        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_meter_node ON meter(node_id);
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS daily (
   cost_cent   INTEGER,            -- 电费，单位：分
   is_final    INTEGER NOT NULL DEFAULT 0,
   covered_hours INTEGER NOT NULL DEFAULT 0,  -- 当日有数据的小时数（0~24），报表据此判断可信度
+  shutdown_hours INTEGER NOT NULL DEFAULT 0, -- 其中判定为停机的小时数（不计入覆盖率分母）
   price_cent  REAL,               -- 当日加权平均单价（分/kWh），电价快照
   tariff_snapshot TEXT,           -- 计费时实际套用的时段电价明细（JSON）
   PRIMARY KEY (meter_id, day_start)

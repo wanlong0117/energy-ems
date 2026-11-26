@@ -156,6 +156,7 @@ CREATE TABLE {name} (
   daily_8am     INTEGER NOT NULL DEFAULT 1,
   is_enabled    INTEGER NOT NULL DEFAULT 1,
   is_demo       INTEGER NOT NULL DEFAULT 0,
+  shutdown_power_w REAL,
   remark        TEXT
 )""",
     "tariff": """
@@ -191,7 +192,7 @@ _REBUILD_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "meter": (
         "id", "name", "node_id", "category_id", "purpose", "is_counted", "daily_8am",
-        "is_enabled", "is_demo", "remark",
+        "is_enabled", "is_demo", "shutdown_power_w", "remark",
     ),
     "tariff": ("id", "name", "price_cent", "start_hour", "end_hour", "is_default"),
 }
@@ -227,6 +228,21 @@ def _v7_autoincrement(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _v8_shutdown_threshold(conn: sqlite3.Connection) -> None:
+    """停机判定所需的两列：meter.shutdown_power_w（阈值）与 daily.shutdown_hours（留痕）。
+
+    背景（业务口径）：夜间停产时设备在线、功率掉到待机值，电量≈0，但小时都有数据。
+    这时覆盖率其实够，问题在另一头——真正缺数据的日子（设备断电）反而永远定稿不了，
+    而「停机小时」被当成「应有数据的小时」是同一个硬币的两面。把停机小时从分母里
+    剔掉，两种情况才都按真实生产时段衡量。
+
+    历史日报不回填 shutdown_hours：判定依赖当时的阈值配置，事后无法可靠重现，
+    补一个拍脑袋的数字比留 0 更糟。字段含义是「结算时实际剔除的小时数」。
+    """
+    _add_column(conn, "meter", "shutdown_power_w", "REAL")
+    _add_column(conn, "daily", "shutdown_hours", "INTEGER NOT NULL DEFAULT 0")
+
+
 MIGRATIONS: list[Migration] = [
     (1, "baseline: 13 张表", _v1_baseline),
     (2, "daily 增加电价与价格快照字段", _v2_daily_price_snapshot),
@@ -235,6 +251,7 @@ MIGRATIONS: list[Migration] = [
     (5, "实体表增加 is_demo 并回填模拟数据", _v5_is_demo),
     (6, "daily 增加 covered_hours", _v6_daily_covered_hours),
     (7, "实体主键改 AUTOINCREMENT", _v7_autoincrement),
+    (8, "停机判定：meter.shutdown_power_w 与 daily.shutdown_hours", _v8_shutdown_threshold),
 ]
 
 # 需要临时关闭外键的迁移：SQLite 不允许在事务内改 PRAGMA foreign_keys

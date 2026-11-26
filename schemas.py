@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from fastapi.responses import JSONResponse
@@ -284,6 +285,9 @@ class MeterIn(_BaseIn):
     daily_8am 已于 v0.1.4 废弃：日切点是全局配置（EMS_DAY_START_HOUR），
     按表设置从未被聚合读取，留着只会让现场以为「这块表单独按 08:00 结算」。
     数据库列保留用于兼容旧库，但接口不再接受该字段。
+
+    shutdown_power_w 是停机判定阈值（W）：该小时平均功率低于它就当停机，
+    不计入日结算的覆盖率分母。留空则用全局 EMS_SHUTDOWN_POWER_W（0=不判定）。
     """
 
     name: str
@@ -292,6 +296,7 @@ class MeterIn(_BaseIn):
     purpose: str = "total"
     is_counted: int = 1
     is_enabled: int = 1
+    shutdown_power_w: float | None = None
     remark: str | None = None
 
     @field_validator("purpose")
@@ -299,6 +304,20 @@ class MeterIn(_BaseIn):
     def _purpose(cls, value: str) -> str:
         if value not in PURPOSES:
             raise ValueError(f"purpose 仅支持 {', '.join(sorted(PURPOSES))}")
+        return value
+
+    @field_validator("shutdown_power_w")
+    @classmethod
+    def _shutdown_power(cls, value: float | None) -> float | None:
+        """阈值必须有限且非负；inf/nan 会让「功率 < 阈值」恒成立，整天都被判停机。"""
+        if value is None:
+            return None
+        if not math.isfinite(value):
+            raise ValueError("停机阈值必须是有限数值")
+        if value < 0:
+            raise ValueError("停机阈值不能为负（0 表示不判定停机）")
+        if value > MANUAL_MAX_ABS_VALUE:
+            raise ValueError("停机阈值过大，请确认单位是 W")
         return value
 
 

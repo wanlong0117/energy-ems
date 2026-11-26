@@ -56,6 +56,7 @@ classDiagram
         +int is_counted
         +int is_demo
         +int is_enabled
+        +float shutdown_power_w
     }
     class MeterPoint {
         +int meter_id
@@ -90,6 +91,7 @@ classDiagram
         +float avg_power
         +int cost_cent
         +int covered_hours
+        +int shutdown_hours
         +int is_final
     }
     class Tariff {

@@ -90,7 +90,7 @@
 |---|---|---|
 | 设备管理 `device` | name / protocol(modbus_tcp\|modbus_rtu_tcp) / host / port(默认 8886) / timeout_ms / retry / poll_interval / is_enabled | 增改查、启停、连接测试；预置网关 192.0.2.11:8886、192.0.2.21:8886 |
 | 点位管理 `point` | name / device_id / slave_id / func_code(3\|4) / reg_offset / reg_count / data_type(u16\|s16\|u32\|s32\|f32\|u64) / byte_order(ABCD\|CDAB\|BADC\|DCBA) / scale / offset_const / min_val / max_val / unit / is_enabled | 增改查；**试读按钮** → 展示原始寄存器（十六进制）+ 按配置解析值 |
-| 计量表管理 `meter` | name / node_id / category_id / purpose / is_counted / is_enabled | 增改查；关联 `meter_point`（选 point + role=reading\|power） |
+| 计量表管理 `meter` | name / node_id / category_id / purpose / is_counted / is_enabled / shutdown_power_w | 增改查；关联 `meter_point`（选 point + role=reading\|power）；`shutdown_power_w` 为停机阈值(W)，留空用全局 `EMS_SHUTDOWN_POWER_W` |
 | 节点 / 电价 `node`/`tariff` | 节点树增删改；tariff: name / price_cent / start_hour / end_hour / is_default | 树形维护、默认电价设定 |
 
 #### 看板（后置 Phase4，单文件 HTML + 原生 JS，数据全部来自真实 API）
