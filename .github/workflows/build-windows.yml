@@ -78,7 +78,15 @@ jobs:
           $zip = "energy-ems-$tag-win11-x64.zip"
           Compress-Archive -Path "dist/energy_ems/*" -DestinationPath $zip -Force
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zip" | Set-Content "$zip.sha256" -Encoding ascii
+          # 必须写 LF。Windows 上 Set-Content 默认追加 CRLF，`sha256sum -c` 会把行尾的
+          # \r 当成文件名的一部分，去找一个叫 "xxx.zip\r" 的文件，报 FAILED open or read
+          # ——校验值本身没错，却让人以为包坏了（v0.1.6 的资产就有这个问题）。
+          # WriteAllText 不做行尾转换，UTF8Encoding($false) 保证不写 BOM。
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) "$zip.sha256"),
+            "$hash  $zip`n",
+            (New-Object System.Text.UTF8Encoding($false))
+          )
           "zip=$zip" >> $env:GITHUB_OUTPUT
           "sha=$hash" >> $env:GITHUB_OUTPUT
 

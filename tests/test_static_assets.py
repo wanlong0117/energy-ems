@@ -102,6 +102,20 @@ def test_release_package_carries_licenses_and_checksum(isolated_db):
     assert "release_notes.py" in yml, "Release 正文必须按 tag 生成，不再用通用说明"
 
 
+def test_checksum_file_uses_lf_endings(isolated_db):
+    """`.sha256` 必须 LF 结尾。
+
+    Windows runner 上 `Set-Content` 会写成 CRLF，`sha256sum -c` / `shasum -c` 把行尾的
+    `\\r` 当成文件名的一部分，去找一个叫 "xxx.zip\\r" 的文件并报 `FAILED open or read`。
+    校验值本身是对的，但用户会以为包损坏（v0.1.6 的 release 资产就踩了这个坑）。
+    """
+    yml = (SRC_ROOT / ".github" / "workflows" / "build-windows.yml").read_text(encoding="utf-8")
+    # 行尾必须显式写 `n（LF），而不是交给 Set-Content 按平台补行尾
+    assert "$hash  $zip`n" in yml, "校验值必须显式写 LF 行尾"
+    assert "WriteAllText" in yml, "需用 WriteAllText 控制行尾，避免平台默认 CRLF"
+    assert 'Set-Content "$zip.sha256"' not in yml, "Set-Content 在 Windows 上会写成 CRLF"
+
+
 def test_release_step_is_tag_gated_and_uses_ref_name(isolated_db):
     """Arrange/Act: 读取 workflow 原文。Assert: release 仅由 v* tag 门控、版本号取自 ref_name、无硬编码版本。"""
     # Arrange：以 utf-8 读入 workflow 全文
