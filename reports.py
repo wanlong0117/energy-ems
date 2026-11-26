@@ -210,7 +210,9 @@ class ReportService:
         note_cell.alignment = Alignment(wrap_text=True, vertical="top")
         sheet.row_dimensions[note_idx].height = 32
 
-        for index, width in enumerate((22, 28, 14, 18, 16, 14, 14, 12, 10), start=1):
+        # 列宽数量必须与 HEADERS 一致：少一个值，最后一列（已结算）会退回默认宽度，
+        # 而前面各列的宽度看起来仍然正常，肉眼极难发现（v0.1.6 修）。
+        for index, width in enumerate((22, 28, 14, 18, 16, 14, 14, 12, 10, 10), start=1):
             sheet.column_dimensions[chr(64 + index)].width = width
 
         buffer = io.BytesIO()

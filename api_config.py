@@ -82,6 +82,9 @@ class ConfigService:
         "meter_id", "point_id", "role", "host", "port", "protocol", "poll_interval",
         "price_cent", "start_hour", "end_hour", "is_default", "node_id", "device_id",
         "parent_id",
+        # 停机阈值直接决定「哪天算已结算」，改它必须连新旧值一起留痕，
+        # 否则事后只能看到「shutdown_power_w 变了」，查不出改成多少。
+        "shutdown_power_w",
     })
     AUDIT_MAX_FIELDS: int = 12
 

@@ -32,6 +32,7 @@ from settings import (
     SECONDS_PER_MINUTE,
     SETTLE_MIN_COVERAGE,
     SETTLE_UTC_MINUTE,
+    SHUTDOWN_GAP_MAX_HOURS,
     SIMULATE_ROLLUP_SEC,
     day_floor,
 )
@@ -53,6 +54,41 @@ def _shutdown_threshold(per_meter: Any) -> float:
     if not math.isfinite(threshold) or threshold <= 0:
         return 0.0
     return threshold
+
+
+def _assumed_shutdown_hours(observed: set[int], shutdown: set[int], max_gap: int) -> int:
+    """把「夹在两段已观测停机之间、长度不超过 max_gap」的缺口小时也算作停机。
+
+    为什么需要它（v0.1.6 修正）：覆盖率门槛的分子与分母必须同源。分母剔除停机
+    小时后，分子若仍把停机小时算成「有生产数据的小时」，比值会被凭空放大——实测
+    「12 小时待机有数 + 12 小时生产时段全缺」会算出 12/12=1.0 而定稿，等于给一次
+    采集中断发了「已结算」证书；停机占比过半的表上，门槛干脆完全失效。
+
+    但只做严格同源会走向另一头：现场待机时段本来可能没有数据（设备随产线断电），
+    把这些缺口按生产小时计，会让「0 度停产日」永远定不了稿，正是本次要解决的问题。
+    折中办法是只用**已有证据**推断：缺口左右两侧最近的有数据小时都判定为停机，
+    且缺口连续长度不超过 max_gap 时才一并当停机。日界一侧的缺口不推断
+    （凌晨/收班前后正是可能开工的时段），长缺口也不推断（那是采集中断，
+    半天的空白不该由系统替人签字）。
+
+    observed / shutdown 都是当日 0~23 的小时序号集合，shutdown ⊆ observed。
+    """
+    if not shutdown or max_gap <= 0:
+        return 0
+    missing: list[int] = [hour for hour in range(24) if hour not in observed]
+    assumed: int = 0
+    index: int = 0
+    while index < len(missing):
+        end: int = index
+        while end + 1 < len(missing) and missing[end + 1] == missing[end] + 1:
+            end += 1
+        run: int = end - index + 1
+        left_ok: bool = (missing[index] - 1) in shutdown
+        right_ok: bool = (missing[end] + 1) in shutdown
+        if run <= max_gap and left_ok and right_ok:
+            assumed += run
+        index = end + 1
+    return assumed
 
 
 def _tz_shift() -> int:
@@ -248,13 +284,15 @@ class Aggregator:
 
         定稿门槛分三层：
           · 表覆盖——有数据的表数须 ≥ 应结算表数×90%，否则整日都不定时稿；
-          · 单表小时覆盖——该表当日有数据的小时数须 ≥ 应覆盖小时数×90%，
+          · 单表小时覆盖——该表当日「有生产数据的小时数」须 ≥ 应覆盖小时数×90%，
             不足则该表单独保留 is_final=0。旧实现用「所有表的小时并集」判定，
             拦不住「99 块表满 24 小时、1 块只有 1 小时」也被一并定稿的情况；
-          · 应覆盖小时数 = 24 − 停机小时。停机小时按「该小时平均功率 < 阈值」
-            判定（阈值逐表：meter.shutdown_power_w，回退全局 EMS_SHUTDOWN_POWER_W）。
-            夜间停产、周末停线、设备待机这类小时本来就不该有生产电量，把它们算进
-            分母等于要求「停产也得报数」，结果是 0 度停产日永远定不了稿。
+          · 应覆盖小时数 = 24 − 停机小时（含缺口推断），分子是「有数据且非停机」
+            的小时数。两者同源是关键：分母剔了停机小时、分子却没剔，比值会被
+            凭空放大（实测 12 小时待机 + 12 小时生产全缺 = 12/12 也能定稿）。
+            夜间停产、周末停线这类小时本就不该有生产电量，把它们算进分母等于
+            要求「停产也得报数」，0 度停产日就永远定不了稿；但「没采到数」也
+            不能自己判成停机，否则门槛形同虚设——折中见 _assumed_shutdown_hours。
 
         模拟模式（is_final=0）与人工回填（enforce_coverage=False）不受门槛限制：
         前者本就只是当天实时视图，后者是操作员对历史数据的明确修正。
@@ -355,30 +393,42 @@ class Aggregator:
             # 否则「采不到数据」会被自己判成「停机」，覆盖率门槛就形同虚设。
             threshold: float = thresholds.get(meter_id, 0.0)
             power_by_hour: dict[int, float | None] = bucket["power_by_hour"] if bucket else {}
-            shutdown_hours: int = 0
+            observed: set[int] = {
+                (hour_start - day_start) // SECONDS_PER_HOUR for hour_start, _ in hours
+            }
+            shutdown_idx: set[int] = set()
             if threshold > 0:
-                shutdown_hours = sum(
-                    1
-                    for power in power_by_hour.values()
+                shutdown_idx = {
+                    (hour_start - day_start) // SECONDS_PER_HOUR
+                    for hour_start, power in power_by_hour.items()
                     if power is not None and power < threshold
-                )
+                }
+            assumed: int = _assumed_shutdown_hours(
+                observed, shutdown_idx, SHUTDOWN_GAP_MAX_HOURS
+            )
+            shutdown_observed: int = len(shutdown_idx)
+            shutdown_hours: int = shutdown_observed + assumed
             if shutdown_hours:
-                shutdown_meters.append(f"{meter_id}({shutdown_hours}h)")
-            # 覆盖率分母按「真实生产小时」算；整日停机时分母为 0，置 1 处理，
-            # 使「全天停产、当天 0 度」能正常定稿，而不是永远卡在未结算。
-            expected_hours: int = max(24 - shutdown_hours, 1)
-            meter_final: int = day_final
-            if (
-                meter_final
-                and enforce_coverage
-                and covered_hours / expected_hours < SETTLE_MIN_COVERAGE
-            ):
-                meter_final = 0
-                short_meters.append(
-                    f"{meter_id}({covered_hours}/{expected_hours}"
-                    + (f",停机{shutdown_hours}" if shutdown_hours else "")
+                shutdown_meters.append(
+                    f"{meter_id}({shutdown_hours}h"
+                    + (f",含缺口{assumed}" if assumed else "")
                     + ")"
                 )
+            # 覆盖率门槛：分子与分母同源。分母是「应有生产小时」，分子是
+            # 「有数据且非停机的小时」——停机小时两边都不算。
+            # 整日停机（含缺口推断）时没有应有生产小时，直接放行：
+            # 这正是「全天停产、当天 0 度」能定稿的来源。
+            expected_hours: int = 24 - shutdown_hours
+            meter_final: int = day_final
+            if meter_final and enforce_coverage and expected_hours > 0:
+                production_covered: int = max(covered_hours - shutdown_observed, 0)
+                if production_covered / expected_hours < SETTLE_MIN_COVERAGE:
+                    meter_final = 0
+                    short_meters.append(
+                        f"{meter_id}({production_covered}/{expected_hours}"
+                        + (f",停机{shutdown_observed}" if shutdown_observed else "")
+                        + ")"
+                    )
             db.execute(
                 "INSERT OR REPLACE INTO daily "
                 "(meter_id, day_start, energy_wh, peak_power, avg_power, cost_cent, "

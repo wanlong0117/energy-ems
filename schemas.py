@@ -389,8 +389,6 @@ class ManualIn(_BaseIn):
     @field_validator("value")
     @classmethod
     def _value(cls, value: float) -> float:
-        import math
-
         number: float = float(value)
         if not math.isfinite(number):
             raise ValueError("value 必须为有限数值（不接受 inf/nan）")

@@ -8,12 +8,19 @@
   · 没有功率点 / 该小时没采到功率 → 不当停机（否则「采不到」会被自己判成「停机」）；
   · 阈值为 0 → 规则关闭，行为与 v0.1.4 完全一致；
   · 阈值逐表可覆盖全局，避免注塑机（待机 3 kW）和照明回路（待机 20 W）共用一个数。
+
+v0.1.6 修正了覆盖率门槛的分子分母不同源：分母剔了停机小时、分子却把停机小时
+算成「有生产数据」，比值被凭空放大，导致「12 小时待机有数 + 12 小时生产全缺」
+也能算出 12/12=1.0 并定稿。现在分子只算「有数据且非停机」的小时，缺失小时
+默认按生产小时计；只有夹在两段已观测停机之间、且不超过
+settings.SHUTDOWN_GAP_MAX_HOURS（默认 3 小时）的短缺口才按停机推断。
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
 
+import aggregation
 import db
 import httpx
 import main
@@ -42,33 +49,36 @@ def _daily(meter_id: int) -> Any:
     )
 
 
-def _shift_day(ready_db: Any, monkeypatch: pytest.MonkeyPatch, meter_id: int) -> None:
-    """构造「3 小时生产 + 18 小时停机 + 3 小时无数据」的典型夜班日。
+def _shift_day(meter_id: int) -> None:
+    """典型夜班日：3 小时生产 + 18 小时停机 + 中间 3 小时采集缺口（夹在停机之间）。
 
-    覆盖 21/24 = 87.5%，按旧口径永远差一点定不了稿；生产时段其实只有 3 小时。
+    覆盖 21/24 = 87.5%，按纯 24 小时口径永远差一点定不了稿；而真正有数据的
+    18 个非生产小时全是待机，缺口两侧也都是待机，可以放心按停机推断。
     """
-    for hour in (8, 9, 10):
+    for hour in (0, 1, 2):
         _hour(meter_id, DAY_START, hour, energy_wh=100_000, power=860.0)
-    for hour in list(range(0, 8)) + list(range(11, 21)):
+    for hour in list(range(3, 11)) + list(range(14, 24)):
         _hour(meter_id, DAY_START, hour, energy_wh=0, power=6.5)
-    monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 50.0)
+    # 11/12/13 三个小时完全没有数据：左右两侧（10 点、14 点）都是待机
 
 
 def test_shutdown_hours_are_excluded_from_coverage(ready_db, monkeypatch):
-    """18 小时停机被剔除后，分母只剩 3 小时生产 → 21/3 达标，日报得以定稿。"""
+    """停机（含可推断的短缺口）被剔除后，分母只剩 3 小时生产 → 达标定稿。"""
     node = create_node("注塑车间")
     meter = create_meter(node, name="1号产线")
-    _shift_day(ready_db, monkeypatch, meter)
+    _shift_day(meter)
+    monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 50.0)
 
     aggregator.settle_day(DAY_START)
     row = _daily(meter)
     assert int(row["covered_hours"]) == 21
-    assert int(row["shutdown_hours"]) == 18
+    # 18 个观测停机 + 3 个夹在停机之间的缺口 = 21
+    assert int(row["shutdown_hours"]) == 21
     assert int(row["is_final"]) == 1, "停机时段不该拖住定稿"
     # 停机判定只改覆盖率口径，绝不改电量：0 度的小时仍然是 0 度
     assert int(row["energy_wh"]) == 300_000
     event = db.query_one("SELECT message FROM event_log WHERE code='SETTLE_SHUTDOWN'")
-    assert event is not None and "停机" in str(event["message"])
+    assert event is not None and "缺口" in str(event["message"])
 
 
 def test_same_day_stays_unsettled_without_threshold(ready_db, monkeypatch):
@@ -78,7 +88,7 @@ def test_same_day_stays_unsettled_without_threshold(ready_db, monkeypatch):
     """
     node = create_node("注塑车间")
     meter = create_meter(node, name="1号产线")
-    _shift_day(ready_db, monkeypatch, meter)
+    _shift_day(meter)
     monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 0.0)
 
     aggregator.settle_day(DAY_START)
@@ -89,7 +99,7 @@ def test_same_day_stays_unsettled_without_threshold(ready_db, monkeypatch):
 
 
 def test_full_day_shutdown_finalizes_with_zero_energy(ready_db, monkeypatch):
-    """整日停产（24 小时都在待机）：分母为 0 时按 1 处理，0 度日也能定稿。"""
+    """整日停产（24 小时都在待机）：没有应有生产小时，0 度日也能定稿。"""
     node = create_node("包装车间")
     meter = create_meter(node, name="包装线总表")
     for hour in range(24):
@@ -100,6 +110,22 @@ def test_full_day_shutdown_finalizes_with_zero_energy(ready_db, monkeypatch):
     row = _daily(meter)
     assert int(row["shutdown_hours"]) == 24
     assert int(row["covered_hours"]) == 24
+    assert int(row["energy_wh"]) == 0
+    assert int(row["is_final"]) == 1
+
+
+def test_zero_energy_day_with_short_gap_still_finalizes(ready_db, monkeypatch):
+    """0 度停产日中间漏采 2 小时（两侧都是待机）仍能定稿——本功能要解决的原始场景。"""
+    node = create_node("配料车间")
+    meter = create_meter(node, name="配料线总表")
+    for hour in list(range(0, 12)) + list(range(14, 24)):
+        _hour(meter, DAY_START, hour, energy_wh=0, power=3.2)
+    monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 50.0)
+
+    aggregator.settle_day(DAY_START)
+    row = _daily(meter)
+    assert int(row["shutdown_hours"]) == 24, "22 个观测停机 + 2 个缺口推断"
+    assert int(row["covered_hours"]) == 22
     assert int(row["energy_wh"]) == 0
     assert int(row["is_final"]) == 1
 
@@ -139,15 +165,65 @@ def test_hours_without_power_reading_are_not_shutdown(ready_db, monkeypatch):
     assert int(row["is_final"]) == 1
 
 
+def test_edge_gap_is_not_assumed_shutdown(ready_db, monkeypatch):
+    """生产时段有数、日界处缺 3 小时：缺口不被推断成停机，仍判未结算。
+
+    v0.1.5 的实现会算出 22/(24-21)=7.33 并定稿——而缺的正是生产时段，
+    等于给一次采集中断发了「已结算」证书（v0.1.6 修正的核心）。
+    """
+    node = create_node("返工区")
+    meter = create_meter(node, name="返工线")
+    _hour(meter, DAY_START, 0, energy_wh=100_000, power=860.0)  # 生产，1~2 点缺数
+    for hour in range(3, 24):
+        _hour(meter, DAY_START, hour, energy_wh=0, power=6.5)
+    monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 50.0)
+
+    aggregator.settle_day(DAY_START)
+    row = _daily(meter)
+    assert int(row["shutdown_hours"]) == 21
+    assert int(row["is_final"]) == 0, "缺口贴着生产时段，不能当作停机"
+    assert db.query_one("SELECT 1 FROM event_log WHERE code='SETTLE_METER_INCOMPLETE'") is not None
+
+
+def test_long_gap_is_not_assumed_shutdown(ready_db, monkeypatch):
+    """半天采集空白（12 小时）不推断成停机：那是有问题的一天，不是停产的一天。"""
+    node = create_node("夜班车间")
+    meter = create_meter(node, name="夜班表")
+    for hour in list(range(0, 8)) + list(range(20, 24)):
+        _hour(meter, DAY_START, hour, energy_wh=0, power=6.5)
+    monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 50.0)
+
+    aggregator.settle_day(DAY_START)
+    row = _daily(meter)
+    assert int(row["shutdown_hours"]) == 12, "长缺口不计入停机小时"
+    assert int(row["covered_hours"]) == 12
+    assert int(row["is_final"]) == 0
+
+
+def test_gap_heuristic_can_be_disabled(ready_db, monkeypatch):
+    """把上限调到 0 即关闭缺口推断：短缺口也回到「未结算」，行为最保守。"""
+    node = create_node("包装车间")
+    meter = create_meter(node, name="包装线")
+    _shift_day(meter)
+    monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 50.0)
+    monkeypatch.setattr(aggregation, "SHUTDOWN_GAP_MAX_HOURS", 0)
+
+    aggregator.settle_day(DAY_START)
+    row = _daily(meter)
+    assert int(row["shutdown_hours"]) == 18
+    assert int(row["is_final"]) == 0
+
+
 def test_shutdown_hours_survive_recompute_without_coverage_enforcement(ready_db, monkeypatch):
     """人工回填走 enforce_coverage=False：停机小时照样要记，只是不再卡定稿。"""
     node = create_node("返工区")
     meter = create_meter(node, name="返工线")
-    _shift_day(ready_db, monkeypatch, meter)
+    _shift_day(meter)
+    monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 50.0)
 
     aggregator.settle_day(DAY_START, is_final=1, enforce_coverage=False)
     row = _daily(meter)
-    assert int(row["shutdown_hours"]) == 18
+    assert int(row["shutdown_hours"]) == 21
     assert int(row["is_final"]) == 1
 
 
@@ -205,15 +281,16 @@ def test_api_stores_and_returns_shutdown_threshold(ready_db):
 
 
 def test_report_carries_shutdown_hours_column(ready_db, monkeypatch):
-    """报表要能解释「为什么只有 3 小时数据也算已结算」，否则对账的人只能猜。"""
+    """报表要能解释「为什么只有 21 小时数据也算已结算」，否则对账的人只能猜。"""
     from reports import HEADERS, report_service
 
     node = create_node("注塑车间")
     meter = create_meter(node, name="1号产线")
-    _shift_day(ready_db, monkeypatch, meter)
+    _shift_day(meter)
+    monkeypatch.setattr(settings, "SHUTDOWN_POWER_W", 50.0)
     aggregator.settle_day(DAY_START)
 
     rows = report_service.build("daily", {"from_ts": DAY_START, "to_ts": DAY_START})
     assert "停机小时" in HEADERS
-    assert rows and rows[0]["shutdown_hours"] == 18
+    assert rows and rows[0]["shutdown_hours"] == 21
     assert rows[0]["final_text"] == "是"

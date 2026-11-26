@@ -142,6 +142,10 @@ DEFAULT_BAUDRATE: int = 9600         # modbus_rtu_serial 默认波特率
 SHUTDOWN_POWER_W: float = _env_float("EMS_SHUTDOWN_POWER_W", 0.0)
 if SHUTDOWN_POWER_W < 0:
     SHUTDOWN_POWER_W = 0.0
+# 缺口推断上限：某段「没有小时数据」的缺口，只有夹在两段已观测停机之间、
+# 且连续长度不超过该值时，才按停机处理。超过它的缺口一律算作「采集中断」，
+# 记成生产小时、拖住定稿——半天的采集空白本来就不该由系统替人签字。
+SHUTDOWN_GAP_MAX_HOURS: int = max(0, _env_int("EMS_SHUTDOWN_GAP_MAX_HOURS", 3))
 
 # ---------- 数据保留与结算门槛 ----------
 RETENTION_DAYS: int = 90             # 原始读数保留天数（超期按批删除）
@@ -225,4 +229,4 @@ HTTP_PORT: int = _env_int("EMS_PORT", 8000)
 
 # ---------- 版本 ----------
 # 单一事实源：FastAPI 元信息、/healthz、看板侧栏都读它，避免三处各写一个版本号
-APP_VERSION: str = "0.1.5"
+APP_VERSION: str = "0.1.6"
