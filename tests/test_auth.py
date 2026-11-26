@@ -36,7 +36,7 @@ def test_login_success_sets_httponly_session_cookie(isolated_db):
 
     # Assert
     assert response.status_code == 200
-    assert json.loads(response.body) == {"ok": True}
+    assert json.loads(response.body) == {"ok": True, "must_change_password": True}
     raw = response.headers["set-cookie"].lower()
     assert "ems_session=" in raw
     assert "httponly" in raw

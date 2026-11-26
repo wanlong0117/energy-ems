@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 import auth
 from auth import require_auth
-from schemas import LoginIn, ok
+from schemas import LoginIn, PasswordIn, ok
 
 router = APIRouter(prefix="/api", tags=["auth"])
 
@@ -26,10 +26,19 @@ def logout(request: Request) -> JSONResponse:
     return auth.logout(request)
 
 
+@router.post("/password", dependencies=[Depends(require_auth)])
+def change_password(body: PasswordIn) -> JSONResponse:
+    """修改登录密码（需登录）；成功后所有会话失效。"""
+    return auth.change_password(body.old_password, body.new_password)
+
+
 @router.get("/session")
 def session(request: Request) -> dict:
     """会话状态查询（无需登录，始终 ok:true）。"""
-    return ok({"authenticated": auth.current_user(request)})
+    return ok({
+        "authenticated": auth.current_user(request),
+        "must_change_password": auth.must_change_password(),
+    })
 
 
 __all__ = ["router", "require_auth"]

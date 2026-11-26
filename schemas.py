@@ -124,6 +124,11 @@ class LoginIn(_BaseIn):
     password: str
 
 
+class PasswordIn(_BaseIn):
+    old_password: str
+    new_password: str
+
+
 class NodeIn(_BaseIn):
     name: str
     parent_id: int | None = None

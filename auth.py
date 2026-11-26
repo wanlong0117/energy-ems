@@ -10,6 +10,7 @@ v2：CONFIG_PATH 走 settings.app_dir()；load_config() 为旧配置（仅 passw
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import time
 from typing import Any
@@ -35,6 +36,8 @@ _sessions: dict[str, float] = {}
 SESSION_TTL: int = SESSION_TTL_SEC  # 兼容原有命名，7 天
 COOKIE_NAME: str = SESSION_COOKIE_NAME
 DEFAULT_PASSWORD: str = "ems2026"
+PASSWORD_ENV: str = "EMS_PASSWORD"          # 首次生成配置时的初始密码（仅首次生效）
+PASSWORD_MIN_LEN: int = 8
 
 CONFIG_DEFAULTS: dict[str, Any] = {
     "password": DEFAULT_PASSWORD,
@@ -45,8 +48,12 @@ CONFIG_DEFAULTS: dict[str, Any] = {
 
 
 def _default_config() -> dict[str, Any]:
-    """返回一份全新的默认配置副本。"""
-    return dict(CONFIG_DEFAULTS)
+    """返回一份全新的默认配置副本；EMS_PASSWORD 仅在首次生成配置时生效。"""
+    config: dict[str, Any] = dict(CONFIG_DEFAULTS)
+    env_password: str = os.environ.get(PASSWORD_ENV, "").strip()
+    if env_password:
+        config["password"] = env_password
+    return config
 
 
 def load_config() -> dict[str, Any]:
@@ -115,6 +122,37 @@ def load_password() -> str:
     return str(load_config().get("password", DEFAULT_PASSWORD))
 
 
+def must_change_password() -> bool:
+    """是否仍在用默认密码：是则前端强制引导改密。"""
+    config: dict[str, Any] = load_config()
+    if bool(config.get("password_changed")):
+        return False
+    return str(config.get("password", DEFAULT_PASSWORD)) == DEFAULT_PASSWORD
+
+
+def change_password(old_password: str, new_password: str) -> JSONResponse:
+    """校验原密码并设置新密码；成功后清空全部会话，强制重新登录。"""
+    if old_password != load_password():
+        log_event("warn", "user", "PASSWORD_CHANGE_FAIL", "改密失败：原密码错误")
+        return JSONResponse({"ok": False, "error": "原密码错误"}, status_code=401)
+    candidate: str = str(new_password or "")
+    if len(candidate) < PASSWORD_MIN_LEN:
+        return JSONResponse(
+            {"ok": False, "error": f"新密码至少 {PASSWORD_MIN_LEN} 位"}, status_code=400
+        )
+    if candidate == DEFAULT_PASSWORD:
+        return JSONResponse({"ok": False, "error": "新密码不能与默认密码相同"}, status_code=400)
+    config: dict[str, Any] = load_config()
+    config["password"] = candidate
+    config["password_changed"] = True
+    save_config(config)
+    _sessions.clear()
+    log_event("warn", "user", "PASSWORD_CHANGED", "管理员密码已修改，所有会话失效")
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE_NAME)
+    return resp
+
+
 def login(password: str, response: Response) -> JSONResponse:
     """校验固定密码，成功则签发 token 并写入 httponly cookie。"""
     if password != load_password():
@@ -122,7 +160,7 @@ def login(password: str, response: Response) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "密码错误"}, status_code=401)
     token = secrets.token_hex(32)
     _sessions[token] = time.time() + SESSION_TTL
-    resp = JSONResponse({"ok": True})
+    resp = JSONResponse({"ok": True, "must_change_password": must_change_password()})
     resp.set_cookie(COOKIE_NAME, token, max_age=SESSION_TTL, httponly=True, samesite="lax")
     log_event("info", "api", "LOGIN", "登录成功")
     return resp

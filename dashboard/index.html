@@ -189,6 +189,8 @@
   .login-sub { margin: 4px 0 20px; font-size: 9.5px; letter-spacing: .16em;
                color: var(--muted); text-transform: uppercase; }
   .login-card input { width: 100%; height: 40px; }
+  .login-card .field + .field { margin-top: 10px; }
+  .login-card .muted[data-i18n="pw_rule"] { margin: 0 0 4px; line-height: 1.5; }
   .center { text-align: center; margin: 10px 0 0; }
 
   /* ===== 其他 ===== */
@@ -277,7 +279,7 @@
   <!-- 登录 -->
   <section class="tab" id="tab-login">
     <div class="login">
-      <div class="login-card">
+      <div class="login-card" id="loginCard">
         <div class="login-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12l1-8.5Z"/></svg></div>
         <h2 data-i18n="login_title">登录</h2>
         <p class="login-sub">ENERGY MANAGEMENT SYSTEM</p>
@@ -285,6 +287,16 @@
           <input id="password" type="password" autocomplete="current-password"></label>
         <button id="loginBtn" class="primary block" type="button" data-i18n="login_btn">登录</button>
         <p class="muted center" id="loginModeHint"></p>
+      </div>
+      <div class="login-card" id="pwChangeCard" hidden>
+        <div class="login-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
+        <h2 data-i18n="pw_change_title">修改密码</h2>
+        <p class="login-sub">FIRST SIGN-IN SECURITY</p>
+        <p class="muted" data-i18n="pw_rule">默认密码仅用于首次登录，请设置至少 8 位新密码。</p>
+        <label class="field"><span data-i18n="pw_old">原密码</span><input id="pwOld" type="password" autocomplete="current-password"></label>
+        <label class="field"><span data-i18n="pw_new">新密码</span><input id="pwNew" type="password" autocomplete="new-password"></label>
+        <label class="field"><span data-i18n="pw_confirm">确认新密码</span><input id="pwConfirm" type="password" autocomplete="new-password"></label>
+        <button id="pwSubmit" class="primary block" type="button" data-i18n="pw_submit">设置新密码</button>
       </div>
     </div>
   </section>
@@ -366,6 +378,16 @@
         <option value="simulate">simulate</option><option value="live">live</option></select></label>
         <button id="modeSwitchBtn" class="primary" type="button" data-i18n="switch">切换</button></div>
       <div class="hint" data-i18n="restart_hint">切换后需重启服务生效：simulate 使用内置模拟器，live 由 Modbus 采集器接管，二者互斥。</div>
+    </div>
+    <div class="card">
+      <h3 data-i18n="pw_change_title">修改密码</h3>
+      <p class="muted" data-i18n="pw_rule">默认密码仅用于首次登录，请设置至少 8 位新密码。</p>
+      <div class="formgrid" style="margin-top:12px">
+        <label><span data-i18n="pw_old">原密码</span><input id="cpOld" type="password" autocomplete="current-password"></label>
+        <label><span data-i18n="pw_new">新密码</span><input id="cpNew" type="password" autocomplete="new-password"></label>
+        <label><span data-i18n="pw_confirm">确认新密码</span><input id="cpConfirm" type="password" autocomplete="new-password"></label>
+      </div>
+      <div class="row" style="margin-top:12px"><button id="cpSubmit" class="primary" type="button" data-i18n="pw_submit">设置新密码</button></div>
     </div>
   </section>
 
@@ -450,7 +472,10 @@ const I18N = {
     limit: "条数", no_data: "暂无数据 / No data", saved: "保存成功", failed: "操作失败",
     confirm_delete: "确认删除该记录？", overwritten: "已覆盖同时间点原记录", trial_fail: "试读失败",
     need_login: "请先登录", welcome: "当前数据模式",
-    accumulating: "数据积累中，至少需要 3 个小时点"
+    accumulating: "数据积累中，至少需要 3 个小时点",
+    pw_change_title: "修改密码", pw_old: "原密码", pw_new: "新密码", pw_confirm: "确认新密码",
+    pw_submit: "设置新密码", pw_rule: "默认密码仅用于首次登录，请设置至少 8 位新密码。",
+    pw_mismatch: "两次输入的新密码不一致", pw_changed: "密码已修改，请重新登录"
   },
   en: {
     app_title: "Energy EMS", logout_btn: "Logout", tab_login: "Login", tab_dashboard: "Dashboard",
@@ -469,10 +494,15 @@ const I18N = {
     limit: "Limit", no_data: "No data", saved: "Saved", failed: "Operation failed",
     confirm_delete: "Delete this record?", overwritten: "Existing record at same timestamp was overwritten",
     trial_fail: "Probe failed", need_login: "Please sign in first", welcome: "Current data mode",
-    accumulating: "Accumulating — at least 3 hourly points needed"
+    accumulating: "Accumulating — at least 3 hourly points needed",
+    pw_change_title: "Change Password", pw_old: "Current password", pw_new: "New password",
+    pw_confirm: "Confirm new password", pw_submit: "Set new password",
+    pw_rule: "The default password is for first sign-in only. Use at least 8 characters.",
+    pw_mismatch: "The two new passwords do not match", pw_changed: "Password changed. Please sign in again."
   }
 };
-const state = { lang: "zh", authed: false, mode: "simulate", editing: {}, latest: [], daily: [], hourly: [] };
+const state = { lang: "zh", authed: false, mode: "simulate", mustChangePassword: false,
+                editing: {}, latest: [], daily: [], hourly: [] };
 const $ = (id) => document.getElementById(id);
 const t = (key) => (I18N[state.lang] && I18N[state.lang][key]) || key;
 const ALL = "\u5168\u90e8 / ALL";
@@ -663,6 +693,7 @@ async function loadSession() {
   try {
     const session = await api("/api/session");
     state.authed = !!session.authenticated;
+    state.mustChangePassword = !!session.must_change_password;
   } catch (e) { state.authed = false; }
   try {
     const mode = await api("/api/mode");
@@ -671,6 +702,13 @@ async function loadSession() {
   } catch (e) { state.mode = "simulate"; }
   renderModeBadge();
   $("logoutBtn").style.display = state.authed ? "" : "none";
+  if (state.authed && state.mustChangePassword) {
+    switchTab("login");
+    showPasswordChange();
+    return;
+  }
+  $("loginCard").hidden = false;
+  $("pwChangeCard").hidden = true;
   switchTab(state.authed ? "dashboard" : "login");
 }
 async function loadFilters() {
@@ -678,6 +716,37 @@ async function loadFilters() {
   await fillSelect($("repNode"), nodesLoader, true, "id", "name");
   await fillSelect($("dashPurpose"), purposesLoader, true, "id", "name");
   await fillSelect($("repPurpose"), purposesLoader, true, "id", "name");
+}
+function showPasswordChange() {
+  $("loginCard").hidden = true;
+  $("pwChangeCard").hidden = false;
+  ["pwOld", "pwNew", "pwConfirm"].forEach((id) => { $(id).value = ""; });
+  $("pwOld").focus();
+}
+async function submitPasswordChange() {
+  if ($("pwNew").value !== $("pwConfirm").value) { toast(t("pw_mismatch"), true); return; }
+  try {
+    await api("/api/password", { method: "POST", body: {
+      old_password: $("pwOld").value, new_password: $("pwNew").value,
+    }});
+    state.authed = false; state.mustChangePassword = false;
+    $("loginCard").hidden = false; $("pwChangeCard").hidden = true;
+    toast(t("pw_changed"));
+    switchTab("login");
+  } catch (e) { toast(e.message, true); }
+}
+async function submitConfigPassword() {
+  if ($("cpNew").value !== $("cpConfirm").value) { toast(t("pw_mismatch"), true); return; }
+  try {
+    await api("/api/password", { method: "POST", body: {
+      old_password: $("cpOld").value, new_password: $("cpNew").value,
+    }});
+    state.authed = false; state.mustChangePassword = false;
+    ["cpOld", "cpNew", "cpConfirm"].forEach((id) => { $(id).value = ""; });
+    $("loginCard").hidden = false; $("pwChangeCard").hidden = true;
+    toast(t("pw_changed"));
+    switchTab("login");
+  } catch (e) { toast(e.message, true); }
 }
 async function doLogin() {
   try {
@@ -997,6 +1066,8 @@ function bind() {
   $("repLoad").onclick = loadReport;
   $("repXlsx").onclick = () => exportReport("xlsx");
   $("repPdf").onclick = () => exportReport("pdf");
+  $("pwSubmit").onclick = submitPasswordChange;
+  $("cpSubmit").onclick = submitConfigPassword;
   $("manSubmit").onclick = submitManual;
   $("evRefresh").onclick = loadEvents;
 }
