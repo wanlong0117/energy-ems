@@ -1,7 +1,8 @@
 # Energy EMS · 轻量能源管理系统
 
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-136%20passed-brightgreen.svg)](#测试)
+[![Tests](https://github.com/wanlong0117/energy-ems/actions/workflows/tests.yml/badge.svg)](https://github.com/wanlong0117/energy-ems/actions/workflows/tests.yml)
+[![Win11 Build](https://github.com/wanlong0117/energy-ems/actions/workflows/build-windows.yml/badge.svg)](https://github.com/wanlong0117/energy-ems/actions/workflows/build-windows.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776ab.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#快速开始)
 
