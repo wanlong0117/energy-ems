@@ -164,9 +164,10 @@ class DeviceIn(_BaseIn):
     def _port(cls, value: int, info: ValidationInfo) -> int:
         protocol: str = str(info.data.get("protocol", "modbus_tcp"))
         if protocol == "modbus_rtu_serial":
-            # 串口设备 port 承载波特率（如 115200），不受 TCP 端口上限约束
-            if not 0 <= value <= 4_000_000:
-                raise ValueError("串口波特率必须在 0~4000000 之间")
+            # 串口设备 port 承载波特率（如 115200），不受 TCP 端口上限约束；
+            # 0 或负数不是合法波特率，必须报错而不是静默回退 9600
+            if not 50 <= value <= 4_000_000:
+                raise ValueError("串口波特率必须在 50~4000000 之间")
             return value
         if not 1 <= value <= 65535:
             raise ValueError("port 必须在 1~65535 之间")
@@ -301,6 +302,16 @@ class TariffIn(_BaseIn):
         if value < 0:
             raise ValueError("price_cent 不能为负数")
         return value
+
+    @model_validator(mode="after")
+    def _hours(self) -> "TariffIn":
+        """时段电价必须成对出现且 0 ≤ start < end ≤ 24（本地小时，右开区间）。"""
+        if (self.start_hour is None) != (self.end_hour is None):
+            raise ValueError("start_hour 与 end_hour 必须同时填写或同时留空")
+        if self.start_hour is not None and self.end_hour is not None:
+            if not 0 <= int(self.start_hour) < int(self.end_hour) <= 24:
+                raise ValueError("时段电价须满足 0 ≤ start_hour < end_hour ≤ 24")
+        return self
 
 
 class SettleIn(_BaseIn):

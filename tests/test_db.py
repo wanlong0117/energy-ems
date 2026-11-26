@@ -1,7 +1,8 @@
-"""db.py / schema.sql 验证：幂等建库、13 张表（v2 增 manual_reading）、默认值与事件日志。"""
+"""db.py / schema.sql 验证：幂等建库、13 张业务表 + 版本表、默认值与迁移。"""
 from __future__ import annotations
 
 import db
+from migrations import SCHEMA_VERSION
 
 from helpers import create_device, create_point
 
@@ -10,9 +11,10 @@ EXPECTED_TABLES = {
     "reading", "reading_latest", "hourly", "daily", "tariff", "event_log",
     "manual_reading",  # v2 第 13 张表
 }
+VERSION_TABLE = "schema_version"
 
 
-def test_init_db_is_idempotent_and_creates_thirteen_tables(isolated_db):
+def test_init_db_is_idempotent_and_creates_tables(isolated_db):
     # Arrange / Act：连续初始化两次
     db.init_db()
     db.init_db()
@@ -20,9 +22,33 @@ def test_init_db_is_idempotent_and_creates_thirteen_tables(isolated_db):
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     )
 
-    # Assert
-    assert {row["name"] for row in rows} == EXPECTED_TABLES
-    assert len(rows) == 13
+    # Assert：13 张业务表 + 迁移版本表
+    names = {row["name"] for row in rows}
+    assert names == EXPECTED_TABLES | {VERSION_TABLE}
+    assert len(names) == 14
+
+
+def test_migrations_record_latest_version_once(isolated_db):
+    """迁移必须登记到最新版本，且重复 init 不会重复应用。"""
+    db.init_db()
+    applied = db.query("SELECT version FROM schema_version ORDER BY version")
+    assert [int(row["version"]) for row in applied] == list(range(1, SCHEMA_VERSION + 1))
+    db.init_db()
+    assert db.query_one("SELECT COUNT(*) AS c FROM schema_version")["c"] == SCHEMA_VERSION
+
+
+def test_migration_adds_price_columns_to_legacy_daily(isolated_db):
+    """旧库（daily 无 price_cent/tariff_snapshot）升级后自动补列。"""
+    db.execute("DROP TABLE daily")
+    db.execute(
+        "CREATE TABLE daily (meter_id INTEGER NOT NULL, day_start INTEGER NOT NULL,"
+        " energy_wh INTEGER NOT NULL, peak_power REAL, avg_power REAL, cost_cent INTEGER,"
+        " is_final INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (meter_id, day_start)) WITHOUT ROWID"
+    )
+    db.execute("DELETE FROM schema_version WHERE version>=2")
+    db.init_db()
+    columns = {row["name"] for row in db.query("PRAGMA table_info(daily)")}
+    assert {"price_cent", "tariff_snapshot"} <= columns
 
 
 def test_init_db_seeds_three_energy_categories(isolated_db):

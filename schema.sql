@@ -1,7 +1,8 @@
--- 自研能耗管理系统 · 13 张表（替代 MyEMS 6.10.0）
+-- 自研能耗管理系统 · 13 张业务表（替代 MyEMS 6.10.0）
 -- 设计约定：主键 INTEGER 自增；时间存 Unix 秒(UTC)；电量存毫度(1 kWh = 1,000,000)；布尔存 0/1
 -- 依据：IMA《自研能耗管理系统-替代MyEMS技术方案》v1.0 + 增量 PRD v2
 -- 全部 CREATE TABLE IF NOT EXISTS：旧库升级重跑本脚本自动补表、原数据不丢
+-- 旧库缺列的升级由 migrations.py 的版本化迁移负责（schema.sql 不 ALTER 已存在的表）
 
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -126,8 +127,11 @@ CREATE TABLE IF NOT EXISTS daily (
   avg_power   REAL,
   cost_cent   INTEGER,            -- 电费，单位：分
   is_final    INTEGER NOT NULL DEFAULT 0,
+  price_cent  REAL,               -- 当日加权平均单价（分/kWh），电价快照
+  tariff_snapshot TEXT,           -- 计费时实际套用的时段电价明细（JSON）
   PRIMARY KEY (meter_id, day_start)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_daily_day ON daily(day_start);
 
 -- ============ 11. 电价（峰平谷，简化版） ============
 CREATE TABLE IF NOT EXISTS tariff (

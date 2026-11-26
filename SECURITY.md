@@ -41,6 +41,8 @@
 | 接口文档 | `/docs`、`/openapi.json` 需登录；Swagger 资源取自 CDN | 纯内网无法加载页面时，直接用 `/openapi.json` 或看板操作 |
 | 会话存内存 | 服务重启后需重新登录 | 属预期行为 |
 | SQLite 单文件 | 无行级权限 | 通过操作系统文件权限保护 `energy.db` |
+| `/healthz` 匿名 | 仅返回状态、版本、最近读数时间，不含配置与业务数据 | 如需隐藏，可在反向代理限制来源 IP |
+| 配置损坏 | `config.json` 解析失败时拒绝登录（503）并停用后台任务，不回退默认密码 | 修正 JSON 后重启恢复 |
 
 ## 安全部署清单
 
@@ -49,5 +51,5 @@
 - [ ] 反向代理启用 HTTPS，并设置 `X-Forwarded-Proto`
 - [ ] 启用 HTTPS 后设置环境变量 `EMS_COOKIE_SECURE=1`，让会话 Cookie 带 Secure 标志
 - [ ] 限制 `energy.db` 与 `config.json` 的文件权限（程序会把 `config.json` 写成 0600）
-- [ ] 定期备份 `energy.db`（停服务复制或先做 WAL checkpoint）
-- [ ] 关注依赖安全公告并定期升级
+- [ ] 定期备份 `energy.db`：`python scripts/backup.py --db energy.db --out backups --keep 14`
+- [ ] 关注依赖安全公告；本项目依赖已锁定具体版本，升级时请同步跑 `pytest` 与 `ruff check`

@@ -118,5 +118,6 @@ def test_weekly_monthly_do_not_create_materialized_tables(isolated_db):
     tables_after = {r["name"] for r in db.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
     assert tables_after == tables_before
-    assert len(tables_after) == 13
+    # 13 张业务表 + schema_version（迁移版本记录，不属于业务物化表）
+    assert len(tables_after - {"schema_version"}) == 13
     assert not {"weekly", "monthly", "weekly_summary"} & tables_after

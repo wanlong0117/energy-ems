@@ -1,0 +1,11 @@
+# 静态检查配置：只开语法/未定义名/未使用导入这类「真问题」，
+# 不做风格重排（现场代码风格已统一，避免一次 lint 产生大量无关 diff）。
+target-version = "py311"
+line-length = 110
+
+[lint]
+select = ["E9", "F"]
+
+[lint.per-file-ignores]
+# 测试里常用「导入即注册」与跨文件夹具，未使用导入不视为错误
+"tests/*" = ["F401"]

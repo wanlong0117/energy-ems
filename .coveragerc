@@ -1,0 +1,18 @@
+[run]
+branch = False
+omit =
+    tests/*
+    scripts/*
+    .venv/*
+    build/*
+    dist/*
+
+[report]
+# 覆盖率门槛：低于该值 CI 直接失败。当前实测约 87%，
+# 门槛设在 85% 留出小幅波动空间，新增模块必须自带用例。
+fail_under = 85
+show_missing = True
+skip_covered = False
+
+[html]
+directory = htmlcov

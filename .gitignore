@@ -13,3 +13,7 @@ build/
 
 config.json
 .tmp_*/
+.coverage
+htmlcov/
+.ruff_cache/
+backups/

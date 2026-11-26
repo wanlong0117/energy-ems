@@ -12,7 +12,7 @@ from typing import Any
 
 import db
 from aggregation import aggregator
-from settings import QUALITY_MANUAL, SECONDS_PER_DAY, SECONDS_PER_HOUR
+from settings import QUALITY_MANUAL, SECONDS_PER_DAY, SECONDS_PER_HOUR, day_floor
 
 
 class ManualService:
@@ -124,7 +124,7 @@ class ManualService:
         """
         ts = int(ts)
         hour_start: int = (ts // SECONDS_PER_HOUR) * SECONDS_PER_HOUR
-        day_start: int = (ts // SECONDS_PER_DAY) * SECONDS_PER_DAY
+        day_start: int = day_floor(ts)
         aggregator.rollup_hour(hour_start)
 
         current = db.query_one(
@@ -134,7 +134,7 @@ class ManualService:
         if current is not None:
             is_final: int = int(current["is_final"])
         else:
-            today_start: int = (int(time.time()) // SECONDS_PER_DAY) * SECONDS_PER_DAY
+            today_start: int = day_floor(time.time())
             is_final = 0 if day_start == today_start else 1
         aggregator.settle_day(day_start, is_final=is_final, enforce_coverage=False)
 

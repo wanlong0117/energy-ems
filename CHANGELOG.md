@@ -2,6 +2,40 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.2] - 2026-11-26
+
+审计报告「中低优先级与一致性」12 项全部处理，看板单位统一为 kWh / 元，测试 153 → 175 项。
+
+### 新增
+
+- **分时电价（峰平谷）**：`tariff.start_hour/end_hour` 真正参与日结算，按当天各小时电量
+  逐段计价；未覆盖时段回退 `is_default` 单一电价，两者都没有则电费记 0 并标记 `none`。
+- **电价快照**：`daily` 新增 `price_cent`（当日加权单价）与 `tariff_snapshot`（时段明细 JSON）；
+  已定稿日按新电价重算会记 `TARIFF_REPRICE` 事件，历史电费变动可追溯。
+- **数据库版本化迁移**：`schema_version` 表 + `migrations.py` 顺序迁移，旧库启动自动补列补索引，
+  重复启动不重复执行，失败即中止。
+- **健康检查**：`GET /healthz`（匿名、最小信息、数据库异常 503）与 `GET /api/health`
+  （模式、采集任务数、迁移版本、配置错误）。
+- **结构化日志**：应用日志改为单行 JSON（`logging_config.py`），便于现场收集与检索。
+- **在线备份**：`scripts/backup.py` 用 SQLite backup API 复制数据库并按份数清理旧备份。
+- **CI 门槛**：`ruff check` 静态检查 + `pytest-cov` 覆盖率门槛（`.coveragerc`），依赖全部锁定版本。
+
+### 修复
+
+- 看板 KPI 与报表预览统一显示 kWh 与 元（此前 KPI 仍显示毫度整数、分）。
+- 串口波特率原样使用配置值，4800/2400 等低速率不再被静默改写为 9600；非法值配置接口返回 400。
+- Modbus 响应校验 MBAP 事务号与单元号（RTU 校验站号），防串包；设备异常码不再重试。
+- 采集任务异常退出后每秒巡检自动复活，并记 `COLLECTOR_REVIVE`（此前只在配置变更时重建）。
+- `config.json` 解析失败改为**拒绝登录**（503）并停用后台任务，不再回退公开默认密码。
+- 日切点可配置：`EMS_DAY_START_HOUR` / `EMS_TZ_OFFSET_HOURS`，默认 08:00 / UTC+8 与旧行为一致；
+  报表与分时电价均按配置时区换算本地小时。
+- 会话过期时看板统一处理 401 并跳回登录页（此前只弹提示，页面仍停在业务页）。
+
+### 文档
+
+- README 增补分时电价、环境变量、运维（探活/日志/备份/升级/恢复）与安全项；
+- CHANGELOG、版本号与 FastAPI 元信息统一由 `settings.APP_VERSION` 提供。
+
 ## [0.1.1] - 2026-11-26
 
 针对第三方审计报告（真实投运可用性、计量口径与安全）的修复版本。
@@ -77,5 +111,6 @@
 - PRD、系统设计、开源可行性评估
 - MIT 许可证与第三方依赖声明
 
+[0.1.2]: https://github.com/wanlong0117/energy-ems/releases/tag/v0.1.2
 [0.1.1]: https://github.com/wanlong0117/energy-ems/releases/tag/v0.1.1
 [0.1.0]: https://github.com/wanlong0117/energy-ems/releases/tag/v0.1.0

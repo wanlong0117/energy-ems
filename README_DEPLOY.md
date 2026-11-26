@@ -79,9 +79,15 @@ energy_ems/
   copy energy.db energy.db.bak
   ```
 
-- 恢复：停服务 → 用备份覆盖 `energy.db` → 重新启动。
-- 旧版本库升级：直接替换程序，启动会自动重跑 schema.sql 幂等补表（`manual_reading`）
-  并保留原有 13 张表全部数据。
+- 恢复：停服务 → 用备份覆盖 `energy.db`（同时删除 `energy.db-wal` / `energy.db-shm`）→ 重新启动。
+- 源码运行时可用内置脚本做在线备份（SQLite backup API，不锁采集写入）：
+
+  ```bash
+  python scripts/backup.py --db energy.db --out backups --keep 14
+  ```
+
+- 旧版本库升级：直接替换程序，启动会自动执行 `schema.sql` 与 `migrations.py` 的版本化迁移
+  （补齐新增列/索引），13 张业务表数据全部保留；迁移记录见 `schema_version` 表。
 
 ## 6. 常见问题
 

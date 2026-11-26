@@ -29,10 +29,13 @@ from aggregation import aggregator
 from api_auth import router as auth_router
 from api_config import router as config_router
 from api_data import router as data_router
+from api_health import router as health_router
 from api_report import router as report_router
-from auth import require_auth
+from auth import ConfigError, require_auth
 from collector import collector
+from logging_config import get_logger, setup_logging
 from settings import (
+    APP_VERSION,
     DATA_MODE_DEFAULT,
     DASHBOARD_DIR,
     HTTP_HOST,
@@ -43,12 +46,24 @@ from settings import (
 )
 from simulator import Simulator
 
+setup_logging()
+logger = get_logger("main")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """启动：建库 + 按 data_mode 起后台任务；退出：取消任务并记审计日志。"""
     db.init_db()
-    config: dict[str, Any] = auth.load_config()
+    config_broken: bool = False
+    try:
+        config: dict[str, Any] = auth.load_config()
+    except ConfigError as exc:
+        # 配置损坏：服务仍起来以便看健康检查与事件日志，但登录会被拒绝（失败关闭），
+        # 也不启动任何采集/模拟任务，避免在无人可管的状态下继续写错数据。
+        config_broken = True
+        logger.error("config.json 损坏，业务任务与登录均已停用")
+        db.log_event("error", "api", "CONFIG_BROKEN", f"启动时配置不可用: {exc}")
+        config = {}
     data_mode: str = str(config.get("data_mode", DATA_MODE_DEFAULT)).lower()
     if data_mode not in ("simulate", "live"):
         data_mode = DATA_MODE_DEFAULT
@@ -56,7 +71,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     background: list[asyncio.Task[Any]] = []
     simulator: Simulator | None = None
 
-    if data_mode == "simulate":
+    if config_broken:
+        db.log_event("warn", "api", "MODE_IDLE", "配置损坏，未启动采集/模拟/结算任务")
+    elif data_mode == "simulate":
         # 模拟模式：写真实表，绝不与采集器同时运行，避免主键冲突
         interval_sec: int = max(1, int(config.get("simulate_interval_sec") or SIMULATE_INTERVAL_SEC))
         simulator = Simulator(interval_sec, config)
@@ -81,8 +98,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         db.log_event("info", "api", "MODE_RUN", "启动真实采集模式")
 
-    # 两种模式都启动正式结算循环（UTC 00:10 结算昨日 + 补算遗漏日）
-    background.append(asyncio.create_task(aggregator.run_loop(), name="ems-aggregator"))
+    if not config_broken:
+        # 两种模式都启动正式结算循环（日切点 +10 分钟结算昨日 + 补算遗漏日）
+        background.append(asyncio.create_task(aggregator.run_loop(), name="ems-aggregator"))
 
     try:
         yield
@@ -99,7 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app: FastAPI = FastAPI(
     title="energy_ems",
-    version="0.1.1",
+    version=APP_VERSION,
     lifespan=lifespan,
     # 关闭 FastAPI 自带的免鉴权文档路由，改用下方带 require_auth 的入口
     docs_url=None,
@@ -107,8 +125,9 @@ app: FastAPI = FastAPI(
     openapi_url=None,
 )
 
-# 路由注册：认证路由在前，其余均挂 require_auth
+# 路由注册：认证与探活在前，其余均挂 require_auth
 app.include_router(auth_router)
+app.include_router(health_router)
 app.include_router(config_router)
 app.include_router(data_router)
 app.include_router(report_router)
@@ -133,6 +152,16 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
         status_code=exc.status_code,
         content={"ok": False, "error": str(exc.detail)},
         headers=exc.headers,
+    )
+
+
+@app.exception_handler(ConfigError)
+async def config_error_handler(request: Request, exc: ConfigError) -> JSONResponse:
+    """配置损坏：503 + 明确话术，绝不悄悄回退到默认密码。"""
+    logger.error("配置文件不可用，请求被拒绝")
+    return JSONResponse(
+        status_code=503,
+        content={"ok": False, "error": "服务器配置文件损坏，请联系管理员修复 config.json"},
     )
 
 

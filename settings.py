@@ -38,16 +38,47 @@ def resource_dir() -> Path:
 STATIC_DIR: Path = _SRC_DIR / "static"  # v1 兼容保留
 DASHBOARD_DIR: Path = resource_dir() / "dashboard"  # v2 单文件看板只读目录
 
-# ---------- 时区与 08:00 结算口径 ----------
-TZ_OFFSET_HOURS: int = 8
+# ---------- 时区与日切点（可配置） ----------
 SECONDS_PER_MINUTE: int = 60
 SECONDS_PER_HOUR: int = 3600
 SECONDS_PER_DAY: int = 86400
 SECONDS_PER_WEEK: int = 7 * SECONDS_PER_DAY
-DAY_START_UTC_HOUR: int = 0          # 本地 08:00 = UTC 00:00
-SETTLE_UTC_HOUR: int = 0             # 本地 08:10 = UTC 00:10
+
+
+def _env_int(name: str, default: int) -> int:
+    """读取整数型环境变量，非法值回退默认（配置错误不应让服务起不来）。"""
+    try:
+        return int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# 时区偏移：现场默认 UTC+8。报表的「本地时刻」「分时电价时段」都按它换算。
+TZ_OFFSET_HOURS: int = _env_int("EMS_TZ_OFFSET_HOURS", 8) % 24
+# 日切点：本地几点算新的一天，默认 08:00（现场抄表口径）。
+# 08:00 本地 = UTC 00:00，故默认值与历史行为完全一致；改成别的整点需重新结算历史。
+DAY_START_LOCAL_HOUR: int = _env_int("EMS_DAY_START_HOUR", 8) % 24
+# 日切点对应的 UTC 整点：08:00 本地 - 8 小时 = 00:00 UTC
+DAY_BOUNDARY_UTC_HOUR: int = (DAY_START_LOCAL_HOUR - TZ_OFFSET_HOURS) % 24
+DAY_START_UTC_HOUR: int = DAY_BOUNDARY_UTC_HOUR  # 兼容旧命名
+SETTLE_UTC_HOUR: int = DAY_BOUNDARY_UTC_HOUR     # 日结在日切点后 10 分钟
 SETTLE_UTC_MINUTE: int = 10
 CATCHUP_LOOKBACK_DAYS: int = 30      # 启动时补算最近 30 天遗漏的日结算
+
+
+def day_floor(ts: int) -> int:
+    """返回 ts 所属「日切点」那一天的起点（Unix 秒 UTC）。
+
+    默认日切点 UTC 00:00 时等价于 round-down 到整日，
+    因此与 v1/v2 的 day_start 完全一致；改 EMS_DAY_START_HOUR 后才整体平移。
+    """
+    offset: int = DAY_BOUNDARY_UTC_HOUR * SECONDS_PER_HOUR
+    return ((int(ts) - offset) // SECONDS_PER_DAY) * SECONDS_PER_DAY + offset
+
+
+def local_hour(ts: int) -> int:
+    """Unix 秒 -> 现场本地小时（0~23），用于分时电价时段匹配。"""
+    return (int(ts) // SECONDS_PER_HOUR + TZ_OFFSET_HOURS) % 24
 
 # ---------- 周 / 月聚合口径 ----------
 WEEK_FIRST_WEEKDAY: int = 0          # 0=周一（ISO 周），weekday() 直接可用
@@ -150,3 +181,7 @@ SESSION_COOKIE_SECURE: bool = os.environ.get("EMS_COOKIE_SECURE", "") not in (""
 # ---------- HTTP 入口（单进程 uvicorn） ----------
 HTTP_HOST: str = "0.0.0.0"
 HTTP_PORT: int = 8000
+
+# ---------- 版本 ----------
+# 单一事实源：FastAPI 元信息、/healthz、看板侧栏都读它，避免三处各写一个版本号
+APP_VERSION: str = "0.1.2"

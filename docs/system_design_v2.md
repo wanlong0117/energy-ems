@@ -510,7 +510,7 @@ sequenceDiagram
 - **API 响应格式**：统一 `{ "ok": bool, "data"?: any, "error"?: str }`（`schemas.ok()`/`fail()`）。成功无业务数据时可省略 `data`；失败带 `error` + 明确 HTTP 状态码（400/401/404/422/500/502）。空区间返回空数组 `{ok:true, data:[]}`，不报错。
 - **鉴权**：session cookie 名 `ems_session`，httponly/samesite=lax/TTL 7 天；除 `/api/login`、`/api/session` 外所有 `/api/*` 经 `require_auth` 守卫，未登录 401。
 - **时间**：所有时间戳 Unix 秒 UTC；`day_start` = UTC 00:00（= 本地 08:00）；`hour_start` = UTC 整点；DB 不存本地时间字符串。
-- **电量单位**：`energy_wh`/`cost_cent` 为整数；1 kWh = 1,000,000 毫度；`cost_cent = round(energy_wh / 1e6 × price_cent)`；`reading.value` 为 scale/offset 换算后工程值，单位见 `point.unit`（水表按毫 m³ 记账）。
+- **电量单位**：`energy_wh`/`cost_cent` 为整数；1 kWh = 1,000,000 毫度；单一电价时 `cost_cent = round(energy_wh / 1e6 × price_cent)`，v0.1.2 起改按小时电量匹配 `tariff.start_hour/end_hour` 逐段计价（峰平谷），并将加权单价与时段快照写入 `daily.price_cent` / `daily.tariff_snapshot`；`reading.value` 为 scale/offset 换算后工程值，单位见 `point.unit`（水表按毫 m³ 记账）。
 - **quality**：0=正常、1=超时、2=越界、3=人工。小时汇总 reading 点取 `quality IN (0,3)`，power 点仅取 `quality=0`。
 - **manual_reading 事务同步**：`record()` 在单事务内写 `manual_reading` + `reading(quality=3)` + `reading_latest`（`reading_latest` 仅当新 `ts >= 旧 ts` 覆盖）；`UNIQUE(point_id,ts)` 重复录入=覆盖并写 `event_log(source=user, code=MANUAL_OVERWRITE)`；提交后触发回填重算。
 - **周/月分组规则**：`week_start(day_start) = day_start - datetime.utcfromtimestamp(day_start).weekday()*86400`（周一为首）；`month_start(day_start) = 当月 1 日 UTC 00:00`；周/月汇总对 `daily` 按分组键 `SUM(energy_wh)/SUM(cost_cent)`，`MAX(peak_power)`、加权平均，`is_final` = 区间内全部日 final。结果与区间 daily 求和误差 0，不落新表。

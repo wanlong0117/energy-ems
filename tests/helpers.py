@@ -91,10 +91,17 @@ def add_reading(point_id: int, ts: int, value: float, quality: int = 0) -> None:
     )
 
 
-def create_tariff(price_cent: int = 80, is_default: int = 1, name: str = "平价") -> int:
+def create_tariff(
+    price_cent: int = 80,
+    is_default: int = 1,
+    name: str = "平价",
+    start_hour: int | None = None,
+    end_hour: int | None = None,
+) -> int:
     return int(db.execute(
-        "INSERT INTO tariff (name, price_cent, is_default) VALUES (?,?,?)",
-        (name, price_cent, is_default),
+        "INSERT INTO tariff (name, price_cent, start_hour, end_hour, is_default) "
+        "VALUES (?,?,?,?,?)",
+        (name, price_cent, start_hour, end_hour, is_default),
     ))
 
 

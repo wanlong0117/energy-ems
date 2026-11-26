@@ -264,7 +264,7 @@
     </nav>
     <div class="sidebar-foot">
       <div class="mode-row"><span class="status-dot"></span><span id="modeBadge" class="badge">simulate</span></div>
-      <div class="ver">v2.0 · 132 TESTS PASSED</div>
+      <div class="ver">v0.1.2 · MIT</div>
     </div>
   </aside>
   <div class="shell">
@@ -318,14 +318,15 @@
           <div class="kpi-value" id="kpiPoints">0</div><div class="kpi-foot">ONLINE POINTS</div>
         </div>
         <div class="kpi">
-          <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_energy">区间电量(毫度)</span>
+          <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_energy">区间电量(kWh)</span>
             <span class="kpi-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12l1-8.5Z"/></svg></span></div>
-          <div class="kpi-value" id="kpiEnergy">0</div><div class="kpi-foot">ENERGY</div>
+          <div class="kpi-value" id="kpiEnergy">0.00</div><div class="kpi-foot">ENERGY · kWh</div>
         </div>
         <div class="kpi">
-          <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_cost">区间电费(分)</span>
-            <span class="kpi-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19V5M4 19h16"/><path d="M8 15v-4M12 15V8M16 15v-6"/></svg></span></div>
-          <div class="kpi-value" id="kpiCost">0</div><div class="kpi-foot">COST</div>
+          <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_cost">区间电费(元)</span>
+            <span class="kpi-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19V5M4 19h16"/><path d="M8 15v-4M12 15V8M16 15v-6"/></svg></span>
+          </div>
+          <div class="kpi-value" id="kpiCost">0.00</div><div class="kpi-foot">COST · CNY</div>
         </div>
         <div class="kpi">
           <div class="kpi-head"><span class="kpi-label" data-i18n="kpi_update">最新时间</span>
@@ -460,8 +461,11 @@ const I18N = {
     tab_config: "配置", tab_report: "报表", tab_manual: "手动录入", tab_events: "事件日志",
     login_title: "登录", password: "密码", login_btn: "登录", login_fail: "登录失败",
     dash_overview: "实时概览", refresh: "刷新", node_filter: "节点", purpose_filter: "用途",
-    kpi_points: "最新点位", kpi_energy: "区间电量(毫度)", kpi_cost: "区间电费(分)", kpi_update: "最新时间",
+    kpi_points: "最新点位", kpi_energy: "区间电量(kWh)", kpi_cost: "区间电费(元)", kpi_update: "最新时间",
     trend_hour: "小时电量趋势", trend_purpose: "按用途日汇总", latest_table: "最新读数",
+    rep_period: "期间", rep_meter: "计量表", rep_purpose_col: "用途", rep_node: "节点",
+    rep_energy: "电量(kWh)", rep_cost: "电费(元)", rep_final: "已结算",
+    yes: "是", no: "否",
     config_title: "配置管理", resource: "资源", save: "保存", reset: "重置", edit: "编辑", delete: "删除",
     trial_title: "点位试读", trial_read: "试读", point: "点位", mode_switch: "数据模式切换", switch: "切换",
     restart_hint: "切换后需重启服务生效：simulate 使用内置模拟器，live 由 Modbus 采集器接管，二者互斥。",
@@ -471,7 +475,7 @@ const I18N = {
     submit: "提交", recent: "最近录入", events_title: "事件日志", level: "级别", source: "来源",
     limit: "条数", no_data: "暂无数据 / No data", saved: "保存成功", failed: "操作失败",
     confirm_delete: "确认删除该记录？", overwritten: "已覆盖同时间点原记录", trial_fail: "试读失败",
-    need_login: "请先登录", welcome: "当前数据模式",
+    need_login: "请先登录", session_expired: "登录已过期，请重新登录", welcome: "当前数据模式",
     accumulating: "数据积累中，至少需要 3 个小时点",
     pw_change_title: "修改密码", pw_old: "原密码", pw_new: "新密码", pw_confirm: "确认新密码",
     pw_submit: "设置新密码", pw_rule: "默认密码仅用于首次登录，请设置至少 8 位新密码。",
@@ -482,8 +486,11 @@ const I18N = {
     tab_config: "Config", tab_report: "Reports", tab_manual: "Manual Entry", tab_events: "Event Log",
     login_title: "Login", password: "Password", login_btn: "Sign in", login_fail: "Login failed",
     dash_overview: "Live Overview", refresh: "Refresh", node_filter: "Node", purpose_filter: "Purpose",
-    kpi_points: "Latest Points", kpi_energy: "Energy (milli)", kpi_cost: "Cost (cent)", kpi_update: "Last Update",
+    kpi_points: "Latest Points", kpi_energy: "Energy (kWh)", kpi_cost: "Cost (CNY)", kpi_update: "Last Update",
     trend_hour: "Hourly Energy Trend", trend_purpose: "Daily Energy by Purpose", latest_table: "Latest Readings",
+    rep_period: "Period", rep_meter: "Meter", rep_purpose_col: "Purpose", rep_node: "Node",
+    rep_energy: "Energy (kWh)", rep_cost: "Cost (CNY)", rep_final: "Settled",
+    yes: "Yes", no: "No",
     config_title: "Configuration", resource: "Resource", save: "Save", reset: "Reset", edit: "Edit", delete: "Delete",
     trial_title: "Point Probe", trial_read: "Probe", point: "Point", mode_switch: "Data Mode Switch", switch: "Switch",
     restart_hint: "Restart is required: simulate uses the built-in simulator, live uses Modbus collectors (mutually exclusive).",
@@ -493,7 +500,8 @@ const I18N = {
     submit: "Submit", recent: "Recent Entries", events_title: "Event Log", level: "Level", source: "Source",
     limit: "Limit", no_data: "No data", saved: "Saved", failed: "Operation failed",
     confirm_delete: "Delete this record?", overwritten: "Existing record at same timestamp was overwritten",
-    trial_fail: "Probe failed", need_login: "Please sign in first", welcome: "Current data mode",
+    trial_fail: "Probe failed", need_login: "Please sign in first",
+    session_expired: "Session expired. Please sign in again.", welcome: "Current data mode",
     accumulating: "Accumulating — at least 3 hourly points needed",
     pw_change_title: "Change Password", pw_old: "Current password", pw_new: "New password",
     pw_confirm: "Confirm new password", pw_submit: "Set new password",
@@ -526,6 +534,16 @@ async function api(path, options) {
   if (!response.ok || !payload.ok) {
     const error = new Error(payload.error || ("HTTP " + response.status));
     error.status = response.status;
+    if (response.status === 401 && state.authed) {
+      // 会话过期：统一回到登录页，不再只是弹个提示让人继续点
+      state.authed = false;
+      state.mustChangePassword = false;
+      $("logoutBtn").style.display = "none";
+      $("loginCard").hidden = false;
+      $("pwChangeCard").hidden = true;
+      switchTab("login");
+      toast(t("session_expired"), true);
+    }
     throw error;
   }
   return payload.data;
@@ -543,6 +561,15 @@ function fmtValue(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return String(value);
   return num.toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+/* 后端电量存毫度、电费存分；看板统一显示 kWh 与 元，避免现场自己除一百万 */
+function fmtKwh(energyMilli) {
+  const value = (Number(energyMilli) || 0) / 1000000;
+  return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtYuan(costCent) {
+  const value = (Number(costCent) || 0) / 100;
+  return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 function htmlTable(target, rows, columns) {
   const head = "<table><thead><tr>" + columns.map((col) => "<th>" + esc(col) + "</th>").join("") + "</tr></thead><tbody>";
@@ -767,8 +794,8 @@ async function loadDashboard() {
     state.latest = latest || []; state.hourly = hourly || []; state.daily = daily || [];
     const fmt = (value) => Number(value || 0).toLocaleString("en-US");
     $("kpiPoints").textContent = fmt(state.latest.length);
-    $("kpiEnergy").textContent = fmt(state.daily.reduce((sum, row) => sum + (Number(row.energy_wh) || 0), 0));
-    $("kpiCost").textContent = fmt(state.daily.reduce((sum, row) => sum + (Number(row.cost_cent) || 0), 0));
+    $("kpiEnergy").textContent = fmtKwh(state.daily.reduce((sum, row) => sum + (Number(row.energy_wh) || 0), 0));
+    $("kpiCost").textContent = fmtYuan(state.daily.reduce((sum, row) => sum + (Number(row.cost_cent) || 0), 0));
     $("kpiUpdate").textContent = fmtTime(state.latest.length ? state.latest[0].ts : 0);
     const hourlyMap = new Map();
     state.hourly.forEach((row) => {
@@ -939,13 +966,19 @@ async function loadReport() {
   const query = reportQuery();
   try {
     const rows = await api("/api/" + kind + (query ? "?" + query : ""));
-    const columns = ["period_start", "meter_name", "purpose", "node_name", "energy_wh", "cost_cent", "is_final"];
-    const display = rows.map((row) => ({
-      period_start: fmtTime(row.period_start || row.day_start).slice(0, 16),
-      meter_name: row.meter_name || "", purpose: row.purpose || "",
-      node_name: row.node_name || "", energy_wh: row.energy_wh || 0,
-      cost_cent: row.cost_cent || 0, is_final: row.is_final || 0
-    }));
+    const columns = [t("rep_period"), t("rep_meter"), t("rep_purpose_col"), t("rep_node"),
+                     t("rep_energy"), t("rep_cost"), t("rep_final")];
+    const display = rows.map((row) => {
+      const item = {};
+      item[columns[0]] = fmtTime(row.period_start || row.day_start).slice(0, 16);
+      item[columns[1]] = row.meter_name || "";
+      item[columns[2]] = row.purpose || "";
+      item[columns[3]] = row.node_name || "";
+      item[columns[4]] = fmtKwh(row.energy_wh);
+      item[columns[5]] = fmtYuan(row.cost_cent);
+      item[columns[6]] = Number(row.is_final) === 1 ? t("yes") : t("no");
+      return item;
+    });
     htmlTable($("repPreview"), display, columns);
   } catch (e) { toast(e.message, true); }
 }

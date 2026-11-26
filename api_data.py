@@ -8,14 +8,13 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from fastapi.responses import JSONResponse
 
 import auth
 import db
 from aggregation import aggregator
 from auth import require_auth
 from schemas import SettleIn, fail, ok
-from settings import DATA_MODE_DEFAULT, SECONDS_PER_DAY
+from settings import DATA_MODE_DEFAULT, SECONDS_PER_DAY, day_floor
 
 router = APIRouter(prefix="/api", tags=["data"], dependencies=[Depends(require_auth)])
 
@@ -227,7 +226,7 @@ def settle(body: SettleIn | None = None) -> Any:
     结算是否定稿由覆盖率决定：数据不完整时保留 is_final=0，响应里如实回传。
     """
     try:
-        today_start: int = (int(time.time()) // SECONDS_PER_DAY) * SECONDS_PER_DAY
+        today_start: int = day_floor(time.time())
         if body is not None and body.day_start is not None:
             day_start: int = int(body.day_start)
             if day_start > today_start:

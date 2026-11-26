@@ -41,12 +41,14 @@ Energy EMS 的取舍：
 | 规模 | 默认预置 100 块电表 + 5 组冷却塔电极 + 5 个机械排水手动点 |
 | 数据 | 13 张表，SQLite WAL；读数质量分级（正常/超时/越界/人工），超时按「保持上一值 + 质量码 1」落库 |
 | 汇总 | 小时 / 日 / 周 / 月；`live` 模式内置小时汇总任务；日结算按本地 08:00（UTC 00:00）口径，覆盖不足 90% 不定稿 |
+| 电价 | 分时电价（峰平谷，按本地小时时段计价）；日表保存当日加权单价与时段快照，改价重算会记 `TARIFF_REPRICE` 事件 |
 | 报表 | 日/周/月聚合，Excel（openpyxl）与 PDF（ReportLab，内置中文字体）；电量 kWh、电费 元，默认导出最近 31 天 |
-| 保留 | 原始读数 90 天滚动清理，事件日志按 2 万条上限裁剪 |
+| 保留 | 原始读数 90 天滚动清理，事件日志按 2 万条上限裁剪；数据库版本化迁移（`schema_version`） |
 | 手动录入 | 机械排水量等离线数据补录，自动同步最新读数；只接受最近 90 天至当前 5 分钟内 |
-| 看板 | 单文件 HTML，无框架、无构建；KPI、趋势、分项、最新读数 |
+| 看板 | 单文件 HTML，无框架、无构建；KPI、趋势、分项、最新读数，电量/电费统一显示 kWh 与 元 |
 | 主题 | 亮/暗色自动跟随系统，860px 以下响应式 |
-| 安全 | 服务端强制改密（默认密码下业务接口 403）、PBKDF2 口令哈希、登录失败锁定、接口文档需登录、httponly 会话 cookie |
+| 安全 | 服务端强制改密（默认密码下业务接口 403）、PBKDF2 口令哈希、登录失败锁定、接口文档需登录、httponly 会话 cookie、配置损坏时拒绝登录而非回退默认密码 |
+| 运维 | `/healthz` 探活、单行 JSON 日志、`scripts/backup.py` 在线备份；采集任务异常退出自动复活并记 `COLLECTOR_REVIVE` |
 | 演示 | `simulate` 模式内置模拟器，无硬件也能完整跑通 |
 
 ## 快速开始
@@ -109,6 +111,28 @@ EMS_PASSWORD='your-strong-password' ./energy_ems
 
 切换 `data_mode` 后需重启服务生效。
 
+以下环境变量控制计量口径（改动后需重新结算历史，否则新旧口径混在一张表里）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `EMS_DAY_START_HOUR` | `8` | 本地几点算新的一天（现场抄表口径） |
+| `EMS_TZ_OFFSET_HOURS` | `8` | 时区偏移，用于报表本地时刻与分时电价时段匹配 |
+| `EMS_COOKIE_SECURE` | 空 | 叠 HTTPS 反向代理后设为 `1`，会话 Cookie 加 Secure |
+
+### 电价（峰平谷）
+
+`tariff` 表一行一个时段：`start_hour` / `end_hour` 为**本地小时**的右开区间，
+`is_default=1` 的行作为未覆盖时段的兜底价；两者都留空则为全天单一电价。
+例如峰段 10–12 点 1.20 元、其余 0.60 元：
+
+| name | price_cent | start_hour | end_hour | is_default |
+|---|---|---|---|---|
+| 峰 | 120 | 10 | 12 | 0 |
+| 平 | 60 | | | 1 |
+
+日结算按当天每小时电量逐段计价，并把加权单价与时段明细写入
+`daily.price_cent` / `daily.tariff_snapshot`，改价后重算会在事件日志留下 `TARIFF_REPRICE`。
+
 ### Modbus 设备配置
 
 看板「配置」页按资源类型维护 `node / device / point / meter / meter_point / tariff`。
@@ -117,8 +141,11 @@ EMS_PASSWORD='your-strong-password' ./energy_ems
 |---|---|---|---|
 | `modbus_tcp` | 网关 IP | 502 | 标准 MBAP over TCP |
 | `modbus_rtu_tcp` | 网关 IP | TCP 端口 | RTU 帧（地址 + PDU + CRC16）走 TCP |
-| `modbus_rtu_serial` | `COM3` 等 | 波特率（9600/115200） | pyserial 串口，异步不阻塞 |
+| `modbus_rtu_serial` | `COM3` 等 | 波特率（4800/9600/115200） | pyserial 串口，异步不阻塞；波特率**原样使用**，非法值返回 400 |
 | `manual` | 任意 | 任意 | 手动表/机械表，不参与采集 |
+
+> Modbus 回包会校验 MBAP 事务号与单元号（RTU 校验站号），不符即丢弃重试；
+> 设备返回的异常码（`func|0x80`）属确定性答复，不重试，直接记 `READ_FAIL`。
 
 点位试读（`POST /api/point/{id}/read`）会返回原始寄存器十六进制、解析值与四种字节序对照，
 用于现场确认 `byte_order`（`ABCD / CDAB / BADC / DCBA`）。
@@ -131,32 +158,37 @@ EMS_PASSWORD='your-strong-password' ./energy_ems
       ▼
 FastAPI / Uvicorn（单进程）
   ├── api_auth      登录、会话、改密
+  ├── api_health    /healthz 探活、/api/health 详细状态
   ├── api_config    7 类资源 CRUD + 点位试读
   ├── api_data      最新读数、小时/日/周/月
   ├── api_report    Excel / PDF 导出
   ├── collector     Modbus TCP / RTU-TCP / RTU 串口
   ├── simulator     演示数据（simulate 模式）
-  └── aggregation   小时 / 日 / 周 / 月汇总
+  ├── aggregation   小时 / 日 / 周 / 月汇总
+  └── tariff        分时电价与价格快照
       │
       ▼
-SQLite（WAL，13 张表）
-```
+SQLite（WAL，13 张业务表 + schema_version）
 
 目录：
 
 ```
 energy-ems/
 ├── main.py              # 入口、lifespan、静态资源
-├── auth.py              # 会话、密码策略
+├── auth.py              # 会话、密码策略、配置读写
 ├── db.py                # SQLite 连接与事件日志
-├── schema.sql           # 13 张表
+├── migrations.py        # 版本化迁移
+├── schema.sql           # 13 张业务表
 ├── modbus.py            # 自研 Modbus 三协议
 ├── collector.py         # 采集循环
 ├── simulator.py         # 模拟器
 ├── aggregation.py       # 聚合与结算
+├── tariff.py            # 分时电价计费
+├── logging_config.py    # 单行 JSON 日志
 ├── reports.py           # Excel / PDF
 ├── api_*.py             # 路由
 ├── dashboard/index.html # 单文件看板
+├── scripts/backup.py    # 在线备份
 ├── tests/               # pytest
 └── docs/                # PRD、架构、开源评估
 ```
@@ -164,13 +196,15 @@ energy-ems/
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest -q
-# 153 passed
+.venv/bin/python -m pytest -q                 # 全量用例
+.venv/bin/python -m pytest -q --cov=.         # 覆盖率门槛见 .coveragerc
+.venv/bin/ruff check .                        # 静态检查（CI 强制）
 ```
 
-覆盖：Modbus 帧解析（含 CRC16/字节序）、聚合口径（间隔法、覆盖率定稿）、live 链路端到端、
-并发事务隔离、周/月报表、Excel/PDF 结构与单位、认证与密码策略（服务端改密拦截、失败锁定、哈希存储）、
-配置 CRUD 与外键状态码、接口文档鉴权、静态资源完整性。
+覆盖：Modbus 帧解析（含 CRC16/字节序/事务号/单元号）、聚合口径（间隔法、覆盖率定稿、
+分时电价）、live 链路端到端、并发事务隔离、周/月报表、Excel/PDF 结构与单位、
+认证与密码策略（服务端改密拦截、失败锁定、哈希存储、配置损坏拒绝登录）、
+配置 CRUD 与外键状态码、数据库迁移、健康检查与备份、接口文档鉴权、静态资源完整性。
 
 ## 安全
 
@@ -179,8 +213,22 @@ energy-ems/
 - 同来源连续 5 次登录失败锁定 60 秒，并记事件日志
 - `/docs`、`/openapi.json` 需登录后访问（Swagger 静态资源取自 CDN，纯内网可能渲染不出）
 - 会话为 httponly + SameSite=Lax cookie，7 天过期；叠 HTTPS 后设 `EMS_COOKIE_SECURE=1`
-- `config.json` 以 0600 权限原子写入；建议仅在内网使用，公网访问请置于反向代理后并启用 HTTPS
+- `config.json` 以 0600 权限原子写入；解析失败时**拒绝登录**（503）而不是回退默认密码
+- 建议仅在内网使用，公网访问请置于反向代理后并启用 HTTPS
 - 漏洞上报请见 [SECURITY.md](SECURITY.md)
+
+## 运维
+
+| 能力 | 用法 |
+|---|---|
+| 探活 | `GET /healthz`（匿名，最小信息，数据库不可用返回 503）；登录后 `GET /api/health` 看模式、任务数、迁移版本 |
+| 日志 | 应用日志为单行 JSON（`ts/level/logger/message`），可直接重定向到文件；业务事件另存 `event_log` 表 |
+| 备份 | `python scripts/backup.py --db energy.db --out backups --keep 14`，用 SQLite backup API 在线复制，不锁采集写入 |
+| 升级 | 停服务、替换文件、启动即自动执行 `schema.sql` + 版本化迁移；记录见 `schema_version` 表 |
+| 恢复 | 停服务，删除 `energy.db-wal` / `energy.db-shm`，用备份替换 `energy.db` 后启动 |
+
+> 迁移只前向执行、失败即中止（不会在半个升级状态下继续服务）；
+> 建议先在测试机用生产库副本跑一遍升级。
 
 ## FAQ
 
@@ -202,6 +250,7 @@ A：使用 ReportLab 内置 `STSong-Light` CID 字体，无需外部字体；生
 ## 路线图
 
 - [x] v0.1 核心：采集、汇总、报表、看板、Win11 包
+- [x] v0.1.2 审计加固：分时电价与价格快照、版本化迁移、健康检查、JSON 日志、在线备份
 - [ ] Docker / compose（NAS、Linux 服务器）
 - [ ] 多用户与角色权限（RBAC）
 - [ ] 告警通知（邮件 / 企业微信 / 钉钉）

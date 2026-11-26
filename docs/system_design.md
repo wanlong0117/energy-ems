@@ -20,7 +20,7 @@
 | 寄存器合并读取 | 相邻寄存器逐点读会浪费往返 | `collector.merge_reads()` 按 (device, slave, func) 排序，把相邻/重叠区间合并为单次 ≤125 寄存器请求 |
 | 配置热生效 | 修改 device/point 后不重启即生效 | `Collector.reload()` 置 `asyncio.Event`，轮询循环在每轮起点重建配置快照 |
 | 08:00 结算口径 | 本地 08:00→次日 08:00，需与 UTC 存储换算 | 现场 UTC+8 ⇒ 08:00 本地 = UTC 00:00；`day_start` 存 UTC 00:00 时间戳，`hour_start` 存 UTC 整点，`08:10` 结算即 UTC 00:10 |
-| 电量单位 | 累计电量差值需换算为毫度（1 kWh = 1,000,000） | `aggregation` 用 `ΔkWh × 1e6` 写 `energy_wh`；电费 `cost_cent = energy_wh/1e6 × price_cent` |
+| 电量单位 | 累计电量差值需换算为毫度（1 kWh = 1,000,000） | `aggregation` 用 `ΔkWh × 1e6` 写 `energy_wh`；电费按小时电量乘对应时段单价（v0.1.2 起支持峰平谷），单一电价即 `energy_wh/1e6 × price_cent` |
 
 ### 1.2 框架与选型
 
@@ -455,14 +455,17 @@ sequenceDiagram
 
 ## 5. Anything UNCLEAR（假设与待确认）
 
-1. **时区/08:00 口径**：假设现场为 UTC+8，故本地 08:00 = UTC 00:00，`day_start` 存 UTC 00:00 时间戳、`hour_start` 存 UTC 整点；`08:10` 结算 = UTC 00:10。若现场时区不同需调整换算。
+1. **时区/08:00 口径**：现场默认 UTC+8，故本地 08:00 = UTC 00:00。v0.1.2 起日切点与
+   时区偏移可用 `EMS_DAY_START_HOUR` / `EMS_TZ_OFFSET_HOURS` 配置，默认值保持 UTC 00:00 口径。
 2. **byte_order 默认值**：`schema.sql` 现为 `DEFAULT 'AB'`（2 字符），与 PRD 的 4 字符格式 `ABCD/CDAB/BADC/DCBA` 冲突。设计按 4 字符统一，初始化时修正默认值为 `ABCD`。
 3. **CDAB 字交换**：现场电表是否确为 CDAB 未最终确认；试读接口返回原始寄存器 hex + 多种字节序解析值供现场比对确认。
-4. **tariff 峰平谷**：PRD 未给具体时段/单价。假设先用 `is_default=1` 的单一电价按日总量计费；分时段电费后置细化（Tariff.start_hour/end_hour 已预留）。
+4. **tariff 峰平谷**：v0.1.2 已实现——按当天各小时电量匹配 `start_hour/end_hour` 时段单价，
+   未覆盖时段回退 `is_default` 单一电价；日表另存加权单价与时段快照（`price_cent`/`tariff_snapshot`）。
 5. **网关连接与并存**：采集机 MyEMS 是否并行运行、E90 网关连接数上限未知；自写客户端每设备独立短连接，读毕即关。
 6. **累计电量取点**：小时电量差取 `meter_point.role='reading'` 的点；瞬时功率取 `role='power'`。若某表未配置 power 点，`avg_power/max_power` 允许为 NULL。
-7. **90 天清理/看板/CSV**：`reading` 滚动清理、单文件看板、CSV 导出均为后置 Phase，本轮仅预留 API 与静态挂载位。
-8. **固定密码修改**：沿用 `config.json` 改密码 + 重启，暂不做网页改密入口（PRD Open Question 4）。
+7. **90 天清理/看板/CSV**：`reading` 90 天滚动清理与单文件看板已在 v0.1.x 落地；
+   报表导出走 Excel/PDF（CSV 未提供）。
+8. **固定密码修改**：已提供网页改密入口（`POST /api/password`），并支持服务端强制改密与失败锁定。
 
 ---
 

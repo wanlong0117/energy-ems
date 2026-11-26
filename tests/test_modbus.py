@@ -124,13 +124,39 @@ def test_read_registers_timeout_retries_then_fails(isolated_db):
     run(scenario())
 
 
-def test_read_registers_retries_after_exception_response(isolated_db):
+def test_parse_response_validates_transaction_and_unit(isolated_db):
+    """Arrange: 事务号/单元号与请求不符的回包。Act: 带期望值解析。Assert: 一律拒绝。"""
+    client = ModbusClient("127.0.0.1", 502)
+    frame = _response_bytes([0x1234], tx=9)
+    # 单元号固定写成 1（_response_bytes 的 unit）
+    assert client.parse_response(frame, 9, 1) == [0x1234]
+    with pytest.raises(ModbusError, match="事务号"):
+        client.parse_response(frame, 8, 1)
+    with pytest.raises(ModbusError, match="单元号"):
+        client.parse_response(frame, 9, 2)
+
+
+def test_rtu_parse_response_validates_slave(isolated_db):
+    """RTU 回包站号必须与请求一致，否则视为总线串包。"""
+    from modbus import ModbusRTUTCPClient
+
+    client = ModbusRTUTCPClient("127.0.0.1", 502)
+    body = bytes([3, 3, 4, 0, 1, 0, 2])  # 站号 3 / func 3 / 4 字节 / 寄存器 1,2
+    crc = client.crc16(body)
+    frame = body + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+    assert client.parse_response(frame, 3) == [1, 2]
+    with pytest.raises(ModbusError, match="单元号"):
+        client.parse_response(frame, 4)
+
+
+def test_read_registers_does_not_retry_on_exception_response(isolated_db):
+    """异常码是设备的确定性答复：重试只会再收一次同样的帧，必须立即失败。"""
     async def scenario():
-        async with FakeGateway(values=[0xABCD, 0xEF01], behavior="fail_first") as gateway:
-            client = ModbusClient("127.0.0.1", gateway.port, timeout_ms=300, retry=1)
-            registers = await client.read_registers(1, 3, 0, 2)
-            assert registers == [0xABCD, 0xEF01]
-            assert gateway.connects == 2
+        async with FakeGateway(values=[0xABCD], behavior="exception") as gateway:
+            client = ModbusClient("127.0.0.1", gateway.port, timeout_ms=300, retry=2)
+            with pytest.raises(ModbusError):
+                await client.read_registers(1, 3, 0, 2)
+            assert gateway.connects == 1, "异常响应不得重试"
 
     run(scenario())
 

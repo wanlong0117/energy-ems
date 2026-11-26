@@ -22,7 +22,6 @@ from modbus import (
 )
 from settings import (
     BYTE_ORDERS,
-    DEFAULT_BAUDRATE,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_RETRY,
     DEFAULT_TIMEOUT_MS,
@@ -44,7 +43,7 @@ class Collector:
         self.reload_event: asyncio.Event = asyncio.Event()
 
     async def start(self) -> None:
-        """常驻调度器：监听 reload_event，增删设备采集协程。"""
+        """常驻调度器：监听 reload_event，增删设备采集协程，并定期复活异常退出的任务。"""
         self.reload_event.set()  # 首次启动立即加载配置
         while True:
             try:
@@ -53,9 +52,36 @@ class Collector:
                     self._sync_tasks()
                 await asyncio.wait_for(self.reload_event.wait(), timeout=1.0)
             except asyncio.TimeoutError:
-                continue  # 每秒巡检一次，便于兜底恢复意外结束的任务
+                self._revive_dead_tasks()  # 每秒巡检：任务若因未捕获异常退出则重建
+                continue
             except asyncio.CancelledError:
                 raise
+
+    def _revive_dead_tasks(self) -> None:
+        """把已结束的采集任务从映射里摘掉并重建，避免设备静默停止采集。
+
+        采集协程的异常分支虽已兜住常见错误，但内存错误、第三方库异常等仍可能
+        让任务结束。旧实现只在配置变更时重建，任务一旦退出就永久不采集，
+        与「每秒巡检兜底恢复」的注释不符。
+        """
+        dead: dict[int, str] = {}
+        for device_id, task in list(self.tasks.items()):
+            if not task.done():
+                continue
+            self.tasks.pop(device_id, None)
+            if task.cancelled():
+                dead[device_id] = "cancelled"
+                continue
+            exc: BaseException | None = task.exception()
+            dead[device_id] = f"{type(exc).__name__}: {exc}" if exc else "ended"
+        if not dead:
+            return
+        db.log_event(
+            "warn", "collector", "COLLECTOR_REVIVE",
+            "采集任务异常退出，已重建: "
+            + "; ".join(f"device {device_id} ({reason})" for device_id, reason in dead.items()),
+        )
+        self._sync_tasks()
 
     def _sync_tasks(self) -> None:
         """依据当前 device 配置快照，取消失效任务并为新增设备建任务。"""
@@ -90,15 +116,23 @@ class Collector:
         timeout_ms: int = int(device.get("timeout_ms") or DEFAULT_TIMEOUT_MS)
         retry: int = int(device.get("retry") if device.get("retry") is not None else DEFAULT_RETRY)
         host: str = str(device.get("host") or "127.0.0.1")
-        port: int = int(device.get("port") or 502)
+        raw_port: Any = device.get("port")
+        if protocol == "modbus_rtu_serial":
+            # 串口设备：host=COM 口，port=波特率。原样使用配置值——
+            # 低波特率（1200/2400/4800）是现场老表常见设置，静默改写会直接读不到数据。
+            # 注意不能用 `port or 502` 兜底：0 会被吞成 502，等于静默改写波特率。
+            try:
+                baudrate: int = int(raw_port)
+            except (TypeError, ValueError) as exc:
+                raise ModbusError(f"串口波特率非法: {raw_port!r}") from exc
+            if baudrate <= 0:
+                raise ModbusError(f"串口波特率必须为正整数，当前为 {raw_port!r}")
+            return ModbusRTUSerialClient(host, baudrate, timeout_ms, retry)
+        port: int = int(raw_port or 502)
         if protocol == "modbus_tcp":
             return ModbusClient(host, port, timeout_ms, retry)
         if protocol == "modbus_rtu_tcp":
             return ModbusRTUTCPClient(host, port, timeout_ms, retry)
-        if protocol == "modbus_rtu_serial":
-            # 串口设备：host=COM 口，port=波特率（非法的占位值回退默认波特率）
-            baudrate: int = port if port >= DEFAULT_BAUDRATE else DEFAULT_BAUDRATE
-            return ModbusRTUSerialClient(host, baudrate, timeout_ms, retry)
         if protocol == "manual":
             raise ModbusError("manual 设备不参与 Modbus 采集")
         raise ModbusError(f"不支持的协议: {protocol}")

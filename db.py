@@ -40,11 +40,14 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """幂等执行 schema.sql：旧库自动补 manual_reading，原 12 表数据不丢。"""
+    """建库 + 版本化迁移：旧库自动补列补索引，原数据不丢。"""
+    from migrations import apply_migrations  # 延迟导入，避免 db <-> migrations 循环
+
     with _lock:
         conn = get_conn()
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         conn.commit()
+        apply_migrations(conn)
 
 
 def query(sql: str, params: tuple | list = ()) -> list[sqlite3.Row]:

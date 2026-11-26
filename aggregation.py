@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import db
+import tariff
 from settings import (
     CATCHUP_LOOKBACK_DAYS,
     EVENT_LOG_MAX_ROWS,
@@ -28,9 +29,9 @@ from settings import (
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
     SETTLE_MIN_COVERAGE,
-    SETTLE_UTC_HOUR,
     SETTLE_UTC_MINUTE,
     SIMULATE_ROLLUP_SEC,
+    day_floor,
 )
 
 
@@ -190,9 +191,13 @@ class Aggregator:
             hours_covered.add(int(row["hour_start"]))
             bucket: dict[str, Any] = buckets.setdefault(
                 int(row["meter_id"]),
-                {"energy_wh": 0, "weighted_sum": 0.0, "samples": 0, "peak": None},
+                {
+                    "energy_wh": 0, "weighted_sum": 0.0, "samples": 0,
+                    "peak": None, "hours": [],
+                },
             )
             bucket["energy_wh"] += int(row["energy_wh"])
+            bucket["hours"].append((int(row["hour_start"]), int(row["energy_wh"])))
             samples: int = int(row["sample_cnt"] or 0)
             if row["avg_power"] is not None:
                 bucket["weighted_sum"] += float(row["avg_power"]) * samples
@@ -201,6 +206,14 @@ class Aggregator:
                 peak: float = float(row["max_power"])
                 if bucket["peak"] is None or peak > bucket["peak"]:
                     bucket["peak"] = peak
+
+        # 未来日期不允许定稿：否则手动传一个未来 day_start 就能凭空产生"已结算"数据
+        if final_flag and day_start >= day_floor(time.time()):
+            final_flag = 0
+            db.log_event(
+                "warn", "collector", "SETTLE_FUTURE",
+                f"day_start={day_start} 尚未结束，按未结算保留",
+            )
 
         if final_flag and enforce_coverage and buckets:
             counted = db.query_one(
@@ -222,12 +235,19 @@ class Aggregator:
             avg_power: float | None = (
                 bucket["weighted_sum"] / bucket["samples"] if bucket["samples"] > 0 else None
             )
-            cost_cent: int = self.calc_cost(energy_wh, day_start)
+            # 分时电价：按当天各小时电量逐段计价，并把「按什么价算的」存成快照
+            cost: tariff.CostResult = tariff.cost_for_hourly(bucket["hours"])
+            self._warn_if_reprice(meter_id, day_start, cost)
             db.execute(
                 "INSERT OR REPLACE INTO daily "
-                "(meter_id, day_start, energy_wh, peak_power, avg_power, cost_cent, is_final) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (meter_id, day_start, energy_wh, bucket["peak"], avg_power, cost_cent, final_flag),
+                "(meter_id, day_start, energy_wh, peak_power, avg_power, cost_cent, "
+                "is_final, price_cent, tariff_snapshot) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    meter_id, day_start, energy_wh, bucket["peak"], avg_power,
+                    cost.cost_cent, final_flag, cost.price_cent,
+                    tariff.dumps(cost, len(bucket["hours"])),
+                ),
             )
 
         db.log_event(
@@ -235,18 +255,36 @@ class Aggregator:
             f"日结算完成 day_start={day_start}，is_final={final_flag}，结算表数={len(buckets)}",
         )
 
-    def calc_cost(self, energy_wh: int, day_start: int) -> int:
-        """默认电价计费：energy_wh/1e6(kWh) × price_cent(分/kWh)，无 tariff 返回 0。
-
-        day_start 预留给峰平谷分时细化；当前按 is_default=1 的单一电价按日总量计。
-        """
-        tariff = db.query_one(
-            "SELECT price_cent FROM tariff WHERE is_default=1 ORDER BY id LIMIT 1"
+    @staticmethod
+    def _warn_if_reprice(meter_id: int, day_start: int, cost: tariff.CostResult) -> None:
+        """已定稿日按新电价改写电费时留痕，避免「历史电费悄悄变了」无从追溯。"""
+        previous = db.query_one(
+            "SELECT cost_cent, price_cent, is_final FROM daily WHERE meter_id=? AND day_start=?",
+            (meter_id, day_start),
         )
-        if tariff is None:
-            return 0
-        price_cent: float = float(tariff["price_cent"])
-        return int(round(int(energy_wh) / MILLI_PER_KWH * price_cent))
+        if previous is None or int(previous["is_final"] or 0) != 1:
+            return
+        old_price: Any = previous["price_cent"]
+        if old_price is None or cost.price_cent is None:
+            return
+        if abs(float(old_price) - float(cost.price_cent)) < 1e-6:
+            return
+        db.log_event(
+            "warn", "collector", "TARIFF_REPRICE",
+            f"表 {meter_id} day_start={day_start} 单价由 {float(old_price):.4f} "
+            f"变为 {cost.price_cent:.4f} 分/kWh，历史电费已重算", meter_id,
+        )
+
+    def calc_cost(
+        self, energy_wh: int, day_start: int, hourly: list[tuple[int, int]] | None = None
+    ) -> int:
+        """电费（分）：有小时明细时按分时电价逐段计费，否则回退单一电价。
+
+        day_start 仅为兼容旧调用保留；分时时段由 hourly 里的 hour_start 决定。
+        """
+        if hourly:
+            return tariff.cost_for_hourly(hourly).cost_cent
+        return tariff.flat_cost(energy_wh).cost_cent
 
     def split_by_purpose(self, day_start: int) -> list[dict[str, Any]]:
         """按 purpose + node 分栋拆分某日汇总（供看板/API 使用）。"""
@@ -398,16 +436,14 @@ class Aggregator:
 
     def _catch_up(self) -> None:
         """补算遗漏日：对近 30 天有 hourly 数据但无 final daily 的日子补结算。"""
-        today_start: int = (int(time.time()) // SECONDS_PER_DAY) * SECONDS_PER_DAY
+        today_start: int = day_floor(time.time())
         cutoff: int = today_start - CATCHUP_LOOKBACK_DAYS * SECONDS_PER_DAY
         rows = db.query(
             "SELECT DISTINCT hour_start FROM hourly WHERE hour_start>=? AND hour_start<? "
             "ORDER BY hour_start",
             (cutoff, today_start),
         )
-        days: set[int] = {
-            (int(row["hour_start"]) // SECONDS_PER_DAY) * SECONDS_PER_DAY for row in rows
-        }
+        days: set[int] = {day_floor(int(row["hour_start"])) for row in rows}
         for day_start in sorted(days):
             final_row = db.query_one(
                 "SELECT 1 FROM daily WHERE day_start=? AND is_final=1 LIMIT 1", (day_start,)
@@ -417,14 +453,10 @@ class Aggregator:
 
     @staticmethod
     def _seconds_to_settle() -> float:
-        """距离下一个 UTC 00:10 的秒数。"""
+        """距离下一个「日切点 + 10 分钟」的秒数。"""
         now: float = time.time()
-        today_start: int = int(now // SECONDS_PER_DAY) * SECONDS_PER_DAY
-        target: int = (
-            today_start
-            + SETTLE_UTC_HOUR * SECONDS_PER_HOUR
-            + SETTLE_UTC_MINUTE * SECONDS_PER_MINUTE
-        )
+        today_start: int = day_floor(now)
+        target: int = today_start + SETTLE_UTC_MINUTE * SECONDS_PER_MINUTE
         if now >= target:
             target += SECONDS_PER_DAY
         return max(1.0, target - now)
@@ -439,7 +471,7 @@ class Aggregator:
         while True:
             await asyncio.sleep(self._seconds_to_settle())
             try:
-                yesterday: int = (int(time.time()) // SECONDS_PER_DAY) * SECONDS_PER_DAY - SECONDS_PER_DAY
+                yesterday: int = day_floor(time.time()) - SECONDS_PER_DAY
                 # 结算涉及上百次查询与写入，放线程执行，避免阻塞事件循环里的 HTTP 请求
                 await asyncio.to_thread(self.settle_day, yesterday)
                 await asyncio.to_thread(self._catch_up)
@@ -485,7 +517,7 @@ class Aggregator:
         避免一次性大事务长时间锁库；事件日志按 EVENT_LOG_MAX_ROWS 保留最新若干条。
         """
         base: int = int(now if now is not None else time.time())
-        cutoff: int = (base // SECONDS_PER_DAY) * SECONDS_PER_DAY - RETENTION_DAYS * SECONDS_PER_DAY
+        cutoff: int = day_floor(base) - RETENTION_DAYS * SECONDS_PER_DAY
         removed: int = 0
         while True:
             with db.transaction() as conn:
@@ -517,7 +549,7 @@ class Aggregator:
             try:
                 now: int = int(time.time())
                 hour_start: int = (now // SECONDS_PER_HOUR) * SECONDS_PER_HOUR
-                day_start: int = (now // SECONDS_PER_DAY) * SECONDS_PER_DAY
+                day_start: int = day_floor(now)
                 # 启动回填可能跨小时，前一小时也汇总一次保证趋势连续
                 await asyncio.to_thread(self.rollup_hour, hour_start - SECONDS_PER_HOUR)
                 await asyncio.to_thread(self.rollup_hour, hour_start)

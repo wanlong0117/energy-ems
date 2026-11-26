@@ -42,6 +42,24 @@ class ModbusTimeoutError(ModbusError):
     """读取超时（用于区分 quality=1）。"""
 
 
+class ModbusExceptionResponse(ModbusError):
+    """设备返回 Modbus 异常码（func|0x80 + code）。
+
+    异常码是设备对「地址非法/功能不支持」的确定性答复，重试只会再收一次同样的
+    异常帧，徒增一轮超时等待，因此单独成类并在读循环中直接抛出、不重试。
+    """
+
+
+def _check_unit(received: int, expected: int | None, frame_name: str) -> None:
+    """校验响应单元号（站号）与请求一致，防止多站总线/网关串包被当成自己的数据。"""
+    if expected is None:
+        return
+    if int(received) != int(expected):
+        raise ModbusError(
+            f"{frame_name} 单元号不匹配：请求 {int(expected)}，响应 {int(received)}"
+        )
+
+
 def decode(registers: list[int], point: dict[str, Any]) -> tuple[float, int]:
     """原始寄存器 -> (工程值, quality)。
 
@@ -104,18 +122,19 @@ def _rtu_adu(slave: int, pdu: bytes) -> bytes:
     return bytes([int(slave) & 0xFF]) + pdu + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
 
-def _parse_rtu_response(data: bytes) -> list[int]:
-    """校验 RTU 响应 CRC 并解 >H 寄存器列表；异常响应抛 ModbusError。"""
+def _parse_rtu_response(data: bytes, expect_slave: int | None = None) -> list[int]:
+    """校验 RTU 响应 CRC 与站号并解 >H 寄存器列表；异常响应抛 ModbusError。"""
     if len(data) < 5:
         raise ModbusError("RTU 响应长度过短")
     frame: bytes = data[:-2]
     received: int = int(data[-2]) | (int(data[-1]) << 8)
     if _crc16(frame) != received:
         raise ModbusError("RTU CRC16 校验失败")
+    _check_unit(frame[0], expect_slave, "RTU 响应")
     func: int = frame[1]
     if func & 0x80:
         code: int = frame[2] if len(frame) > 2 else 0
-        raise ModbusError(f"Modbus 异常响应 func=0x{func:02X} code={code}")
+        raise ModbusExceptionResponse(f"Modbus 异常响应 func=0x{func:02X} code={code}")
     if func not in (3, 4):
         raise ModbusError(f"非预期功能码: {func}")
     byte_count: int = frame[2]
@@ -145,6 +164,9 @@ class BaseModbusClient(ABC):
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._tx_id: int = 0
+        # 最近一次 build_adu 写入的事务号/单元号，供 parse_response 校验回包归属
+        self._pending_tx: int | None = None
+        self._pending_unit: int | None = None
 
     async def connect(self) -> None:
         """建立 TCP 连接；已有可用连接时直接复用（串口子类覆盖为空实现）。"""
@@ -203,22 +225,29 @@ class ModbusTCPClient(BaseModbusClient):
         self._tx_id = (self._tx_id + 1) & 0xFFFF
         pdu: bytes = struct.pack(">BHH", func, int(offset) & 0xFFFF, int(count) & 0xFFFF)
         mbap: bytes = struct.pack(">HHHB", transaction_id, 0, len(pdu) + 1, int(slave) & 0xFF)
+        self._pending_tx, self._pending_unit = transaction_id, int(slave) & 0xFF
         return mbap + pdu
 
-    def parse_response(self, data: bytes) -> list[int]:
+    def parse_response(
+        self, data: bytes, expect_tx: int | None = None, expect_unit: int | None = None
+    ) -> list[int]:
         """校验 MBAP/PDU 并解析 >H 寄存器列表；异常响应抛 ModbusError。"""
-        if len(data) < 11:
+        if len(data) < 9:
+            # 最短合法响应：MBAP 7B + 异常 PDU 2B（func|0x80 + code）
             raise ModbusError("Modbus 响应长度过短")
-        _tx, protocol, length, _unit = struct.unpack(">HHHB", data[:7])
+        tx, protocol, length, unit = struct.unpack(">HHHB", data[:7])
         if protocol != 0:
             raise ModbusError("Modbus 协议标识非 0")
+        if expect_tx is not None and int(tx) != int(expect_tx):
+            raise ModbusError(f"MBAP 事务号不匹配：请求 {int(expect_tx)}，响应 {int(tx)}")
+        _check_unit(unit, expect_unit, "MBAP 响应")
         if length < 3 or len(data) < 6 + length:
             raise ModbusError("Modbus 响应字节数不合法")
         pdu: bytes = data[7:6 + length]
         func: int = pdu[0]
         if func & 0x80:
             code: int = pdu[1] if len(pdu) > 1 else 0
-            raise ModbusError(f"Modbus 异常响应 func=0x{func:02X} code={code}")
+            raise ModbusExceptionResponse(f"Modbus 异常响应 func=0x{func:02X} code={code}")
         if func not in (3, 4):
             raise ModbusError(f"非预期功能码: {func}")
         byte_count: int = pdu[1]
@@ -244,6 +273,7 @@ class ModbusTCPClient(BaseModbusClient):
                 await self.connect()
                 assert self._reader is not None and self._writer is not None
                 self._writer.write(self.build_adu(slave, func, offset, count))
+                expected_tx, expected_unit = self._pending_tx, self._pending_unit
                 await self._writer.drain()
                 header: bytes = await asyncio.wait_for(self._reader.readexactly(7), timeout=timeout)
                 # MBAP.length 计入了单元号，而单元号已在这 7 字节头里，故剩余 PDU 为 length-1
@@ -251,7 +281,9 @@ class ModbusTCPClient(BaseModbusClient):
                 body: bytes = await asyncio.wait_for(
                     self._reader.readexactly(length - 1), timeout=timeout
                 )
-                registers: list[int] = self.parse_response(header + body)
+                registers: list[int] = self.parse_response(
+                    header + body, expected_tx, expected_unit
+                )
                 if len(registers) < count:
                     raise ModbusError(f"返回寄存器数量不足：需要 {count}，实际 {len(registers)}")
                 return registers[:count]
@@ -261,6 +293,9 @@ class ModbusTCPClient(BaseModbusClient):
                 last_error = ModbusError(f"响应不完整: {exc}")
             except (OSError, ValueError, struct.error) as exc:
                 last_error = ModbusError(str(exc))
+            except ModbusExceptionResponse:
+                # 异常码是设备的确定性答复，重试只会再收一次同样的帧
+                raise
             except ModbusError as exc:
                 last_error = exc
             finally:
@@ -285,11 +320,12 @@ class ModbusRTUTCPClient(BaseModbusClient):
         if not 1 <= count <= MODBUS_MAX_REGISTERS:
             raise ValueError(f"count 必须在 1~{MODBUS_MAX_REGISTERS} 之间")
         pdu: bytes = struct.pack(">BHH", func, int(offset) & 0xFFFF, int(count) & 0xFFFF)
+        self._pending_unit = int(slave) & 0xFF
         return _rtu_adu(slave, pdu)
 
-    def parse_response(self, data: bytes) -> list[int]:
-        """校验 CRC16 后解析寄存器列表；异常响应抛 ModbusError。"""
-        return _parse_rtu_response(data)
+    def parse_response(self, data: bytes, expect_slave: int | None = None) -> list[int]:
+        """校验 CRC16 与站号后解析寄存器列表；异常响应抛 ModbusExceptionResponse。"""
+        return _parse_rtu_response(data, expect_slave)
 
     async def read_registers(self, slave: int, func: int, offset: int, count: int) -> list[int]:
         """短连接读取 RTU-over-TCP，按帧头字节数定长读取，失败重试。"""
@@ -305,6 +341,7 @@ class ModbusRTUTCPClient(BaseModbusClient):
                 await self.connect()
                 assert self._reader is not None and self._writer is not None
                 self._writer.write(self.build_adu(slave, func, offset, count))
+                expected_unit: int | None = self._pending_unit
                 await self._writer.drain()
                 head: bytes = await asyncio.wait_for(self._reader.readexactly(3), timeout=timeout)
                 if head[1] & 0x80:
@@ -316,7 +353,7 @@ class ModbusRTUTCPClient(BaseModbusClient):
                     tail = await asyncio.wait_for(
                         self._reader.readexactly(byte_count + 2), timeout=timeout
                     )
-                registers: list[int] = self.parse_response(head + tail)
+                registers: list[int] = self.parse_response(head + tail, expected_unit)
                 if len(registers) < count:
                     raise ModbusError(f"返回寄存器数量不足：需要 {count}，实际 {len(registers)}")
                 return registers[:count]
@@ -326,6 +363,8 @@ class ModbusRTUTCPClient(BaseModbusClient):
                 last_error = ModbusError(f"响应不完整: {exc}")
             except (OSError, ValueError, struct.error) as exc:
                 last_error = ModbusError(str(exc))
+            except ModbusExceptionResponse:
+                raise
             except ModbusError as exc:
                 last_error = exc
             finally:
@@ -371,11 +410,12 @@ class ModbusRTUSerialClient(BaseModbusClient):
         if not 1 <= count <= MODBUS_MAX_REGISTERS:
             raise ValueError(f"count 必须在 1~{MODBUS_MAX_REGISTERS} 之间")
         pdu: bytes = struct.pack(">BHH", func, int(offset) & 0xFFFF, int(count) & 0xFFFF)
+        self._pending_unit = int(slave) & 0xFF
         return _rtu_adu(slave, pdu)
 
-    def parse_response(self, data: bytes) -> list[int]:
-        """校验 CRC16 后解析寄存器列表。"""
-        return _parse_rtu_response(data)
+    def parse_response(self, data: bytes, expect_slave: int | None = None) -> list[int]:
+        """校验 CRC16 与站号后解析寄存器列表。"""
+        return _parse_rtu_response(data, expect_slave)
 
     async def connect(self) -> None:
         """串口无需持久连接，空实现以兼容统一接口。"""
@@ -423,6 +463,7 @@ class ModbusRTUSerialClient(BaseModbusClient):
         if not 1 <= count <= MODBUS_MAX_REGISTERS:
             raise ValueError(f"count 必须在 1~{MODBUS_MAX_REGISTERS} 之间")
         adu: bytes = self.build_adu(slave, func, offset, count)
+        expected_unit: int | None = self._pending_unit
         last_error: ModbusError = ModbusError("未知读取错误")
         for attempt in range(self.retry + 1):
             try:
@@ -430,7 +471,7 @@ class ModbusRTUSerialClient(BaseModbusClient):
                     asyncio.to_thread(self._read_sync, adu),
                     timeout=max(0.1, self.timeout_ms / 1000.0 + 0.5),
                 )
-                registers: list[int] = self.parse_response(frame)
+                registers: list[int] = self.parse_response(frame, expected_unit)
                 if len(registers) < count:
                     raise ModbusError(f"返回寄存器数量不足：需要 {count}，实际 {len(registers)}")
                 return registers[:count]
@@ -438,6 +479,8 @@ class ModbusRTUSerialClient(BaseModbusClient):
                 last_error = ModbusTimeoutError(f"串口 {self.port_name} 读取超时")
             except (OSError, ValueError, struct.error) as exc:
                 last_error = ModbusError(str(exc))
+            except ModbusExceptionResponse:
+                raise
             except ModbusError as exc:
                 last_error = exc
             if attempt < self.retry:
@@ -471,6 +514,7 @@ __all__ = [
     "BaseModbusClient",
     "ModbusClient",
     "ModbusError",
+    "ModbusExceptionResponse",
     "ModbusRTUSerialClient",
     "ModbusRTUTCPClient",
     "ModbusTCPClient",

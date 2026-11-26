@@ -35,11 +35,22 @@ def change_password(body: PasswordIn) -> JSONResponse:
 
 @router.get("/session")
 def session(request: Request) -> dict:
-    """会话状态查询（无需登录，始终 ok:true）。"""
-    return ok({
-        "authenticated": auth.current_user(request),
-        "must_change_password": auth.must_change_password(),
-    })
+    """会话状态查询（无需登录，始终 ok:true）。
+
+    配置损坏时不抛 503：前端仍要知道「服务活着但登录被禁用」，
+    否则只会看到一个语焉不详的失败提示。
+    """
+    try:
+        return ok({
+            "authenticated": auth.current_user(request),
+            "must_change_password": auth.must_change_password(),
+        })
+    except auth.ConfigError:
+        return ok({
+            "authenticated": False,
+            "must_change_password": False,
+            "config_error": True,
+        })
 
 
 __all__ = ["router", "require_auth"]

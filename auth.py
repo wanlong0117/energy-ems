@@ -38,6 +38,14 @@ from settings import (
 
 CONFIG_PATH = app_dir() / "config.json"
 
+
+class ConfigError(RuntimeError):
+    """配置文件损坏（JSON 解析失败）。
+
+    解析失败必须「失败关闭」：绝不回退到默认密码 ems2026——否则任何人都能用
+    公开默认口令登录，反而比服务不可用更危险。管理员看到事件日志后修正文件即可恢复。
+    """
+
 # token -> 过期时间戳
 _sessions: dict[str, float] = {}
 _last_prune: float = 0.0
@@ -143,14 +151,15 @@ def load_config() -> dict[str, Any]:
         try:
             loaded: Any = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            # 不静默降级：解析失败要留痕，随后按默认密码处理（配合强制改密更安全）
-            log_event("error", "api", "CONFIG_PARSE_FAIL", f"配置文件解析失败: {exc}")
-            loaded = {}
-        if isinstance(loaded, dict):
-            # 用户已有键优先；仅对缺失键填默认值
-            for key, value in loaded.items():
-                if value is not None:
-                    config[key] = value
+            log_event("error", "api", "CONFIG_PARSE_FAIL", f"配置文件解析失败，拒绝启动登录: {exc}")
+            raise ConfigError(f"配置文件 {CONFIG_PATH} 解析失败：{exc}") from exc
+        if not isinstance(loaded, dict):
+            log_event("error", "api", "CONFIG_PARSE_FAIL", "配置文件根节点不是对象")
+            raise ConfigError(f"配置文件 {CONFIG_PATH} 根节点必须是 JSON 对象")
+        # 用户已有键优先；仅对缺失键填默认值
+        for key, value in loaded.items():
+            if value is not None:
+                config[key] = value
     config["data_mode"] = str(config.get("data_mode", DATA_MODE_DEFAULT)).lower()
     if config["data_mode"] not in DATA_MODES:
         config["data_mode"] = DATA_MODE_DEFAULT
@@ -318,12 +327,26 @@ def login(password: str, response: Response, client: str = "") -> JSONResponse:
             {"ok": False, "error": f"登录失败次数过多，请 {int(LOGIN_LOCK_SEC)} 秒后再试"},
             status_code=429,
         )
-    if not verify_login_password(password):
+    try:
+        password_ok: bool = verify_login_password(password)
+    except ConfigError:
+        # 配置损坏时拒绝登录，绝不用公开默认密码兜底
+        return JSONResponse(
+            {"ok": False, "error": "服务器配置文件损坏，请联系管理员修复 config.json"},
+            status_code=503,
+        )
+    if not password_ok:
         _record_login_failure(client)
         log_event("warn", "api", "LOGIN_FAIL", "登录密码错误")
         return JSONResponse({"ok": False, "error": "密码错误"}, status_code=401)
     _clear_login_failures(client)
-    _upgrade_plaintext_password(password)
+    try:
+        _upgrade_plaintext_password(password)
+    except ConfigError:
+        return JSONResponse(
+            {"ok": False, "error": "服务器配置文件损坏，请联系管理员修复 config.json"},
+            status_code=503,
+        )
     token = secrets.token_hex(32)
     _sessions[token] = time.time() + SESSION_TTL
     resp = JSONResponse({"ok": True, "must_change_password": must_change_password()})
