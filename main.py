@@ -91,7 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db.log_event("info", "api", "SHUTDOWN", "energy_ems 服务停止")
 
 
-app: FastAPI = FastAPI(title="energy_ems", version="2.0.0", lifespan=lifespan)
+app: FastAPI = FastAPI(title="energy_ems", version="0.1.0", lifespan=lifespan)
 
 # 路由注册：认证路由在前，其余均挂 require_auth
 app.include_router(auth_router)
