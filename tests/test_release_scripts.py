@@ -62,6 +62,43 @@ def test_make_version_info_survives_windows_console(tmp_path, console_encoding):
     assert content.startswith("# UTF-8")
 
 
+def test_make_version_info_accepts_main_branch_dev_tag(tmp_path):
+    """主干构建的 tag 是 `dev-<sha>`，绝不能把 sha 前 7 位当成主版本号。
+
+    旧实现抓所有数字 → `filevers=(2120610,0,0,0)`，超过 WORD 上限，PyInstaller 拒编。
+    诡异之处在于「推 tag 的运行成功、推主干的运行失败」，只看 tag 结果是看不出来的。
+    """
+    # Arrange
+    target = tmp_path / "version_info.txt"
+
+    # Act
+    result = _run(
+        "make_version_info.py", "--version", "dev-2120610", "--out", str(target),
+        console_encoding="utf-8",
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    content = target.read_text(encoding="utf-8")
+    assert "filevers=(0, 0, 0, 0)" in content, "非语义化版本必须退回 0.0.0.0"
+    assert "dev-2120610" in content, "人读的版本串仍要保留，便于分辨主干构建"
+
+
+def test_parse_version_strictness():
+    """版本解析的边界：只认 x.y.z，每段夹到 WORD 上限。"""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from make_version_info import parse_version
+
+    assert parse_version("v0.1.4") == (0, 1, 4, 0)
+    assert parse_version("0.1.4-rc1") == (0, 1, 4, 0)
+    assert parse_version("v10.20.30") == (10, 20, 30, 0)
+    # 关键：提交号不能被当成版本号
+    assert parse_version("dev-2120610") == (0, 0, 0, 0)
+    assert parse_version("dev-9f3a1b2") == (0, 0, 0, 0)
+    assert parse_version("") == (0, 0, 0, 0)
+    assert parse_version("v999999.1.1") == (65535, 1, 1, 0)
+
+
 @pytest.mark.parametrize("console_encoding", ENCODINGS)
 def test_release_notes_survives_windows_console(tmp_path, console_encoding):
     """Release 正文按 tag 生成，同样不能被控制台编码打断。"""

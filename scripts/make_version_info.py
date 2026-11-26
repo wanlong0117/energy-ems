@@ -51,12 +51,22 @@ VSVersionInfo(
 """
 
 
+_SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+_MAX_FIELD = 65535  # Windows 版本资源的每段是 WORD，超了 PyInstaller 直接拒编
+
+
 def parse_version(text: str) -> tuple[int, int, int, int]:
-    """把 v0.1.4 / 0.1.4-rc1 这类字符串解析成四段整数（缺位补 0）。"""
-    numbers: list[int] = [int(part) for part in re.findall(r"\d+", text)[:3]]
-    while len(numbers) < 3:
-        numbers.append(0)
-    return numbers[0], numbers[1], numbers[2], 0
+    """把 v0.1.4 / 0.1.4-rc1 解析成四段整数；非语义化版本号一律退回 0.0.0.0。
+
+    为什么必须严格：主干构建的 tag 形如 `dev-2120610`（提交号前 7 位），旧实现把所有
+    数字抓出来当主版本号，得到 `filevers=(2120610,0,0,0)` —— 超过 WORD 上限，PyInstaller
+    在「打标签的运行成功、推主干的运行失败」这种最迷惑的组合上挂掉。
+    """
+    match = _SEMVER.match(text.strip())
+    if match is None:
+        return 0, 0, 0, 0
+    major, minor, patch = (min(int(part), _MAX_FIELD) for part in match.groups())
+    return major, minor, patch, 0
 
 
 def main(argv: list[str] | None = None) -> int:
