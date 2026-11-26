@@ -203,4 +203,10 @@ if _dashboard_root.is_dir():
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=HTTP_HOST, port=HTTP_PORT, workers=1)
+    # 必须直接传 app 对象，不能写成 uvicorn.run("main:app", ...)。
+    # PyInstaller 冻结后，入口脚本在 sys.modules 里只注册为 __main__，并没有一个叫
+    # main 的可导入模块；uvicorn 拿到字符串会去 importlib.import_module("main")，
+    # 直接抛 "Could not import module \"main\"" 并以退出码 3 结束——源码运行正常、
+    # 打包后必挂，v0.1.7 及之前的 Windows 包全部踩了这个坑。
+    # workers=1 时传对象是 uvicorn 官方支持的用法（workers>1 或 reload 才必须传字符串）。
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT, workers=1)

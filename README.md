@@ -56,7 +56,7 @@ Energy EMS 的取舍：
 
 ### 方式 A：Windows 免安装包（推荐给现场）
 
-1. 从 [Releases](../../releases) 下载 `energy-ems-v0.1.7-win11-x64.zip`（同名 `.sha256` 可校验）
+1. 从 [Releases](../../releases) 下载 `energy-ems-v0.1.8-win11-x64.zip`（同名 `.sha256` 可校验）
 2. 解压到非中文、非 `C:\Program Files` 的目录，例如 `D:\energy_ems`
 3. 双击 `energy_ems.exe`（`build_win11.bat` 为备用启动脚本）
 4. 浏览器打开 <http://127.0.0.1:8000/>
@@ -263,6 +263,7 @@ A：使用 ReportLab 内置 `STSong-Light` CID 字体，无需外部字体；生
 - [x] v0.1.5 停机判定：功率低于阈值的小时不计入覆盖率分母，停产日不再卡在「未结算」
 - [x] v0.1.6 修掉覆盖率门槛分子分母不同源（会让采集中断的日子被误判已结算），新增有界缺口推断
 - [x] v0.1.7 发布资产 `.sha256` 改纯 LF 行尾（`sha256sum -c` 不再误报），构建内加 CR 字节自检
+- [x] v0.1.8 修 Windows 包启动即退出（uvicorn 按名导入 main 在冻结环境失效），CI 增加 exe 实跑冒烟
 - [ ] Docker / compose（NAS、Linux 服务器）
 - [ ] 多用户与角色权限（RBAC）
 - [ ] 告警通知（邮件 / 企业微信 / 钉钉）

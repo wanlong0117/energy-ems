@@ -221,3 +221,16 @@ def test_readme_deploy_covers_mode_switch_backup_vcredist(isolated_db):
     assert "simulate" in lowered and "live" in lowered
     assert any(k in lowered for k in ("backup", "备份", ".db"))
     assert any(k in lowered for k in ("vc_redist", "vc++", "visual c++", "运行库"))
+
+
+def test_workflow_smoke_tests_packaged_exe(isolated_db):
+    """Arrange/Act: 读取构建工作流。Assert: 打包后必须真跑 exe 打 /healthz。
+
+    v0.1.7 的教训：只做「压缩包里有 exe」的静态校验，编译绿灯却双击闪退
+    （uvicorn 找不到 main 模块）。构建流程必须包含一次真实启动验证。
+    """
+    yml = (SRC_ROOT / ".github" / "workflows" / "build-windows.yml").read_text(encoding="utf-8")
+    assert "Smoke test packaged exe" in yml, "缺少 exe 实跑冒烟步骤"
+    assert "/healthz" in yml, "冒烟步骤必须真的请求 /healthz"
+    assert "Start-Process" in yml, "冒烟步骤必须实际启动 exe"
+    assert "HasExited" in yml and "ExitCode" in yml, "必须捕获「启动即退出」并把退出码带进报错"

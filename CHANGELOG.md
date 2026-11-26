@@ -2,6 +2,36 @@
 
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0/lang/zh-CN/)。
 
+## [0.1.8] - 2026-11-26
+
+**修复一个让 Windows 安装包彻底不可用的缺陷：exe 启动即退出（退出码 3），
+日志只有一行 `ERROR: Error loading ASGI app. Could not import module "main".`**
+v0.1.1 ~ v0.1.7 的包全部中招（源码运行正常，只有打包产物坏），
+**已部署旧包的现场必须升级**。测试 238 → 241 项，覆盖率 88.36%。
+
+### 修复
+
+- **冻结后 uvicorn 找不到 main 模块（阻断）**：入口写的是
+  `uvicorn.run("main:app", ...)`。PyInstaller 冻结后，入口脚本在 `sys.modules`
+  里只注册为 `__main__`，并不存在名叫 `main` 的可导入模块，uvicorn 按名字
+  `importlib.import_module("main")` 必然失败并退出码 3。改为直接传 `app` 对象
+  （`workers=1` 时是 uvicorn 官方支持的用法）。已在本地用 PyInstaller 实打包验证：
+  修复前 `退出码 3 / Could not import module "main"`，修复后服务正常起来、
+  `/healthz` 返回 200、匿名 `/openapi.json` 仍被 401 拦下。
+- **CI 增加 exe 实跑冒烟**：打包后真正启动 `energy_ems.exe`，30 秒内请求
+  `/healthz` 必须返回 200，否则构建失败并打印 exe 的 stdout/stderr 与退出码。
+  这之前的构建只做「压缩包里有 exe / 许可文本 / schema.sql」的静态核对，
+  所以 v0.1.1 起七个版本「CI 全绿、双击闪退」一直没被拦下。
+- **新增入口契约测试**（`tests/test_entrypoint.py`）：AST 解析 `main.py`，
+  断言 `uvicorn.run` 首参是本模块的 `app` 对象而非字符串字面量，且 `workers` 不得 >1。
+  另加静态测试要求工作流保留冒烟步骤（含 `/healthz`、`Start-Process`、退出码回传）。
+
+### 为什么没有采用「在 exe 同目录放一个 main.py 存根」的绕法
+
+那样能跑，但依赖「运行时 cwd 恰好在 `sys.path` 里」这一隐含前提，用户换个启动方式
+（计划任务、服务、快捷方式的工作目录不同）就会再次失败，而且多一个必须随包维护的文件。
+传 `app` 对象是从根上不依赖「按名字导入」，零额外文件、零启动参数变化。
+
 ## [0.1.7] - 2026-11-26
 
 **只修发布资产的校验文件：`.sha256` 由 CRLF 改纯 LF。程序功能与 0.1.6 完全一致

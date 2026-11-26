@@ -130,6 +130,48 @@ jobs:
           }
           Write-Host ("包内条目 {0} 个，许可文本与关键资源齐全" -f $entries.Count)
 
+      - name: Smoke test packaged exe
+        # 只编译不实跑会放过「双击闪退」：v0.1.1~v0.1.7 的包因为
+        # uvicorn.run("main:app") 在冻结环境里找不到 main 模块，启动即退出码 3，
+        # 而 CI 一直是绿的。这里把 exe 真拉起来，/healthz 返回 200 才算构建通过。
+        shell: pwsh
+        run: |
+          $exeDir = Join-Path (Get-Location) "dist/energy_ems"
+          $exe = Join-Path $exeDir "energy_ems.exe"
+          if (-not (Test-Path $exe)) { throw "找不到打包产物 $exe" }
+          $port = 18090
+          $env:EMS_HOST = "127.0.0.1"
+          $env:EMS_PORT = "$port"
+          $log = Join-Path (Get-Location) "smoke.log"
+          $err = Join-Path (Get-Location) "smoke.err.log"
+          $proc = Start-Process -FilePath $exe -WorkingDirectory $exeDir `
+                    -RedirectStandardOutput $log -RedirectStandardError $err -PassThru
+          $url = "http://127.0.0.1:$port/healthz"
+          $ok = $false
+          $exitCode = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Milliseconds 500
+            if ($proc.HasExited) { $exitCode = $proc.ExitCode; break }
+            try {
+              $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3
+              if ($resp.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+          }
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          foreach ($f in @($log, $err)) {
+            if (Test-Path $f) {
+              Write-Host "--- $f ---" -ForegroundColor Yellow
+              Get-Content $f | Select-Object -First 30 | ForEach-Object { Write-Host "  $_" }
+            }
+          }
+          if ($ok) {
+            Write-Host "exe 启动成功，/healthz 返回 200" -ForegroundColor Green
+          } elseif ($null -ne $exitCode) {
+            throw "打包后的 exe 启动即退出（退出码 $exitCode），见上方日志"
+          } else {
+            throw "/healthz 在 30 秒内未返回 200（超时）"
+          }
+
       - name: Generate release notes from CHANGELOG
         if: startsWith(github.ref, 'refs/tags/v')
         run: python scripts/release_notes.py --tag ${{ github.ref_name }} --out release_notes.md

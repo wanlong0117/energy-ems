@@ -22,7 +22,13 @@ energy_ems/
 
 ## 2. 启动
 
-1. 解压 `energy-ems-v0.1.7-win11-x64.zip` 到任意目录（建议非中文路径、非 `C:\Program Files`，
+> ⚠️ **v0.1.7 及更早的 Windows 包有阻断缺陷，必须换成 v0.1.8 及以上**：
+> 双击后窗口一闪就退，日志只有一行
+> `ERROR: Error loading ASGI app. Could not import module "main".`，服务根本没起来。
+> 原因是打包后按名字导入 `main` 模块失效（源码运行不受影响）。已在 v0.1.8 修复，
+> 并加了「CI 真跑 exe 打 `/healthz`」的冒烟检查防止复发。
+
+1. 解压 `energy-ems-v0.1.8-win11-x64.zip` 到任意目录（建议非中文路径、非 `C:\Program Files`，
    避免权限问题）。资产文件名带版本号，同一天的多个补丁包不会再同名。
 2. **双击 `energy_ems.exe`** 启动（`build_win11.bat` 为可选备用脚本）。
 3. 打开浏览器访问 `http://127.0.0.1:8000/`，即可看到单文件看板。
@@ -218,16 +224,16 @@ python -m venv .venv
 ```
 
 macOS 不交叉产 exe；Windows 安装包仅由 GitHub Actions 的 `windows-latest` runner 产出，
-在 Actions 页面下载 `energy-ems-v0.1.7-win11-x64.zip` artifact 即可。
+在 Actions 页面下载 `energy-ems-v0.1.8-win11-x64.zip` artifact 即可。
 
 校验下载是否完整，两种都行：
 
 ```bat
 :: Windows
-certutil -hashfile energy-ems-v0.1.7-win11-x64.zip SHA256
+certutil -hashfile energy-ems-v0.1.8-win11-x64.zip SHA256
 ```
 
 ```bash
 # macOS / Linux：.sha256 自 0.1.7 起为纯 LF 行尾，可直接校验
-shasum -a 256 -c energy-ems-v0.1.7-win11-x64.zip.sha256
+shasum -a 256 -c energy-ems-v0.1.8-win11-x64.zip.sha256
 ```
