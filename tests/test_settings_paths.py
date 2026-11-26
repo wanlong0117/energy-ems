@@ -26,16 +26,19 @@ def test_app_dir_and_resource_dir_in_source_mode(monkeypatch):
     assert (settings.DASHBOARD_DIR / "index.html").is_file()
 
 
-def test_frozen_paths_derive_from_executable_and_meipass(monkeypatch):
+def test_frozen_paths_derive_from_executable_and_meipass(monkeypatch, tmp_path):
     """Arrange: monkeypatch frozen 环境。Act: 解析路径。Assert: 可写=exe 同级、只读=_MEIPASS。"""
-    exe = Path("/opt/energy_ems_dist/energy_ems.exe")
-    meipass = Path("/opt/energy_ems_dist/_internal")
+    dist = tmp_path / "energy_ems_dist"
+    (dist / "_internal").mkdir(parents=True)
+    exe = dist / "energy_ems.exe"
+    exe.write_bytes(b"")
+    meipass = dist / "_internal"
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(exe), raising=False)
     monkeypatch.setattr(sys, "_MEIPASS", str(meipass), raising=False)
 
     assert settings.is_frozen() is True
-    assert settings.app_dir() == exe.parent
+    assert settings.app_dir() == dist.resolve()
     assert settings.resource_dir() == meipass
     # 可写目录绝不来自 _MEIPASS，只读资源绝不来自 exe 同级
     assert settings.app_dir() != settings.resource_dir()
