@@ -2,6 +2,75 @@
 
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0/lang/zh-CN/)。
 
+## [0.1.4] - 2026-11-26
+
+**复审加固：一个阻断级 + 六个高优先级 + 六个中优先级问题全修。**
+测试 188 → 212 项，覆盖率 88.30%。本版不改计量口径，**无需重算历史**，但升级前请备份数据库
+（含一次实体表重建迁移）。
+
+> ⚠️ **升级必读（两处行为变化）**
+> 1. **默认只监听 127.0.0.1**：此前默认绑 `0.0.0.0`，配合公开的默认口令存在「同网段抢先改密
+>    把管理员锁在门外」的风险。需要用手机/其他电脑访问时，先改掉默认密码，再设
+>    `EMS_ALLOW_LAN=1`（或 `EMS_HOST=0.0.0.0`）启动。
+> 2. **切 live 会自动停用演示数据**：simulate 预置的 100 块「模拟-*」表会被置为停用，
+>    日结算覆盖率只按真实表计算。确认不再需要演示后，用
+>    `python scripts/clear_demo.py --db energy.db` 彻底清理历史读数与旧日报。
+
+### 修复（阻断级）
+
+- **演示表不再拖死 live 日结**：`node/device/point/meter` 新增 `is_demo` 列（迁移 v5 按历史
+  命名回填），切换 live 时自动停用演示数据；`settle_day` 与报表/接口查询在有真表时排除
+  演示表。此前 1 块真表 + 100 块演示表时覆盖率为 1/101，日报永远「未结算」——而这正是
+  文档推荐的「先演示、再接真表」路径。
+
+### 修复（高优先级）
+
+- **整点补录不再漏算上一小时/上一日**：`manual.recompute` 改按「受影响小时集合」重算——
+  ts 落在整点时连上一小时一起算（左开右闭窗口下它属于上一小时收口），并连带重算下一小时
+  （它的基准可能变成这条值），再分别结算所属日。此前用 00:00/08:00 补录会静默错账
+  （实测应 10 kWh 仍显示 2 kWh）。
+- **实体 ID 不再复用**：实体主键改 `AUTOINCREMENT`（迁移 v7 重建表），删点位/表时同事务
+  清理 `reading`/`reading_latest`/`manual_reading`/`hourly`/`daily`。此前删除后重建会继承
+  旧表底码与旧日报，看板「有数」但对不上账。仍被关联时会返回 409「请先解除关联」，
+  不会静默删掉别人的数据源。
+- **人工录入量程校验**：请求模型与服务层都校验有限性、`|value| ≤ 1e9` 以及点位
+  `min_val/max_val`；小时汇总结算改为逐表异常隔离（`METER_ROLLUP_FAIL`），单表脏数据
+  不再中断整轮，避免「每 5 分钟重复失败一次」。
+- **发布包合规**：zip 内新增 `licenses/LICENSE` 与 `licenses/THIRD_PARTY_NOTICES.md`
+  （补全 Python/OpenSSL/SQLite 等运行时声明），并随包附带 `scripts/` 运维脚本；
+  CI 解压清单校验缺文件即失败。
+- **Release 正文按 tag 生成**：从 CHANGELOG 抽取本版段落，含重算要求与安装/校验说明，
+  不再四个版本共用一段通用文案。
+- **默认安全**：默认绑定 127.0.0.1；`EMS_ALLOW_LAN`/`EMS_HOST`/`EMS_PORT` 可覆盖；
+  SECURITY 明确写出「默认口令 + 监听局域网 = 可被抢先接管」。
+
+### 修复（中优先级）
+
+- **设备配置热生效**：按 `protocol/host/port/timeout_ms/retry/poll_interval` 计算设备签名，
+  变化即取消并重建采集任务（`COLLECTOR_HOT_RELOAD`）。此前改 IP/端口后接口返回成功，
+  采集仍连旧地址直到重启。
+- **配置变更审计**：CRUD 成功路径统一写 `CONFIG_CHANGE`，敏感字段记录「旧值→新值」，
+  删表/删点还会附上清理行数。此前改 scale、改表计用途无痕可查。
+- **死字段收口**：`meter.daily_8am`（日切点由 `EMS_DAY_START_HOUR` 全局配置）与
+  `point.point_role`（实际以 `meter_point.role` 为准）不再出现在接口与表单；
+  能源分类只接受 `kWh`，水/气表挂进来会被拒绝，而不是被当成电计费。
+- **缺失表落零行**：正式结算时为「应结算但整日无数据」的表写零值行并标 `is_final=0`，
+  `daily` 新增 `covered_hours`，报表增加「覆盖小时」列——不再出现「已结算但总量静默少计」。
+- **发布资产命名与校验**：资产名含 tag（`energy-ems-v0.1.4-win11-x64.zip`），生成
+  `.sha256`，exe 通过 `scripts/make_version_info.py` 写入版本资源（文件属性可见版本号）。
+
+### 工程与治理
+
+- CI 矩阵扩到 Ubuntu/Windows/macOS × Python 3.11/3.12/3.13；新增 CodeQL 与 Dependabot；
+- **Actions 全部按 commit SHA 固定**（`@<40位sha>  # vX`）：发布 job 持有 `contents: write`，
+  上游 tag 一旦被移动或重打，未经审阅的代码就能拿到本仓库写权限。固定 SHA 不影响
+  Dependabot 自动提升级 PR，并加了一条静态测试防止被改回 tag；
+- 新增 issue 模板（Bug/Feature）、PR 模板、CODEOWNERS；
+- 修正 CONTRIBUTING（迁移机制、日切点口径）、OPEN_SOURCE_ASSESSMENT（按 v0.1.4 复核数字）、
+  README_DEPLOY（许可目录、默认监听、clear_demo 流程）；
+- 公开文档与测试中的个人称谓统一改为「现场运维 / operator-1」；
+- 看板侧栏版本号改为读取 `/healthz`，不再手写静态版本。
+
 ## [0.1.3] - 2026-11-26
 
 **计量口径修复：三处会让电量悄悄偏少、而系统照旧标记「已结算」的缺陷。**

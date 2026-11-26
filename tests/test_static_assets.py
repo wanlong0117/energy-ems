@@ -87,9 +87,19 @@ def test_github_actions_produces_win11_artifact(isolated_db):
     yml = (SRC_ROOT / ".github" / "workflows" / "build-windows.yml").read_text(encoding="utf-8")
     assert "runs-on: windows-latest" in yml
     assert "pyinstaller energy-ems.spec" in yml
-    assert "energy-ems-win11-x64" in yml
+    # 资产名必须含 tag：同一天发布多个补丁版本时不能再撞名（P2-5）
+    assert 'energy-ems-$tag-win11-x64.zip' in yml
     assert "upload-artifact" in yml
     assert "artifact" in yml.lower()
+
+
+def test_release_package_carries_licenses_and_checksum(isolated_db):
+    """发布合规：zip 内必须有 MIT 与第三方声明，且产出 SHA256 校验文件。"""
+    yml = (SRC_ROOT / ".github" / "workflows" / "build-windows.yml").read_text(encoding="utf-8")
+    assert "licenses" in yml and "LICENSE" in yml
+    assert "THIRD_PARTY_NOTICES.md" in yml
+    assert "Get-FileHash" in yml and ".sha256" in yml
+    assert "release_notes.py" in yml, "Release 正文必须按 tag 生成，不再用通用说明"
 
 
 def test_release_step_is_tag_gated_and_uses_ref_name(isolated_db):
@@ -107,6 +117,31 @@ def test_release_step_is_tag_gated_and_uses_ref_name(isolated_db):
     assert "v1.0.0" not in yml, "workflow 不得硬编码 v1.0.0"
     # 4) 同一 tag 重跑时可覆盖已有 asset，避免发布失败
     assert "overwrite_files: true" in yml, "需允许覆盖同名 release asset"
+
+
+def test_workflow_actions_are_pinned_to_commit_sha(isolated_db):
+    """供应链：workflow 里每个 uses 都必须按 40 位 commit SHA 固定，并保留 `# vX` 可读注释。
+
+    发布 job 持有 contents: write，若引用可移动的 tag（如 actions/checkout@v4），
+    上游一旦重打 tag，未经审阅的代码即可拿到本仓库写权限。Dependabot 能识别这种写法
+    并自动提升级 PR，因此固定 SHA 不牺牲可维护性。
+    """
+    # Arrange：收齐三个 workflow 原文
+    workflow_dir = SRC_ROOT / ".github" / "workflows"
+    files = sorted(workflow_dir.glob("*.yml"))
+    assert files, "必须存在 workflow 文件"
+
+    pinned = re.compile(r"^uses:\s*([\w.-]+/[\w./-]+)@([0-9a-f]{40})\s*(#\s*v\S+)?\s*$")
+
+    # Act & Assert：逐行核对，任何一个 tag 引用都要被拦下
+    for path in files:
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if not stripped.startswith("uses:"):
+                continue
+            match = pinned.match(stripped)
+            assert match, f"{path.name}:{lineno} 未按 commit SHA 固定: {stripped}"
+            assert match.group(3), f"{path.name}:{lineno} 缺少 `# vX` 注释，后续无法判断版本: {stripped}"
 
 
 def test_readme_deploy_covers_mode_switch_backup_vcredist(isolated_db):

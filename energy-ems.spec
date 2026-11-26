@@ -5,6 +5,8 @@
 - hiddenimports：openpyxl / reportlab / pyserial 及其子模块，保证随包可用；
 - 可写数据（config.json / energy.db）由 settings.app_dir() 解析到 exe 同级目录。
 """
+import os
+
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
@@ -48,6 +50,10 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+_version_file = os.environ.get("EMS_VERSION_FILE", "build/version_info.txt")
+if not os.path.exists(_version_file):
+    _version_file = None
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -60,6 +66,8 @@ exe = EXE(
     upx=False,
     console=True,
     disable_windowed_traceback=False,
+    # exe 版本资源：CI 用 scripts/make_version_info.py 按 tag 生成，本地缺失则跳过
+    version=_version_file,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,

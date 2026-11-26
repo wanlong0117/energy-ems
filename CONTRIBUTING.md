@@ -30,8 +30,10 @@ python -m venv .venv
 ## 代码约定
 
 - 遵循现有风格：`from __future__ import annotations`、类型标注、短函数、中文注释
-- 数据库变更必须**幂等**：`schema.sql` 只用 `CREATE TABLE IF NOT EXISTS`，旧库启动自动补表
-- 时间口径统一 UTC 秒；日结算 `day_start` 为 UTC 00:00（本地 08:00）
+- 数据库变更必须**幂等**：新表写进 `schema.sql`（`CREATE TABLE IF NOT EXISTS`），加列/加索引/改主键
+  必须新增一条 `migrations.py` 迁移（先 `PRAGMA table_info` 判存在），旧库启动自动按序升级
+- 时间口径统一 UTC 秒；日切点可配（`EMS_DAY_START_HOUR`，默认本地 08:00 = UTC 00:00），
+  换算只允许走 `settings.day_floor()` / `local_hour()`
 - 电量单位：毫度（1 kWh = 1,000,000）
 - 前端不引入框架；新增交互优先用原生 API
 - 不提交 `config.json`、`energy.db*`、`.venv/`、`dist/`、`build/`

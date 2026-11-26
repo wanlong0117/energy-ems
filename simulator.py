@@ -80,7 +80,8 @@ class Simulator:
         if row is not None:
             return int(row["id"])
         return int(db.execute(
-            "INSERT INTO node (name, kind, sort_order, is_active) VALUES (?, 'area', 0, 1)",
+            "INSERT INTO node (name, kind, sort_order, is_active, is_demo) "
+            "VALUES (?, 'area', 0, 1, 1)",
             (name,),
         ))
 
@@ -92,7 +93,7 @@ class Simulator:
             return int(row["id"])
         return int(db.execute(
             "INSERT INTO device (name, node_id, protocol, host, port, timeout_ms, "
-            "retry, poll_interval, is_enabled) VALUES (?,?,?,?,502,3000,2,60,1)",
+            "retry, poll_interval, is_enabled, is_demo) VALUES (?,?,?,?,502,3000,2,60,1,1)",
             (name, node_id, protocol, host),
         ))
 
@@ -116,8 +117,8 @@ class Simulator:
         return int(db.execute(
             "INSERT INTO point (name, device_id, slave_id, func_code, reg_offset, "
             "reg_count, data_type, byte_order, scale, offset_const, min_val, max_val, "
-            "unit, point_role, is_enabled) "
-            "VALUES (?,?,?,3,?,?,?,'ABCD',1,0,?,?,?,?,1)",
+            "unit, point_role, is_enabled, is_demo) "
+            "VALUES (?,?,?,3,?,?,?,'ABCD',1,0,?,?,?,?,1,1)",
             (
                 name, device_id, slave_id, reg_offset, reg_count, data_type,
                 min_val, max_val, unit, point_role,
@@ -126,6 +127,15 @@ class Simulator:
 
     def ensure_baseline(self) -> None:
         """首次启动补齐 4×25 电表 + 5 电极×3 点 + 5 机械排水点（可重复调用）。"""
+        # 从 live 切回 simulate 时，演示数据在 live 启动阶段被自动停用过，这里恢复。
+        with db.transaction() as conn:
+            for table, flag in (
+                ("meter", "is_enabled"), ("point", "is_enabled"),
+                ("device", "is_enabled"), ("node", "is_active"),
+            ):
+                conn.execute(
+                    f"UPDATE {table} SET {flag}=1 WHERE is_demo=1 AND {flag}=0"
+                )
         building_nodes: dict[str, int] = {
             building: self._ensure_node(f"模拟-{building}栋") for building in BUILDINGS
         }
@@ -156,7 +166,7 @@ class Simulator:
                 else:
                     meter_id = int(db.execute(
                         "INSERT INTO meter (name, node_id, category_id, purpose, "
-                        "is_counted, daily_8am, is_enabled) VALUES (?,?,1,?,1,1,1)",
+                        "is_counted, daily_8am, is_enabled, is_demo) VALUES (?,?,1,?,1,1,1,1)",
                         (meter_name, building_nodes[building], purpose),
                     ))
 
@@ -223,7 +233,7 @@ class Simulator:
         rows = db.query(
             "SELECT mp.meter_id, mp.role, mp.point_id, m.purpose "
             "FROM meter_point mp JOIN meter m ON m.id=mp.meter_id "
-            "WHERE m.name LIKE '模拟-%' AND m.is_enabled=1"
+            "WHERE (m.is_demo=1 OR m.name LIKE '模拟-%') AND m.is_enabled=1"
         )
         for row in rows:
             role: str = str(row["role"])
@@ -244,7 +254,9 @@ class Simulator:
     @staticmethod
     def _point_ids_by_name(pattern: str) -> list[int]:
         rows = db.query(
-            "SELECT id FROM point WHERE name LIKE ? ORDER BY id", (pattern,)
+            "SELECT id FROM point WHERE name LIKE ? AND (is_demo=1 OR name LIKE '模拟-%') "
+            "ORDER BY id",
+            (pattern,),
         )
         return [int(row["id"]) for row in rows]
 

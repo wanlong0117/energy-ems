@@ -114,12 +114,12 @@ def test_crud_for_all_seven_config_resources(ready_db):
             assert point["name"] == "总电量-改"
             assert len(_envelope(await client.get("/api/config/point"))["data"]) == 1
 
-            # energy_category（初始化已有 3 条）
+            # energy_category（初始化已有 3 条；v0.1.4 起只接受电 kWh）
             category = _envelope(await client.post("/api/config/energy_category", json={
-                "name": "蒸汽", "unit": "t",
+                "name": "电-照明", "unit": "kWh",
             }))["data"]
             _envelope(await client.put(
-                f"/api/config/energy_category/{category['id']}", json={"unit": "吨"}
+                f"/api/config/energy_category/{category['id']}", json={"unit": "kWh"}
             ))
             assert len(_envelope(await client.get("/api/config/energy_category"))["data"]) == 4
 

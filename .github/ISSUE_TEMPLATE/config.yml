@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞上报 / Security report
+    url: https://github.com/wanlong0117/energy-ems/security/advisories/new
+    about: 请勿通过公开 issue 披露安全问题，走私密漏洞报告
+  - name: 部署与升级说明 / Deployment guide
+    url: https://github.com/wanlong0117/energy-ems/blob/main/README_DEPLOY.md
+    about: 安装、切 live、重算历史、备份恢复都写在这里

@@ -55,6 +55,71 @@ class ConfigService:
         "meter_point": {"meter_id": "meter", "point_id": "point"},
     }
 
+    # 删除实体时要一起清掉的历史数据（表, 关联列）：reading/hourly/daily 这些表
+    # 都不带外键，删了实体不清理就会变成孤儿行；ID 复用后新实体直接继承旧读数。
+    CLEANUP_RULES: dict[str, tuple[tuple[str, str], ...]] = {
+        # 注意这里**不含 meter_point**：点位/表仍被关联时，直接删关联会让计量表
+        # 静默失去读数点（表还在、数不再更新），比报错难发现得多。保持 409
+        # 「请先解除关联」，让操作员显式决定。
+        "point": (
+            ("manual_reading", "point_id"),
+            ("reading", "point_id"),
+            ("reading_latest", "point_id"),
+        ),
+        # 删表可以连关联一起删：表没了，映射本身没有意义。
+        # （反之删点位不行——那会让还活着的表失去数据源，所以保持 409。）
+        "meter": (
+            ("meter_point", "meter_id"),
+            ("hourly", "meter_id"),
+            ("daily", "meter_id"),
+        ),
+    }
+
+    # 审计重点关注字段：改动这些会改变账单或采集行为
+    SENSITIVE_FIELDS: frozenset[str] = frozenset({
+        "scale", "offset_const", "byte_order", "data_type", "reg_count", "reg_offset",
+        "min_val", "max_val", "purpose", "is_counted", "is_enabled", "category_id",
+        "meter_id", "point_id", "role", "host", "port", "protocol", "poll_interval",
+        "price_cent", "start_hour", "end_hour", "is_default", "node_id", "device_id",
+        "parent_id",
+    })
+    AUDIT_MAX_FIELDS: int = 12
+
+    @classmethod
+    def _audit(cls, action: str, resource: str, item_id: int, detail: str) -> None:
+        """配置变更审计：谁在什么时候把哪个字段改成了什么（P2-2）。
+
+        旧实现只有采集任务重载会写 COLLECTOR_RELOAD，改 scale / 改表计用途
+        这类直接影响账单的操作完全无痕，事后对不上账无法追溯。
+        """
+        db.log_event(
+            "warn" if resource in ("meter", "point", "tariff") else "info",
+            "user", "CONFIG_CHANGE",
+            f"{action} {resource} id={item_id} {detail}".strip(),
+            int(item_id),
+        )
+
+    @classmethod
+    def _diff_text(cls, before: dict[str, Any], after: dict[str, Any]) -> str:
+        """把变更压成「字段 旧值→新值」，敏感字段全部列出，其余只给字段名。"""
+        parts: list[str] = []
+        for key in sorted(after.keys()):
+            if key in ("id", "rowid"):
+                continue
+            old_value: Any = before.get(key)
+            new_value: Any = after.get(key)
+            if old_value == new_value:
+                continue
+            if len(parts) < cls.AUDIT_MAX_FIELDS:
+                if key in cls.SENSITIVE_FIELDS:
+                    parts.append(f"{key}: {old_value!r}→{new_value!r}")
+                else:
+                    parts.append(f"{key}*")
+        if not parts:
+            return "（无字段变化）"
+        text: str = "，".join(parts)
+        return text if len(text) <= 600 else text[:600] + "…"
+
     @classmethod
     def _check_refs(cls, resource: str, data: dict[str, Any]) -> None:
         """校验被引用记录是否存在；不存在抛 ValueError（映射为 400）。"""
@@ -112,6 +177,8 @@ class ConfigService:
         data: dict[str, Any] = MODEL_MAP[resource](**body).model_dump()
         if resource == "point":
             validate_point(data)
+        if resource == "meter":
+            self._check_meter_category(data.get("category_id"))
         self._check_refs(resource, data)
         columns: list[str] = list(data.keys())
         placeholders: str = ", ".join("?" for _ in columns)
@@ -121,7 +188,27 @@ class ConfigService:
         new_id: int = db.execute(sql, tuple(data[column] for column in columns))
         if resource in ("device", "point"):
             collector.reload()  # 采集配置变更热生效
-        return self.get(resource, new_id)
+        created: dict[str, Any] = self.get(resource, new_id)
+        self._audit("新增", resource, new_id, self._diff_text({}, created))
+        return created
+
+    @staticmethod
+    def _check_meter_category(category_id: Any) -> None:
+        """计量表只能挂电（kWh）分类。
+
+        聚合按毫度换算、电价按分/kWh 计、报表列头写死 kWh——把水表挂到
+        「水 m3」分类下，读数会被当成 kWh 并按电价算钱，比不支持更糟。
+        """
+        if category_id is None:
+            return
+        row: Any = db.query_one(
+            "SELECT unit FROM energy_category WHERE id=?", (int(category_id),)
+        )
+        if row is not None and str(row["unit"]) != "kWh":
+            raise ValueError(
+                "当前版本仅支持电（kWh）计量，水/气分类暂不能挂表；"
+                "如需多能源请先实现按分类的单位换算与计价口径"
+            )
 
     def update(self, resource: str, item_id: int, body: dict[str, Any]) -> dict[str, Any]:
         """局部更新记录；point 校验时排除自身 id 的区间。"""
@@ -132,6 +219,8 @@ class ConfigService:
         data: dict[str, Any] = MODEL_MAP[resource](**merged).model_dump()
         if resource == "point":
             validate_point(merged, exclude_id=int(item_id))
+        if resource == "meter":
+            self._check_meter_category(merged.get("category_id"))
 
         fields: dict[str, Any] = {
             key: value for key, value in data.items() if key in body and key != "id"
@@ -145,17 +234,38 @@ class ConfigService:
             )
         if resource in ("device", "point"):
             collector.reload()
-        return self.get(resource, item_id)
+        updated: dict[str, Any] = self.get(resource, item_id)
+        if fields:
+            self._audit("修改", resource, item_id, self._diff_text(old, updated))
+        return updated
 
     def delete(self, resource: str, item_id: int) -> bool:
-        """删除记录；device/point 删除后触发采集重载。"""
+        """删除记录，并在同事务内清掉挂在它名下的历史数据。
+
+        reading / reading_latest / hourly / daily / manual_reading 都没有外键，
+        删除实体时不会自动清理；配合「主键复用」就会出现新表一上线就带着
+        旧表底码与旧日报（实测重建 point 后 reading_latest 立即返回旧值 42）。
+        """
         self._check_resource(resource)
-        self.get(resource, item_id)  # 不存在则抛 LookupError -> 404
-        db.execute(
-            f"DELETE FROM {resource} WHERE {self._id_col(resource)}=?", (int(item_id),)
-        )
+        old: dict[str, Any] = self.get(resource, item_id)  # 不存在则抛 LookupError -> 404
+        cleaned: dict[str, int] = {}
+        with db.transaction() as conn:
+            for table, column in self.CLEANUP_RULES.get(resource, ()):
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE {column}=?", (int(item_id),)
+                )
+                cleaned[table] = int(cursor.rowcount or 0)
+            conn.execute(
+                f"DELETE FROM {resource} WHERE {self._id_col(resource)}=?", (int(item_id),)
+            )
         if resource in ("device", "point"):
             collector.reload()
+        detail: str = self._diff_text(old, {})
+        if cleaned:
+            detail += "；同时清理 " + "、".join(
+                f"{table} {count} 行" for table, count in cleaned.items() if count
+            )
+        self._audit("删除", resource, item_id, detail)
         return True
 
     async def test_device(self, device_id: int) -> dict[str, Any]:

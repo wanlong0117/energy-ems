@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # 运行时依赖：补丁/次要版本都提 PR，但由人判断是否随版本发布
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "02:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    groups:
+      runtime:
+        patterns: ["fastapi", "uvicorn", "pydantic"]
+      reporting:
+        patterns: ["openpyxl", "reportlab"]
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+
+  # GitHub Actions 也需要跟着升级：checkout/setup-python 这类频繁发版
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "chore(ci)"

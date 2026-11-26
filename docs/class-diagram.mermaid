@@ -39,7 +39,7 @@ classDiagram
         +float min_val
         +float max_val
         +str unit
-        +str point_role
+        +int is_demo
         +int is_enabled
     }
     class EnergyCategory {
@@ -54,7 +54,7 @@ classDiagram
         +int category_id
         +str purpose
         +int is_counted
-        +int daily_8am
+        +int is_demo
         +int is_enabled
     }
     class MeterPoint {
@@ -89,6 +89,7 @@ classDiagram
         +float peak_power
         +float avg_power
         +int cost_cent
+        +int covered_hours
         +int is_final
     }
     class Tariff {

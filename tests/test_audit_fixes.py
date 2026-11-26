@@ -358,14 +358,14 @@ def test_manual_record_rejects_out_of_window_timestamps(ready_db):
     assert node > 0
 
     with pytest.raises(ValueError):
-        manual_service.record({"point_id": point, "ts": 0, "value": 1.0, "operator": "强哥"})
+        manual_service.record({"point_id": point, "ts": 0, "value": 1.0, "operator": "operator-1"})
     with pytest.raises(ValueError):
         manual_service.record({
-            "point_id": point, "ts": int(time.time()) + 3600, "value": 1.0, "operator": "强哥",
+            "point_id": point, "ts": int(time.time()) + 3600, "value": 1.0, "operator": "operator-1",
         })
     result = manual_service.record({
         "point_id": point, "ts": int(time.time()) - SECONDS_PER_DAY, "value": 1.0,
-        "operator": "强哥",
+        "operator": "operator-1",
     })
     assert result["overwritten"] is False
 

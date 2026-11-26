@@ -1,5 +1,8 @@
 name: Build Windows x64 (Win11 onedir)
 
+# 本 job 持有 contents: write（发布 Release），第三方 action 一律按 commit SHA 固定，
+# 避免上游 tag 被移动或重打后，未经审阅的代码拿到本仓库的写权限。
+# 形如 `@<40位sha>  # vX` 的写法 Dependabot 仍能识别并自动提 PR 升级，人工只需复核 diff。
 permissions:
   contents: write
 
@@ -14,10 +17,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Setup Python 3.11 x64
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.11"
           architecture: x64
@@ -27,45 +30,114 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
 
+      - name: Resolve version tag
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = "dev-$($env:GITHUB_SHA.Substring(0,7))"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Generate exe version resource
+        # 让 exe 文件属性里能看到版本号，避免多个包只能靠文件名猜
+        run: python scripts/make_version_info.py --version ${{ steps.version.outputs.tag }} --out build/version_info.txt
+
       - name: Build onedir package with PyInstaller
         run: pyinstaller energy-ems.spec --noconfirm --clean
 
-      - name: Assemble release folder
+      - name: Assemble release folder (含许可文本与运维脚本)
         shell: pwsh
         run: |
-          Copy-Item -Path build_win11.bat -Destination dist/energy_ems/ -Force
-          Copy-Item -Path README_DEPLOY.md -Destination dist/energy_ems/ -Force
+          $dist = "dist/energy_ems"
+          Copy-Item -Path build_win11.bat -Destination $dist -Force
+          Copy-Item -Path README_DEPLOY.md -Destination $dist -Force
+          # MIT 与第三方许可必须随二进制分发：源码仓库里有 LICENSE 不等于 zip 里有
+          New-Item -ItemType Directory -Force -Path "$dist/licenses" | Out-Null
+          Copy-Item -Path LICENSE, THIRD_PARTY_NOTICES.md -Destination "$dist/licenses" -Force
+          # 升级/清理/备份脚本随包，README_DEPLOY 里引用了它们
+          New-Item -ItemType Directory -Force -Path "$dist/scripts" | Out-Null
+          Copy-Item -Path scripts/backup.py, scripts/recompute.py, scripts/clear_demo.py `
+            -Destination "$dist/scripts" -Force
+          foreach ($f in @("LICENSE", "THIRD_PARTY_NOTICES.md")) {
+            if (-not (Test-Path "$dist/licenses/$f")) { throw "发布目录缺少 licenses/$f" }
+          }
 
-      - name: Compress archive
+      - name: Compress archive and write SHA256
         id: package
         shell: pwsh
         run: |
-          $stamp = Get-Date -Format yyyyMMdd
-          $zip = "energy-ems-win11-x64-$stamp.zip"
+          $tag = "${{ steps.version.outputs.tag }}"
+          $zip = "energy-ems-$tag-win11-x64.zip"
           Compress-Archive -Path "dist/energy_ems/*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Set-Content "$zip.sha256" -Encoding ascii
           "zip=$zip" >> $env:GITHUB_OUTPUT
+          "sha=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Verify package contents
+        # 发布合规不能只看工作流日志：直接解压清单核对许可文本与关键资源
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = "${{ steps.package.outputs.zip }}"
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          try {
+            $entries = $archive.Entries | ForEach-Object { $_.FullName -replace '\\', '/' }
+          } finally {
+            $archive.Dispose()
+          }
+          $required = @(
+            "energy_ems.exe",
+            "licenses/LICENSE",
+            "licenses/THIRD_PARTY_NOTICES.md",
+            "schema.sql",
+            "dashboard/index.html"
+          )
+          $missing = $required | Where-Object { $entries -notcontains $_ }
+          if ($missing) { throw "发布包缺少：$($missing -join ', ')" }
+          Write-Host ("包内条目 {0} 个，许可文本齐全" -f $entries.Count)
+
+      - name: Generate release notes from CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python scripts/release_notes.py --tag ${{ github.ref_name }} --out release_notes.md
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ${{ steps.package.outputs.zip }}
-          path: ${{ steps.package.outputs.zip }}
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
           if-no-files-found: error
           retention-days: 90
 
       - name: Publish Release (可直链下载)
         # 仅在打 v* tag 时发布，push main 只产出 artifact，不触碰 release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           tag_name: ${{ github.ref_name }}
           name: energy-ems ${{ github.ref_name }} · Win11 x64
-          body: |
-            能耗管理系统 energy-ems ${{ github.ref_name }} · Win11 x64 onedir 完整包（MIT 许可）。
-            解压后双击 energy_ems.exe，浏览器打开 http://127.0.0.1:8000/ 。
-            首次启动为 simulate 模拟数据模式，看板与报表立即可用。
-            默认密码 ems2026，首次登录会强制修改，也可用 EMS_PASSWORD 环境变量指定初始密码。
-          files: ${{ steps.package.outputs.zip }}
+          body_path: release_notes.md
+          files: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
           overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish checksum in job summary
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          @"
+          ### sha256
+          ```
+          ${{ steps.package.outputs.sha }}  ${{ steps.package.outputs.zip }}
+          ```
+          校验：`sha256sum -c ${{ steps.package.outputs.zip }}.sha256`
+          （Windows：`certutil -hashfile ${{ steps.package.outputs.zip }} SHA256`）
+          "@ >> $env:GITHUB_STEP_SUMMARY

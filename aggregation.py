@@ -97,94 +97,27 @@ class Aggregator:
         """
         hour_start = int(hour_start)
         hour_end: int = hour_start + SECONDS_PER_HOUR
-        meters = db.query("SELECT id FROM meter WHERE is_enabled=1 AND is_counted=1")
+        # 演示表只在「纯演示实例」里参与汇总；接入真表后一律让位（P0）
+        meters = db.query(
+            "SELECT id FROM meter WHERE is_enabled=1 AND is_counted=1" + db.demo_guard("meter")
+        )
         fallback_meters: int = 0
 
         for meter in meters:
             meter_id: int = int(meter["id"])
-            reading_point = db.query_one(
-                "SELECT p.id FROM point p JOIN meter_point mp ON mp.point_id=p.id "
-                "WHERE mp.meter_id=? AND mp.role='reading' ORDER BY p.id LIMIT 1",
-                (meter_id,),
-            )
-            if reading_point is None:
-                continue  # 未配置累计电量点，无法计算小时电量
-            point_id: int = int(reading_point["id"])
-
-            # 收口：本小时窗口内最后一条；窗口为空即本小时无样本，不产出行
-            end = db.query_one(
-                "SELECT value, ts FROM reading WHERE point_id=? AND ts>? AND ts<=? "
-                "AND quality IN (0,3) ORDER BY ts DESC LIMIT 1",
-                (point_id, hour_start, hour_end),
-            )
-            if end is None:
+            try:
+                if self._rollup_one_meter(meter_id, hour_start, hour_end):
+                    fallback_meters += 1
+            except Exception as exc:
+                # 单表异常（脏数据/整数溢出/字段缺失）只影响该表：
+                # 旧实现让异常冒到循环外，故障表之后的所有表整轮停止更新，
+                # 而小时任务每 5 分钟重试一次，等于每 5 分钟重复失败一次。
+                db.log_event_throttled(
+                    "error", "collector", "METER_ROLLUP_FAIL",
+                    f"表 {meter_id} 小时汇总失败，本轮跳过：{type(exc).__name__}: {exc}",
+                    meter_id,
+                )
                 continue
-
-            # 基准：hour_start 及之前的最后一条；缺失则回退到窗口内首条（首个小时/换表）
-            base = db.query_one(
-                "SELECT value, ts FROM reading WHERE point_id=? AND ts<=? "
-                "AND quality IN (0,3) ORDER BY ts DESC LIMIT 1",
-                (point_id, hour_start),
-            )
-            if base is None:
-                base = db.query_one(
-                    "SELECT value, ts FROM reading WHERE point_id=? AND ts>? AND ts<=? "
-                    "AND quality IN (0,3) ORDER BY ts ASC LIMIT 1",
-                    (point_id, hour_start, hour_end),
-                )
-                fallback_meters += 1
-            if base is None:
-                continue
-
-            delta_kwh: float = float(end["value"]) - float(base["value"])
-            if delta_kwh < 0:
-                # 累计值回退（换表/溢出）：本小时记 0 并留审计痕迹
-                db.log_event(
-                    "warn", "collector", "METER_RESET",
-                    f"表 {meter_id} 累计值回退 {delta_kwh:.6f} kWh，按 0 计", meter_id,
-                )
-                delta_kwh = 0.0
-            energy_wh: int = int(round(delta_kwh * MILLI_PER_KWH))
-
-            # 瞬时功率：同表所有 role='power' 的点的平均/最大值（仅 quality=0）。
-            # 功率用 [hour_start, hour_end) 左闭右开——它是「本小时内的采样」，
-            # 与电量的右闭窗口不同源：累计读数 v(hour_end) 是上一段区间的收口，
-            # 而瞬时功率 p(hour_end) 属于下一小时的第一个采样点。
-            power_points = db.query(
-                "SELECT p.id FROM point p JOIN meter_point mp ON mp.point_id=p.id "
-                "WHERE mp.meter_id=? AND mp.role='power'",
-                (meter_id,),
-            )
-            avg_parts: list[float] = []
-            max_power: float | None = None
-            for power_point in power_points:
-                aggreg = db.query_one(
-                    "SELECT AVG(value) AS avg_v, MAX(value) AS max_v, COUNT(*) AS cnt "
-                    "FROM reading WHERE point_id=? AND ts>=? AND ts<? AND quality=0",
-                    (int(power_point["id"]), hour_start, hour_end),
-                )
-                if aggreg is not None and int(aggreg["cnt"]) > 0:
-                    avg_parts.append(float(aggreg["avg_v"]))
-                    max_v: Any = aggreg["max_v"]
-                    if max_v is not None:
-                        max_value = float(max_v)
-                        if max_power is None or max_value > max_power:
-                            max_power = max_value
-            avg_power: float | None = sum(avg_parts) / len(avg_parts) if avg_parts else None
-
-            sample_row = db.query_one(
-                "SELECT COUNT(*) AS cnt FROM reading WHERE point_id=? AND ts>=? "
-                "AND ts<? AND quality IN (0,3)",
-                (point_id, hour_start, hour_end),
-            )
-            sample_cnt: int = int(sample_row["cnt"]) if sample_row is not None else 0
-
-            db.execute(
-                "INSERT OR REPLACE INTO hourly "
-                "(meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt) "
-                "VALUES (?,?,?,?,?,?)",
-                (meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt),
-            )
 
         if fallback_meters:
             db.log_event(
@@ -196,6 +129,98 @@ class Aggregator:
             db.log_event(
                 "info", "collector", "ROLLUP_HOUR_DONE", f"小时汇总完成 hour_start={hour_start}"
             )
+
+    def _rollup_one_meter(self, meter_id: int, hour_start: int, hour_end: int) -> bool:
+        """单表小时汇总：返回是否回退了「窗口内首条」作为基准。
+
+        拆成独立方法是为了异常隔离：某块表出现脏数据（超大整数、字段缺失）时
+        只跳过它，不会让排在它后面的所有表整轮停止更新。
+        """
+        reading_point = db.query_one(
+            "SELECT p.id FROM point p JOIN meter_point mp ON mp.point_id=p.id "
+            "WHERE mp.meter_id=? AND mp.role='reading' ORDER BY p.id LIMIT 1",
+            (meter_id,),
+        )
+        if reading_point is None:
+            return False  # 未配置累计电量点，无法计算小时电量
+        point_id: int = int(reading_point["id"])
+        used_fallback: bool = False
+
+        # 收口：本小时窗口内最后一条；窗口为空即本小时无样本，不产出行
+        end = db.query_one(
+            "SELECT value, ts FROM reading WHERE point_id=? AND ts>? AND ts<=? "
+            "AND quality IN (0,3) ORDER BY ts DESC LIMIT 1",
+            (point_id, hour_start, hour_end),
+        )
+        if end is None:
+            return False
+
+        # 基准：hour_start 及之前的最后一条；缺失则回退到窗口内首条（首个小时/换表）
+        base = db.query_one(
+            "SELECT value, ts FROM reading WHERE point_id=? AND ts<=? "
+            "AND quality IN (0,3) ORDER BY ts DESC LIMIT 1",
+            (point_id, hour_start),
+        )
+        if base is None:
+            base = db.query_one(
+                "SELECT value, ts FROM reading WHERE point_id=? AND ts>? AND ts<=? "
+                "AND quality IN (0,3) ORDER BY ts ASC LIMIT 1",
+                (point_id, hour_start, hour_end),
+            )
+            used_fallback = True
+        if base is None:
+            return False
+
+        delta_kwh: float = float(end["value"]) - float(base["value"])
+        if delta_kwh < 0:
+            # 累计值回退（换表/溢出）：本小时记 0 并留审计痕迹
+            db.log_event(
+                "warn", "collector", "METER_RESET",
+                f"表 {meter_id} 累计值回退 {delta_kwh:.6f} kWh，按 0 计", meter_id,
+            )
+            delta_kwh = 0.0
+        energy_wh: int = int(round(delta_kwh * MILLI_PER_KWH))
+
+        # 瞬时功率：同表所有 role='power' 的点的平均/最大值（仅 quality=0）。
+        # 功率用 [hour_start, hour_end) 左闭右开——它是「本小时内的采样」，
+        # 与电量的右闭窗口不同源：累计读数 v(hour_end) 是上一段区间的收口，
+        # 而瞬时功率 p(hour_end) 属于下一小时的第一个采样点。
+        power_points = db.query(
+            "SELECT p.id FROM point p JOIN meter_point mp ON mp.point_id=p.id "
+            "WHERE mp.meter_id=? AND mp.role='power'",
+            (meter_id,),
+        )
+        avg_parts: list[float] = []
+        max_power: float | None = None
+        for power_point in power_points:
+            aggreg = db.query_one(
+                "SELECT AVG(value) AS avg_v, MAX(value) AS max_v, COUNT(*) AS cnt "
+                "FROM reading WHERE point_id=? AND ts>=? AND ts<? AND quality=0",
+                (int(power_point["id"]), hour_start, hour_end),
+            )
+            if aggreg is not None and int(aggreg["cnt"]) > 0:
+                avg_parts.append(float(aggreg["avg_v"]))
+                max_v: Any = aggreg["max_v"]
+                if max_v is not None:
+                    max_value = float(max_v)
+                    if max_power is None or max_value > max_power:
+                        max_power = max_value
+        avg_power: float | None = sum(avg_parts) / len(avg_parts) if avg_parts else None
+
+        sample_row = db.query_one(
+            "SELECT COUNT(*) AS cnt FROM reading WHERE point_id=? AND ts>=? "
+            "AND ts<? AND quality IN (0,3)",
+            (point_id, hour_start, hour_end),
+        )
+        sample_cnt: int = int(sample_row["cnt"]) if sample_row is not None else 0
+
+        db.execute(
+            "INSERT OR REPLACE INTO hourly "
+            "(meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt) "
+            "VALUES (?,?,?,?,?,?)",
+            (meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt),
+        )
+        return used_fallback
 
     def settle_day(
         self, day_start: int, is_final: int = 1, enforce_coverage: bool = True
@@ -214,6 +239,13 @@ class Aggregator:
         day_start = int(day_start)
         final_flag: int = 1 if int(is_final) else 0
         day_end: int = day_start + SECONDS_PER_DAY
+        # 应结算表集合：启用 + 计入，且接入真表后排除演示表（P0）。
+        # 覆盖率分母必须与「谁应该报数」一致，否则演示数据会把分母撑爆。
+        target_rows = db.query(
+            "SELECT id FROM meter WHERE is_enabled=1 AND is_counted=1" + db.demo_guard("meter")
+        )
+        target_ids: list[int] = [int(row["id"]) for row in target_rows]
+        target_set: set[int] = set(target_ids)
         rows = db.query(
             "SELECT meter_id, hour_start, energy_wh, avg_power, max_power, sample_cnt "
             "FROM hourly WHERE hour_start>=? AND hour_start<?",
@@ -222,6 +254,8 @@ class Aggregator:
         buckets: dict[int, dict[str, Any]] = {}
         hours_covered: set[int] = set()
         for row in rows:
+            if target_set and int(row["meter_id"]) not in target_set:
+                continue  # 已停用/演示表的残留小时数据不参与结算
             hours_covered.add(int(row["hour_start"]))
             bucket: dict[str, Any] = buckets.setdefault(
                 int(row["meter_id"]),
@@ -251,10 +285,7 @@ class Aggregator:
 
         day_final: int = final_flag
         if final_flag and enforce_coverage:
-            counted = db.query_one(
-                "SELECT COUNT(*) AS cnt FROM meter WHERE is_enabled=1 AND is_counted=1"
-            )
-            total_meters: int = int(counted["cnt"]) if counted is not None else 0
+            total_meters: int = len(target_ids)
             meter_ratio: float = len(buckets) / total_meters if total_meters else 0.0
             if not buckets or meter_ratio < SETTLE_MIN_COVERAGE:
                 day_final = 0
@@ -265,15 +296,26 @@ class Aggregator:
                 )
 
         short_meters: list[str] = []
-        for meter_id, bucket in buckets.items():
-            energy_wh: int = int(bucket["energy_wh"])
+        settled_meters: int = 0
+        # 正式结算时，应结算但整日无数据的表也要落一行零值（P2-4）：
+        # 旧行为是「没数据就不产行」，报表按行求和会静默少计，而页面仍显示「已结算」。
+        # 补零行 + covered_hours=0 + is_final=0，缺哪块表一眼能看出来。
+        meter_ids: list[int] = list(buckets.keys())
+        if enforce_coverage:
+            meter_ids += [mid for mid in target_ids if mid not in buckets]
+        for meter_id in meter_ids:
+            bucket: dict[str, Any] | None = buckets.get(meter_id)
+            hours: list[tuple[int, int]] = bucket["hours"] if bucket else []
+            energy_wh: int = int(bucket["energy_wh"]) if bucket else 0
             avg_power: float | None = (
-                bucket["weighted_sum"] / bucket["samples"] if bucket["samples"] > 0 else None
+                bucket["weighted_sum"] / bucket["samples"]
+                if bucket and bucket["samples"] > 0 else None
             )
             # 分时电价：按当天各小时电量逐段计价，并把「按什么价算的」存成快照
-            cost: tariff.CostResult = tariff.cost_for_hourly(bucket["hours"])
-            self._warn_if_reprice(meter_id, day_start, cost)
-            covered_hours: int = len(bucket["hours"])
+            cost: tariff.CostResult = tariff.cost_for_hourly(hours)
+            if bucket:
+                self._warn_if_reprice(meter_id, day_start, cost)
+            covered_hours: int = len(hours)
             meter_final: int = day_final
             if (
                 meter_final
@@ -285,14 +327,16 @@ class Aggregator:
             db.execute(
                 "INSERT OR REPLACE INTO daily "
                 "(meter_id, day_start, energy_wh, peak_power, avg_power, cost_cent, "
-                "is_final, price_cent, tariff_snapshot) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "is_final, covered_hours, price_cent, tariff_snapshot) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
-                    meter_id, day_start, energy_wh, bucket["peak"], avg_power,
-                    cost.cost_cent, meter_final, cost.price_cent,
+                    meter_id, day_start, energy_wh,
+                    bucket["peak"] if bucket else None, avg_power,
+                    cost.cost_cent, meter_final, covered_hours, cost.price_cent,
                     tariff.dumps(cost, covered_hours),
                 ),
             )
+            settled_meters += 1
 
         if short_meters:
             db.log_event(
@@ -304,7 +348,8 @@ class Aggregator:
 
         db.log_event(
             "info", "collector", "SETTLE_DONE",
-            f"日结算完成 day_start={day_start}，is_final={day_final}，结算表数={len(buckets)}",
+            f"日结算完成 day_start={day_start}，is_final={day_final}，"
+            f"应结算表数={len(target_ids)}，有数据表数={len(buckets)}，写入行数={settled_meters}",
         )
 
     @staticmethod
@@ -344,7 +389,7 @@ class Aggregator:
             "SELECT m.purpose AS purpose, m.node_id AS node_id, "
             "SUM(d.energy_wh) AS energy_wh, SUM(d.cost_cent) AS cost_cent "
             "FROM daily d JOIN meter m ON m.id=d.meter_id "
-            "WHERE d.day_start=? GROUP BY m.purpose, m.node_id "
+            "WHERE d.day_start=?" + db.demo_guard("m") + " GROUP BY m.purpose, m.node_id "
             "ORDER BY m.purpose, m.node_id",
             (int(day_start),),
         )
@@ -390,6 +435,9 @@ class Aggregator:
         if is_final is not None:
             conditions.append("d.is_final=?")
             params.append(int(is_final))
+        guard: str = db.demo_guard("m")
+        if guard:
+            conditions.append(guard.removeprefix(" AND "))
         sql: str = (
             "SELECT d.day_start, d.meter_id, d.energy_wh, d.cost_cent, d.peak_power, "
             "d.avg_power, d.is_final, m.name AS meter_name, m.purpose, m.node_id, "

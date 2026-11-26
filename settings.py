@@ -100,6 +100,11 @@ RECONNECT_BACKOFF_MAX_SEC: float = 60.0
 MODBUS_MAX_REGISTERS: int = 125      # 单次读寄存器上限（协议约束）
 MODBUS_MAX_BYTE_COUNT: int = 250
 
+# ---------- 人工录入边界 ----------
+# 单条人工读数绝对值上限（工程值）。超过这个量级不可能是真实抄见值，
+# 且 ×1e6 转毫度后会溢出 SQLite INTEGER，直接把整轮汇总打断。
+MANUAL_MAX_ABS_VALUE: float = 1e9
+
 # ---------- 数据质量 ----------
 QUALITY_OK: int = 0
 QUALITY_TIMEOUT: int = 1
@@ -187,9 +192,13 @@ SESSION_TTL_SEC: int = 7 * SECONDS_PER_DAY
 SESSION_COOKIE_SECURE: bool = os.environ.get("EMS_COOKIE_SECURE", "") not in ("", "0", "false")
 
 # ---------- HTTP 入口（单进程 uvicorn） ----------
-HTTP_HOST: str = "0.0.0.0"
-HTTP_PORT: int = 8000
+# 默认只绑本机：默认密码是公开的，一旦直接监听 0.0.0.0，同一网段任何人都能抢先
+# 用默认口令登录并把密码改掉，把现场管理员锁在外面（v0.1.3 复审 P1-6）。
+# 需要手机/其他电脑访问时显式设置 EMS_ALLOW_LAN=1 或 EMS_HOST=0.0.0.0。
+ALLOW_LAN: bool = os.environ.get("EMS_ALLOW_LAN", "") not in ("", "0", "false")
+HTTP_HOST: str = os.environ.get("EMS_HOST") or ("0.0.0.0" if ALLOW_LAN else "127.0.0.1")
+HTTP_PORT: int = _env_int("EMS_PORT", 8000)
 
 # ---------- 版本 ----------
 # 单一事实源：FastAPI 元信息、/healthz、看板侧栏都读它，避免三处各写一个版本号
-APP_VERSION: str = "0.1.3"
+APP_VERSION: str = "0.1.4"

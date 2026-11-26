@@ -92,6 +92,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db.log_event("info", "api", "MODE_RUN", f"启动模拟模式，间隔 {interval_sec}s")
     else:
         # 真实模式：模拟器完全不启动，但必须起小时汇总，否则 hourly 无写入者
+        #
+        # 同时停用演示数据（P0）：先 simulate 演示、再切 live 接真表是本项目文档
+        # 推荐的路径，但 100 块「模拟-*」表若仍处于启用+计入，日结算覆盖率分母
+        # 会变成 101，真实表永远达不到 90% 门槛，日报全部停在「未结算」。
+        disabled: dict[str, int] = db.disable_demo_data()
+        if any(disabled.values()):
+            logger.warning("已停用演示数据：%s", disabled)
         background.append(asyncio.create_task(collector.start(), name="ems-collector"))
         background.append(
             asyncio.create_task(aggregator.run_hourly_loop(), name="ems-hourly-rollup")

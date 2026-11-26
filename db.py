@@ -122,6 +122,53 @@ def log_event(
     )
 
 
+# ---------- 演示数据隔离（P0） ----------
+def has_real_meter() -> bool:
+    """是否存在「启用且计入」的真实表（is_demo=0）。
+
+    判据是「有没有真表」而不是「当前是不是 live 模式」：一个纯演示实例
+    （simulate）必须继续展示模拟数据，否则看板一进来就空；一旦接入了真表，
+    演示数据就必须整体让位，否则 100 块模拟表会把日结覆盖率分母撑到 101。
+    """
+    return query_one(
+        "SELECT 1 FROM meter WHERE is_enabled=1 AND is_counted=1 AND is_demo=0 LIMIT 1"
+    ) is not None
+
+
+def demo_guard(alias: str = "m") -> str:
+    """演示数据过滤片段：有真表时排除演示表，纯演示实例不过滤。"""
+    return "" if not has_real_meter() else f" AND {alias}.is_demo=0"
+
+
+def disable_demo_data() -> dict[str, int]:
+    """停用全部演示数据（切 live 时调用），返回各表停用条数。
+
+    只停用不删除：现场还需要「切回 simulate 继续演示」的能力，
+    删数据属于显式操作（scripts/clear_demo.py）。
+    """
+    counts: dict[str, int] = {}
+    # node 的启用位叫 is_active，其余实体叫 is_enabled
+    targets: tuple[tuple[str, str], ...] = (
+        ("meter", "is_enabled"), ("point", "is_enabled"),
+        ("device", "is_enabled"), ("node", "is_active"),
+    )
+    with transaction() as conn:
+        for table, flag in targets:
+            cursor = conn.execute(
+                f"UPDATE {table} SET {flag}=0 WHERE is_demo=1 AND {flag}=1"
+            )
+            counts[table] = int(cursor.rowcount or 0)
+    total: int = sum(counts.values())
+    if total:
+        log_event(
+            "warn", "api", "DEMO_DISABLED",
+            "切换到 live 模式，已自动停用演示数据："
+            + "、".join(f"{table} {count} 条" for table, count in counts.items() if count)
+            + "。如需彻底清理请执行 scripts/clear_demo.py",
+        )
+    return counts
+
+
 # 节流状态：key = code|ref_id -> 上次落库时刻（单调时钟）与期间被折叠的条数
 _log_throttle_at: dict[str, float] = {}
 _log_suppressed: dict[str, int] = {}

@@ -106,6 +106,9 @@ class DataService:
         if node_id is not None:
             conditions.append("m.node_id=?")
             params.append(int(node_id))
+        guard: str = db.demo_guard("m")
+        if guard:
+            conditions.append(guard.removeprefix(" AND "))
         sql: str = (
             "SELECT h.*, m.name AS meter_name, m.purpose, m.node_id, n.name AS node_name "
             "FROM hourly h JOIN meter m ON m.id=h.meter_id "
@@ -156,6 +159,9 @@ class DataService:
         if is_final is not None:
             conditions.append("d.is_final=?")
             params.append(int(is_final))
+        guard: str = db.demo_guard("m")
+        if guard:
+            conditions.append(guard.removeprefix(" AND "))
         sql: str = (
             "SELECT d.*, m.name AS meter_name, m.purpose, m.node_id, n.name AS node_name "
             "FROM daily d JOIN meter m ON m.id=d.meter_id "

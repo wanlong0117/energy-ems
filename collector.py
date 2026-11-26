@@ -40,6 +40,9 @@ class Collector:
     def __init__(self) -> None:
         self.tasks: dict[int, asyncio.Task[None]] = {}
         self.config_sig: str = ""
+        # device_id -> 建任务时的配置签名：签名变化说明 host/port/interval/protocol
+        # 被改过，旧任务必须重建，否则会一直连旧地址直到重启。
+        self._sigs: dict[int, str] = {}
         self.reload_event: asyncio.Event = asyncio.Event()
         # 复活退避：任务若崩溃后立即又崩（配置本身有问题），不能每秒重建一次，
         # 否则 CPU 空转 + 每秒一条日志。device_id -> 允许下次复活的时间（单调时钟）。
@@ -78,6 +81,7 @@ class Collector:
             if not task.done():
                 continue
             self.tasks.pop(device_id, None)
+            self._sigs.pop(device_id, None)
             if task.cancelled():
                 dead[device_id] = "cancelled"
                 continue
@@ -115,8 +119,20 @@ class Collector:
         self._revive_hold.pop(device_id, None)
         self._revive_delay.pop(device_id, None)
 
+    @staticmethod
+    def _device_sig(device: dict[str, Any]) -> str:
+        """设备配置签名：只包含会改变采集行为的字段。
+
+        只比「有没有这台设备」是不够的：现场改错 IP 或端口后接口照样返回保存成功，
+        采集却继续连旧地址，直到重启才生效——最难排查的一类「配置不生效」。
+        """
+        keys: tuple[str, ...] = (
+            "protocol", "host", "port", "timeout_ms", "retry", "poll_interval", "is_enabled",
+        )
+        return "|".join(f"{key}={device.get(key)}" for key in keys)
+
     def _sync_tasks(self, forced: set[int] | None = None) -> None:
-        """依据当前 device 配置快照，取消失效任务并为新增设备建任务。
+        """按当前 device 配置快照调整任务：失效的取消，新增的建，改配置的重建。
 
         forced：本次必须重建的设备（复活流程判定过，跳过退避检查）。
         """
@@ -129,11 +145,21 @@ class Collector:
         ]
         wanted: dict[int, dict[str, Any]] = {int(device["id"]): device for device in devices}
 
+        changed: list[str] = []
         for device_id, task in list(self.tasks.items()):
             if device_id not in wanted or task.done():
                 if not task.done():
                     task.cancel()  # 配置变更：旧任务会在下一个 await 处退出
                 del self.tasks[device_id]
+                self._sigs.pop(device_id, None)
+                continue
+            signature: str = self._device_sig(wanted[device_id])
+            if signature != self._sigs.get(device_id):
+                # host/port/interval/protocol 改了：旧任务手里的配置快照已过期
+                task.cancel()
+                del self.tasks[device_id]
+                self._sigs.pop(device_id, None)
+                changed.append(str(device_id))
 
         now: float = time.monotonic()
         for device_id, device in wanted.items():
@@ -144,10 +170,16 @@ class Collector:
             self.tasks[device_id] = asyncio.create_task(
                 self.poll_device(device), name=f"ems-poll-device-{device_id}"
             )
+            self._sigs[device_id] = self._device_sig(device)
+
+        if changed:
+            db.log_event(
+                "info", "collector", "COLLECTOR_HOT_RELOAD",
+                f"设备配置变更，已重建采集任务: device {', '.join(changed)}",
+            )
 
         self.config_sig = "|".join(
-            f"{device['id']}:{device.get('host')}:{device.get('port')}:{device.get('poll_interval')}"
-            for device in devices
+            f"{device['id']}:{self._device_sig(device)}" for device in devices
         )
 
     def _client_for(self, device: dict[str, Any]) -> BaseModbusClient:
@@ -457,6 +489,7 @@ class Collector:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.tasks.clear()
+        self._sigs.clear()
 
 
 collector: Collector = Collector()

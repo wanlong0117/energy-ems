@@ -7,12 +7,19 @@ weekly/monthly 为按需聚合，无需重算。
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
 import db
 from aggregation import aggregator
-from settings import QUALITY_MANUAL, SECONDS_PER_DAY, SECONDS_PER_HOUR, day_floor
+from settings import (
+    MANUAL_MAX_ABS_VALUE,
+    QUALITY_MANUAL,
+    SECONDS_PER_DAY,
+    SECONDS_PER_HOUR,
+    day_floor,
+)
 
 
 class ManualService:
@@ -21,6 +28,9 @@ class ManualService:
     # 补录窗口：只允许最近 90 天至当前时间后 5 分钟，避免凭空生成 1970 或未来日期的汇总
     MAX_LOOKBACK_DAYS: int = 90
     MAX_FUTURE_SEC: int = 300
+    # 单条读数的绝对上限：超过 1e9（kWh 口径下是十亿度）不可能是真实抄见值，
+    # 而这类值会在 ×1e6 转毫度时超出 SQLite INTEGER 范围，把整轮汇总打断。
+    MAX_ABS_VALUE: float = MANUAL_MAX_ABS_VALUE
 
     def _check_ts(self, ts: int) -> int:
         """校验时间戳落在允许区间内，返回规范化后的整数秒。"""
@@ -34,21 +44,49 @@ class ManualService:
             raise ValueError("ts 不得晚于当前时间 5 分钟以上")
         return ts
 
+    def _check_value(self, value: Any, point: dict[str, Any]) -> float:
+        """校验读数：必须有限、在绝对上限内、并落在点位配置的量程里。
+
+        校验放在服务层而不是只放在请求模型上：脚本、运维钩子也会直接调用
+        record()，模型层的约束到不了这些入口。旧实现放行 1e20 后，
+        rollup_hour 在 int(value*1e6) 处抛 OverflowError，异常冒到轮询循环外，
+        排在它后面的表整轮停止更新，而小时任务每 5 分钟重试一次，等于每 5 分钟
+        重复失败一次。
+        """
+        try:
+            number: float = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("value 必须为数值") from exc
+        if not math.isfinite(number):
+            raise ValueError("value 必须为有限数值（不接受 inf/nan）")
+        if abs(number) > self.MAX_ABS_VALUE:
+            raise ValueError(
+                f"value 超出合理范围（|value| ≤ {self.MAX_ABS_VALUE:g}），请核对单位与小数点"
+            )
+        min_val: Any = point.get("min_val")
+        max_val: Any = point.get("max_val")
+        if min_val is not None and number < float(min_val):
+            raise ValueError(f"value={number} 低于点位下限 {float(min_val):g}")
+        if max_val is not None and number > float(max_val):
+            raise ValueError(f"value={number} 高于点位上限 {float(max_val):g}")
+        return number
+
     def record(self, body: dict[str, Any]) -> dict[str, Any]:
         """录入一条人工读数，返回写入结果与是否覆盖。"""
         point_id: int = int(body.get("point_id", 0))
         ts: int = self._check_ts(int(body.get("ts", 0)))
-        value: float = float(body.get("value", 0.0))
         operator: str = str(body.get("operator") or "").strip()
         remark: str | None = body.get("remark")
 
-        point = db.query_one(
-            "SELECT p.id, p.name, p.unit, d.protocol AS protocol "
+        point_row = db.query_one(
+            "SELECT p.id, p.name, p.unit, p.min_val, p.max_val, d.protocol AS protocol "
             "FROM point p JOIN device d ON d.id=p.device_id WHERE p.id=?",
             (point_id,),
         )
-        if point is None:
+        if point_row is None:
             raise LookupError(f"点位 {point_id} 不存在")
+        point: dict[str, Any] = dict(point_row)
+        value: float = self._check_value(body.get("value", 0.0), point)
 
         row: dict[str, Any] = {
             "point_id": point_id,
@@ -137,26 +175,49 @@ class ManualService:
             return overwritten
 
     def recompute(self, ts: int) -> None:
-        """回填受影响小时与当日汇总；当日原 is_final 状态保留。
+        """回填受影响小时与日汇总；当日原 is_final 状态保留。
+
+        小时窗口是**左开右闭** `(hour_start, hour_end]`，所以「受影响的小时」不止
+        ts 所在的那个：
+
+          · ts 正好落在整点 —— 这条值属于**上一小时**的收口（上一小时 delta 变了）；
+          · ts 落在某小时内 —— 本小时 delta 变了；若该值是本小时最后一条，
+            下一小时的基准也跟着变，所以要连下一小时一起重算。
+
+        旧实现只重算当前小时、只结算当前日，操作员用 00:00/08:00 这类整点补录时
+        上一小时与上一日会静默错账（实测应 10 kWh 仍显示 2 kWh），因此这里
+        按小时集合与所属日集合分别重算，并把未来的小时排除在外。
 
         操作员对历史数据的明确修正不再受自动结算的覆盖率门槛约束，
         因此传 enforce_coverage=False，保持原 is_final 语义。
         """
         ts = int(ts)
+        now: int = int(time.time())
         hour_start: int = (ts // SECONDS_PER_HOUR) * SECONDS_PER_HOUR
-        day_start: int = day_floor(ts)
-        aggregator.rollup_hour(hour_start)
+        hours: set[int] = {hour_start}
+        if hour_start == ts:
+            hours.add(hour_start - SECONDS_PER_HOUR)  # 整点补录改写的是上一小时收口
+        next_hour: int = hour_start + SECONDS_PER_HOUR
+        if next_hour <= now:
+            hours.add(next_hour)  # 下一小时的基准可能变成这条值
+        ordered: list[int] = sorted(hours)
+        for hour in ordered:
+            aggregator.rollup_hour(hour)
+        for day_start in sorted({day_floor(hour) for hour in ordered}):
+            aggregator.settle_day(
+                day_start, is_final=self._day_final(day_start), enforce_coverage=False
+            )
 
+    @staticmethod
+    def _day_final(day_start: int) -> int:
+        """沿用该日原有结算状态；没有日报时，历史日按已结算、当日按未结算。"""
         current = db.query_one(
             "SELECT is_final FROM daily WHERE day_start=? ORDER BY is_final DESC LIMIT 1",
             (day_start,),
         )
         if current is not None:
-            is_final: int = int(current["is_final"])
-        else:
-            today_start: int = day_floor(time.time())
-            is_final = 0 if day_start == today_start else 1
-        aggregator.settle_day(day_start, is_final=is_final, enforce_coverage=False)
+            return int(current["is_final"])
+        return 0 if day_start == day_floor(time.time()) else 1
 
     def list(self, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """最近录入列表（point_id / limit 过滤）。"""

@@ -20,10 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Setup Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
           cache: pip
@@ -41,15 +41,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ["3.11", "3.12"]
+        # macOS 也跑：README 徽章宣称 Windows/Linux/macOS，开发机是 3.13，
+        # 不能让「宣称支持」变成没人验证过的承诺。
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Setup Python ${{ matrix.python }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -63,6 +65,7 @@ jobs:
           python -m pip install -r requirements-dev.txt
 
       - name: Run tests
+        # 覆盖率门槛那条腿已含全量用例，其余腿不重复跑
         if: matrix.os != 'ubuntu-latest' || matrix.python != '3.12'
         env:
           PYTHONUTF8: "1"

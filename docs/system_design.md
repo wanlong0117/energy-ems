@@ -105,7 +105,7 @@ classDiagram
         +float min_val
         +float max_val
         +str unit
-        +str point_role
+        +int is_demo
         +int is_enabled
     }
     class EnergyCategory {
@@ -120,7 +120,7 @@ classDiagram
         +int category_id
         +str purpose
         +int is_counted
-        +int daily_8am
+        +int is_demo
         +int is_enabled
     }
     class MeterPoint {
@@ -155,6 +155,7 @@ classDiagram
         +float peak_power
         +float avg_power
         +int cost_cent
+        +int covered_hours
         +int is_final
     }
     class Tariff {
@@ -526,6 +527,8 @@ sequenceDiagram
 - **小时电量取窗（关键）**：累计电量点用**左开右闭**区间 `(hour_start, hour_end]`——`base = ts <= hour_start` 的最后一条、`end = hour_start < ts <= hour_end` 的最后一条。相邻小时首尾相接，24 小时合计严格等于首末日读数差。**不要**改成 `[hour_start, hour_end)`：整点读数只被下一小时当基准，本小时收口取不到，每小时固定少计一个采样间隔（300s 约 8.3%）。功率点与 `sample_cnt` 仍用 `[hour_start, hour_end)`，因为瞬时值归入本小时的采样。窗口内没有任何有效读数时**不产出** `hourly` 行（掉线不能记成 0 电量）。
 - **结算定稿门槛**：表覆盖（有数据的表数 / 应结算表数 ≥ 90%）决定整日，小时覆盖（该表当日有数据的小时数 / 24 ≥ 90%）**逐表**决定；不达标的表单独 `is_final=0` 并记 `SETTLE_METER_INCOMPLETE`。不要用全局小时并集判定——那拦不住「99 块表满、1 块只有 1 小时」。
 - **点位校验（硬性）**：`reg_offset` ∈ [0,65535]；`reg_count` ∈ [1,125]；`data_type`↔`reg_count` = u16/s16:1、u32/s32/f32:2、u64:4；`func_code` ∈ {3,4}；`byte_order` ∈ {ABCD,CDAB,BADC,DCBA}；同 device + 同 slave + 同 func 的 `[reg_offset, reg_offset+reg_count)` 区间不得与已有记录重叠（更新时排除自身 id）。
+- **演示数据隔离（关键）**：`node`/`device`/`point`/`meter` 带 `is_demo` 标记。只要存在一块「真实且启用」的表（`is_enabled=1 AND is_counted=1 AND is_demo=0`），所有汇总与查询都要经 `db.demo_guard()` 追加 `AND is_demo=0`；否则演示表会被计入覆盖率分母，把真表当天的定稿率从 100% 压到 1/101。切 live 时启动阶段调 `db.disable_demo_data()` 停用演示实体而不是删除——现场需要能回看演示库长什么样。
+- **手工补录的重算范围**：补录落在整点（`ts == hour_start`）时必须连带重算**上一小时**——左开右闭窗口下，整点读数同时是上一小时的收口基准；同时重算所属日的日报。只写新行不改旧行，就是「补录成功了但报表没动」的经典事故。
 - **quality**：0=正常、1=超时、2=越界（超出 min/max）、3=人工。
 - **单一连接**：`db.py` 全局连接、`check_same_thread=False`；所有 DB 调用同步短事务，`execute()` 内 commit，避免在 `await` 间持有游标。
 - **寄存器合并**：同 (device, slave, func) 按 offset 排序，相邻/重叠合并为单次请求，单次 `reg_count ≤ 125`，超限拆分。

@@ -11,7 +11,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 import db
-from settings import BYTE_ORDERS, DATA_MODES, PROTOCOLS, PURPOSES, TYPE_COUNT
+from settings import (
+    BYTE_ORDERS,
+    DATA_MODES,
+    MANUAL_MAX_ABS_VALUE,
+    PROTOCOLS,
+    PURPOSES,
+    TYPE_COUNT,
+)
 
 
 def ok(data: Any = None) -> dict[str, Any]:
@@ -209,7 +216,6 @@ class PointIn(_BaseIn):
     min_val: float | None = None
     max_val: float | None = None
     unit: str | None = None
-    point_role: str = "energy"
     is_enabled: int = 1
     remark: str | None = None
 
@@ -254,17 +260,37 @@ class PointIn(_BaseIn):
 
 
 class EnergyCategoryIn(_BaseIn):
+    """能源分类请求模型。
+
+    v0.1.4 起只接受电（kWh）：聚合、电价与报表都按「累计电量 kWh」口径实现，
+    水表/气表接进来会被标成 kWh 并按电价计费，比不支持更危险。
+    """
+
     name: str
     unit: str
 
+    @field_validator("unit")
+    @classmethod
+    def _unit(cls, value: str) -> str:
+        unit: str = str(value).strip()
+        if unit != "kWh":
+            raise ValueError("当前版本仅支持电（unit=kWh）；水/气计量需等按分类换算的口径实现")
+        return unit
+
 
 class MeterIn(_BaseIn):
+    """计量表请求模型。
+
+    daily_8am 已于 v0.1.4 废弃：日切点是全局配置（EMS_DAY_START_HOUR），
+    按表设置从未被聚合读取，留着只会让现场以为「这块表单独按 08:00 结算」。
+    数据库列保留用于兼容旧库，但接口不再接受该字段。
+    """
+
     name: str
     node_id: int
     category_id: int
     purpose: str = "total"
     is_counted: int = 1
-    daily_8am: int = 1
     is_enabled: int = 1
     remark: str | None = None
 
@@ -346,9 +372,14 @@ class ManualIn(_BaseIn):
     def _value(cls, value: float) -> float:
         import math
 
-        if not math.isfinite(float(value)):
-            raise ValueError("value 必须为有限数值")
-        return float(value)
+        number: float = float(value)
+        if not math.isfinite(number):
+            raise ValueError("value 必须为有限数值（不接受 inf/nan）")
+        if abs(number) > MANUAL_MAX_ABS_VALUE:
+            raise ValueError(
+                f"value 超出合理范围（|value| ≤ {MANUAL_MAX_ABS_VALUE:g}），请核对单位与小数点"
+            )
+        return number
 
 
 class ReportQueryIn(_BaseIn):

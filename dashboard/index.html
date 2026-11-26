@@ -264,7 +264,7 @@
     </nav>
     <div class="sidebar-foot">
       <div class="mode-row"><span class="status-dot"></span><span id="modeBadge" class="badge">simulate</span></div>
-      <div class="ver">v0.1.3 · MIT</div>
+      <div class="ver" id="appVer">v0.1.4 · MIT</div>
     </div>
   </aside>
   <div class="shell">
@@ -836,13 +836,13 @@ const RESOURCES = ["node", "device", "point", "energy_category", "meter", "meter
 const FIELDS = {
   node: ["name", "parent_id", "kind", "sort_order", "is_active", "remark"],
   device: ["name", "node_id", "protocol", "host", "port", "timeout_ms", "retry", "poll_interval", "is_enabled", "remark"],
-  point: ["name", "device_id", "slave_id", "func_code", "reg_offset", "reg_count", "data_type", "byte_order", "scale", "offset_const", "min_val", "max_val", "unit", "point_role", "is_enabled", "remark"],
+  point: ["name", "device_id", "slave_id", "func_code", "reg_offset", "reg_count", "data_type", "byte_order", "scale", "offset_const", "min_val", "max_val", "unit", "is_enabled", "remark"],
   energy_category: ["name", "unit"],
-  meter: ["name", "node_id", "category_id", "purpose", "is_counted", "daily_8am", "is_enabled", "remark"],
+  meter: ["name", "node_id", "category_id", "purpose", "is_counted", "is_enabled", "remark"],
   meter_point: ["meter_id", "point_id", "role"],
   tariff: ["name", "price_cent", "start_hour", "end_hour", "is_default"]
 };
-const INT_FIELDS = new Set(["parent_id", "node_id", "category_id", "meter_id", "point_id", "port", "timeout_ms", "retry", "poll_interval", "slave_id", "func_code", "reg_offset", "reg_count", "sort_order", "is_active", "is_enabled", "is_counted", "daily_8am", "price_cent", "start_hour", "end_hour", "is_default"]);
+const INT_FIELDS = new Set(["parent_id", "node_id", "category_id", "meter_id", "point_id", "port", "timeout_ms", "retry", "poll_interval", "slave_id", "func_code", "reg_offset", "reg_count", "sort_order", "is_active", "is_enabled", "is_counted", "price_cent", "start_hour", "end_hour", "is_default"]);
 const FLOAT_FIELDS = new Set(["scale", "offset_const", "min_val", "max_val"]);
 function selectOptions(field) {
   const map = {
@@ -850,7 +850,6 @@ function selectOptions(field) {
     kind: ["area", "line", "room", "device_area"],
     data_type: ["u16", "s16", "u32", "s32", "f32", "u64"],
     byte_order: ["ABCD", "CDAB", "BADC", "DCBA"],
-    point_role: ["energy", "power", "status", "other"],
     purpose: ["total", "production", "hvac", "lighting", "other"],
     role: ["reading", "power"]
   };
@@ -1114,6 +1113,12 @@ function bind() {
   $("evRefresh").onclick = loadEvents;
 }
 async function init() {
+  // 侧栏版本号取自后端 /healthz，避免每次发版都改前端静态文案（改漏就是文档漂移）
+  try {
+    const response = await fetch("/healthz");
+    const info = await response.json().catch(() => null);
+    if (info && info.version) $("appVer").textContent = "v" + info.version + " · MIT";
+  } catch (e) { /* 探活失败不阻断页面 */ }
   try {
     await loadFilters();
   } catch (e) { /* 未登录时静默，登录后再加载 */ }

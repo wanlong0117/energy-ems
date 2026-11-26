@@ -10,6 +10,8 @@ energy_ems/
 ├── dashboard/            # 已内嵌单文件看板（无需单独放置）
 ├── build_win11.bat       # 备用启动脚本（主启动双击 energy_ems.exe）
 ├── README_DEPLOY.md      # 本说明
+├── licenses/             # LICENSE（MIT）与 THIRD_PARTY_NOTICES.md，随包分发不可删除
+├── scripts/              # backup.py / recompute.py / clear_demo.py
 ├── config.json           # 首次运行自动生成（可写，exe 同级）
 └── energy.db             # 首次运行自动生成（可写，exe 同级）
 ```
@@ -20,11 +22,15 @@ energy_ems/
 
 ## 2. 启动
 
-1. 解压 `energy-ems-win11-x64-<YYYYMMDD>.zip` 到任意目录（建议非中文路径、非 C:\Program Files，
-   避免权限问题）。
+1. 解压 `energy-ems-v0.1.4-win11-x64.zip` 到任意目录（建议非中文路径、非 `C:\Program Files`，
+   避免权限问题）。资产文件名带版本号，同一天的多个补丁包不会再同名。
 2. **双击 `energy_ems.exe`** 启动（`build_win11.bat` 为可选备用脚本）。
 3. 打开浏览器访问 `http://127.0.0.1:8000/`，即可看到单文件看板。
 4. 默认密码 `ems2026`（见 config.json 的 `password`，可自行修改后重启）。
+
+> **默认只监听本机**（127.0.0.1）。需要用手机或其他电脑访问时，先设置环境变量
+> `EMS_ALLOW_LAN=1` 再启动（等价于 `EMS_HOST=0.0.0.0`），并务必先改掉默认密码——
+> 默认口令是公开的，直接监听局域网等于让同网段任何人都能抢先登录改密、把管理员锁在外面。
 
 > 注意：首次启动为 **simulate** 模式，内置模拟器会预置 100 电表 + 5 组冷却塔电极 +
 > 5 个机械排水量手动点，并按 5 分钟间隔向真实 SQLite 写读数；看板与报表立即可用。
@@ -38,8 +44,15 @@ energy_ems/
 
 切换后**必须重启服务**（接口返回 `restart_required=true`）：
 
-- `simulate`：启动内置模拟器（不启动 Modbus 采集器），额外每 10 分钟做一次小时/日汇总；
-- `live`：只启动 Modbus 采集器（不启动模拟器），由真实设备写入读数。
+- `simulate`：启动内置模拟器（不启动 Modbus 采集器），额外每 10 分钟做一次小时/日汇总，
+  并从旧库恢复此前被 live 停用过的演示数据；
+- `live`：只启动 Modbus 采集器与小时汇总（不启动模拟器），由真实设备写入读数；
+  **启动时会自动停用全部演示数据**（`is_demo=1` 的表/点位/设备），
+  日结算覆盖率只按真实表计算，不会再被 100 块模拟表拖成「未结算」。
+
+> 演示数据只是停用、没有删除。确认不再需要演示时执行一次
+> `python scripts\clear_demo.py --db energy.db --dry-run` 看影响面，
+> 再去掉 `--dry-run` 清理历史读数与旧日报。
 
 两种模式互斥，共用同一套 API / 看板 / 报表，无需维护假数据分支。
 常用可调字段（config.json）：
@@ -87,7 +100,7 @@ energy_ems/
   ```
 
 - 旧版本库升级：直接替换程序，启动会自动执行 `schema.sql` 与 `migrations.py` 的版本化迁移
-  （补齐新增列/索引），13 张业务表数据全部保留；迁移记录见 `schema_version` 表。
+  （补齐新增列/索引、实体主键改自增），13 张业务表数据全部保留；迁移记录见 `schema_version` 表。
 
 - **v0.1.3 升级后必须重算历史**（重要）：本版修正了小时电量的取窗方式，旧库里
   `hourly` / `daily` 的数字是在「整点读数丢一个采样间隔」的旧口径下算出来的，
@@ -117,8 +130,12 @@ A：包内 `_internal/` 已内置 `VCRUNTIME140.dll`，Win11 通常无需另装 
 请先确认 zip 已完整解压（`energy_ems.exe` 与 `_internal/` 同级），并检查 Windows Defender
 是否误删了 exe（可加白名单后重新解压）。如仍报错，查看黑框里的具体缺失模块名。
 
+**Q：手机或另一台电脑打不开看板**
+A：默认只监听 127.0.0.1 是刻意的安全默认。确认已改掉默认密码后，用
+`set EMS_ALLOW_LAN=1` 再启动 exe；随后在手机浏览器访问 `http://<本机IP>:8000/`。
+
 **Q：端口 8000 被占用**
-A：exe 版端口固定为 8000，先关闭占用它的程序（在 exe 目录打开 cmd 运行
+A：exe 版端口默认 8000（可用 `EMS_PORT` 覆盖），先关闭占用它的程序（在 exe 目录打开 cmd 运行
 `netstat -ano | findstr :8000`，再按 PID 结束进程）。若必须使用其他端口，
 可用 Windows 端口转发：`netsh interface portproxy add v4tov4 listenport=8080 connectport=8000 connectaddress=127.0.0.1`。
 
@@ -139,4 +156,5 @@ python -m venv .venv
 ```
 
 macOS 不交叉产 exe；Windows 安装包仅由 GitHub Actions 的 `windows-latest` runner 产出，
-在 Actions 页面下载 `energy-ems-win11-x64-<YYYYMMDD>.zip` artifact 即可。
+在 Actions 页面下载 `energy-ems-v0.1.4-win11-x64.zip` artifact 即可；
+同名 `.sha256` 文件里有校验值，用 `certutil -hashfile <zip> SHA256` 对比。

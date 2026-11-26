@@ -43,7 +43,7 @@ def test_record_writes_manual_reading_reading_and_latest_in_one_txn(ready_db):
     point_id = _manual_point()
     result = manual_service.record({
         "point_id": point_id, "ts": DAY, "value": 12.5,
-        "operator": "强哥", "remark": "首录",
+        "operator": "operator-1", "remark": "首录",
     })
 
     assert result["overwritten"] is False
@@ -103,7 +103,7 @@ def test_historical_backfill_recomputes_daily_and_keeps_is_final(ready_db):
     # 同小时补录更高的累计读数（quality=3），应被 rollup 采用
     manual_service.record({
         "point_id": reading_point, "ts": DAY + 2700, "value": 115.0,
-        "operator": "强哥", "remark": "补录",
+        "operator": "operator-1", "remark": "补录",
     })
 
     hourly = db.query_one("SELECT energy_wh FROM hourly WHERE meter_id=? AND hour_start=?",

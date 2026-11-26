@@ -17,7 +17,7 @@
 | 现状 | 已有 P0 骨架：`schema.sql`（12 表）、`db.py`、`auth.py`、`requirements.txt` |
 | 本轮范围 | **Phase 0~3**（数据采进来、配起来、算出来）；Phase 4~6 后置 |
 
-**原始需求复述**：强哥工厂内网部署的 MyEMS 6.10.0 实际仅用到不到 5% 功能，现场实测确认自研只做这 5%——用单进程 + 单 SQLite 文件 + 一个网页，实现 Modbus TCP 采集、点位配置与试读、08:00 口径小时/日汇总与电费、按用途分栋拆分、CSV 导出与看板展示；砍掉碳排、计费系统、预测、FDD、工单、储能/微电网/光伏等全部非必需模块。
+**原始需求复述**：现场工厂内网部署的 MyEMS 6.10.0 实际仅用到不到 5% 功能，现场实测确认自研只做这 5%——用单进程 + 单 SQLite 文件 + 一个网页，实现 Modbus TCP 采集、点位配置与试读、08:00 口径小时/日汇总与电费、按用途分栋拆分、CSV 导出与看板展示；砍掉碳排、计费系统、预测、FDD、工单、储能/微电网/光伏等全部非必需模块。
 
 ## 二、产品定义
 
@@ -29,7 +29,7 @@
 
 ### 2.2 用户故事
 
-1. As a 工厂运维（强哥），I want 单进程单库部署且 Windows 重启后自动拉起，so that 不再维护 MyEMS 的多服务多库，备份只需复制一个 `.db` 文件。
+1. As a 现场运维，I want 单进程单库部署且 Windows 重启后自动拉起，so that 不再维护 MyEMS 的多服务多库，备份只需复制一个 `.db` 文件。
 2. As a 工厂运维，I want 系统自写客户端经 Modbus TCP 从两台 E90 网关读表并断网重连，so that 数据连续完整且不引入 pymodbus 等重依赖。
 3. As a 工厂运维，I want 在网页表单里配置设备/点位参数并一键试读，so that 接入新电表不用改 MyEMS 的 JSON 或写代码。
 4. As a 工厂管理者，I want 按 08:00 结算口径查看分栋/按用途的日能耗与电费，so that 与 MyEMS 对账偏差控制在 0.5% 以内。
@@ -89,8 +89,8 @@
 | 页面 | 关键字段 | 操作 |
 |---|---|---|
 | 设备管理 `device` | name / protocol(modbus_tcp\|modbus_rtu_tcp) / host / port(默认 8886) / timeout_ms / retry / poll_interval / is_enabled | 增改查、启停、连接测试；预置网关 192.0.2.11:8886、192.0.2.21:8886 |
-| 点位管理 `point` | name / device_id / slave_id / func_code(3\|4) / reg_offset / reg_count / data_type(u16\|s16\|u32\|s32\|f32\|u64) / byte_order(ABCD\|CDAB\|BADC\|DCBA) / scale / offset_const / min_val / max_val / unit / point_role / is_enabled | 增改查；**试读按钮** → 展示原始寄存器（十六进制）+ 按配置解析值 |
-| 计量表管理 `meter` | name / node_id / category_id / purpose / is_counted / daily_8am / is_enabled | 增改查；关联 `meter_point`（选 point + role=reading\|power） |
+| 点位管理 `point` | name / device_id / slave_id / func_code(3\|4) / reg_offset / reg_count / data_type(u16\|s16\|u32\|s32\|f32\|u64) / byte_order(ABCD\|CDAB\|BADC\|DCBA) / scale / offset_const / min_val / max_val / unit / is_enabled | 增改查；**试读按钮** → 展示原始寄存器（十六进制）+ 按配置解析值 |
+| 计量表管理 `meter` | name / node_id / category_id / purpose / is_counted / is_enabled | 增改查；关联 `meter_point`（选 point + role=reading\|power） |
 | 节点 / 电价 `node`/`tariff` | 节点树增删改；tariff: name / price_cent / start_hour / end_hour / is_default | 树形维护、默认电价设定 |
 
 #### 看板（后置 Phase4，单文件 HTML + 原生 JS，数据全部来自真实 API）
