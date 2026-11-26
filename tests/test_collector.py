@@ -138,8 +138,9 @@ def test_poll_device_logs_failure_and_out_of_range(isolated_db):
         device = dict(db.query_one("SELECT * FROM device WHERE id=?", (device_id,)))
         task = asyncio.create_task(collector.poll_device(device))
         try:
+            # 连接被拒绝在不同平台会呈现为 READ_FAIL 或 READ_TIMEOUT，两者都算「失败留痕」
             assert await wait_until(lambda: db.query_one(
-                "SELECT 1 FROM event_log WHERE code='READ_FAIL'"
+                "SELECT 1 FROM event_log WHERE code IN ('READ_FAIL','READ_TIMEOUT')"
             ) is not None)
         finally:
             task.cancel()
