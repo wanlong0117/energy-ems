@@ -229,4 +229,4 @@ HTTP_PORT: int = _env_int("EMS_PORT", 8000)
 
 # ---------- 版本 ----------
 # 单一事实源：FastAPI 元信息、/healthz、看板侧栏都读它，避免三处各写一个版本号
-APP_VERSION: str = "0.1.6"
+APP_VERSION: str = "0.1.7"

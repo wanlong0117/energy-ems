@@ -2,6 +2,30 @@
 
 本项目遵循 [语义化版本](https://semver.org/spec/v2.0.0/lang/zh-CN/)。
 
+## [0.1.7] - 2026-11-26
+
+**只修发布资产的校验文件：`.sha256` 由 CRLF 改纯 LF。程序功能与 0.1.6 完全一致
+（除版本号），已部署 0.1.6 的现场不必升级。** 测试 237 → 238 项，覆盖率 88.36%。
+
+### 修复
+
+- **`.sha256` 行尾为 CRLF，让校验命令误报包损坏**：构建用
+  `"$hash  $zip" | Set-Content ...` 生成，Windows 上默认追加 CRLF。
+  `sha256sum -c` / `shasum -c` 会把行尾的 `\r` 当成文件名的一部分，去找一个叫
+  `energy-ems-v0.1.6-win11-x64.zip\r` 的文件，报 `FAILED open or read`。
+  哈希值本身一直是对的，纯属误导用户以为下载损坏。改用
+  `[IO.File]::WriteAllText` + `UTF8Encoding($false)`：不做行尾转换、不写 BOM。
+- **构建内加字节自检**：写成 CRLF 时 `WriteAllText` 同样不会报错、步骤照样绿，
+  所以紧接着 `ReadAllBytes` 回读，命中 CR(13) 就 `throw`。把「步骤没报错」
+  升级成「字节确实干净」。
+- **新增测试** `test_checksum_file_uses_lf_endings`：锁死四条契约（显式 `` `n ``、
+  用 `WriteAllText`、不得用 `Set-Content "$zip.sha256"`、必须有 CR 自检）。
+
+### 说明
+
+Windows 用户按部署文档用 `certutil -hashfile` 校验，0.1.6 起就没受影响；
+本版只是让 macOS / Linux 侧的 `sha256sum -c` 也能直接用。
+
 ## [0.1.6] - 2026-11-26
 
 **修复 0.1.5 覆盖率门槛的分子分母不同源：停机小时只从分母剔除、却仍算作
