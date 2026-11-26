@@ -164,7 +164,7 @@ energy-ems/
 
 ```bash
 .venv/bin/python -m pytest -q
-# 136 passed
+# 137 passed
 ```
 
 覆盖：Modbus 帧解析（含 CRC16/字节序）、聚合口径、周/月报表、Excel/PDF 结构、

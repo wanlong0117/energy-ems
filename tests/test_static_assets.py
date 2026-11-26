@@ -92,6 +92,23 @@ def test_github_actions_produces_win11_artifact(isolated_db):
     assert "artifact" in yml.lower()
 
 
+def test_release_step_is_tag_gated_and_uses_ref_name(isolated_db):
+    """Arrange/Act: 读取 workflow 原文。Assert: release 仅由 v* tag 门控、版本号取自 ref_name、无硬编码版本。"""
+    # Arrange：以 utf-8 读入 workflow 全文
+    yml = (SRC_ROOT / ".github" / "workflows" / "build-windows.yml").read_text(encoding="utf-8")
+
+    # Act & Assert：锁死四点契约，防止修复被回退
+    # 1) step 级门控：只有打 v* tag 才发布，push 主干只产出 artifact
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in yml, "release 必须由 v* tag 门控"
+    # 2) 版本号取自触发本次运行的 tag，不再硬编码
+    assert "tag_name: ${{ github.ref_name }}" in yml, "tag_name 必须取 github.ref_name"
+    # 3) 不得存在硬编码版本串（任一旧版本回退都要被拦下）
+    assert "v0.1.0" not in yml, "workflow 不得硬编码 v0.1.0"
+    assert "v1.0.0" not in yml, "workflow 不得硬编码 v1.0.0"
+    # 4) 同一 tag 重跑时可覆盖已有 asset，避免发布失败
+    assert "overwrite_files: true" in yml, "需允许覆盖同名 release asset"
+
+
 def test_readme_deploy_covers_mode_switch_backup_vcredist(isolated_db):
     """Arrange/Act: 读取部署说明。Assert: 覆盖启动/模式切换/备份/VC++ 运行库。"""
     readme = (SRC_ROOT / "README_DEPLOY.md").read_text(encoding="utf-8")
