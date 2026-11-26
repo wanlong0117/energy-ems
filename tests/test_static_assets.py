@@ -114,6 +114,8 @@ def test_checksum_file_uses_lf_endings(isolated_db):
     assert "$hash  $zip`n" in yml, "校验值必须显式写 LF 行尾"
     assert "WriteAllText" in yml, "需用 WriteAllText 控制行尾，避免平台默认 CRLF"
     assert 'Set-Content "$zip.sha256"' not in yml, "Set-Content 在 Windows 上会写成 CRLF"
+    # 还要有运行时自检：写成 CRLF 时 WriteAllText 不会报错，只有回读字节才能发现
+    assert "ReadAllBytes" in yml and "-contains 13" in yml, "必须有 CR 自检，否则 CRLF 会静默通过"
 
 
 def test_release_step_is_tag_gated_and_uses_ref_name(isolated_db):

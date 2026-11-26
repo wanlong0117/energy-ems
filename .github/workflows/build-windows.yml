@@ -87,6 +87,10 @@ jobs:
             "$hash  $zip`n",
             (New-Object System.Text.UTF8Encoding($false))
           )
+          # 自检：生成物里不得出现 CR(13)，否则下游 sha256sum -c 一定失败。
+          # 别只靠"步骤没报错"判断——写成 CRLF 时 WriteAllText 同样不会报错。
+          $bytes = [System.IO.File]::ReadAllBytes((Join-Path (Get-Location) "$zip.sha256"))
+          if ($bytes -contains 13) { throw "$zip.sha256 含 CR，必须为纯 LF 行尾" }
           "zip=$zip" >> $env:GITHUB_OUTPUT
           "sha=$hash" >> $env:GITHUB_OUTPUT
 
