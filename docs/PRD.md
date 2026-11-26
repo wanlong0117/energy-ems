@@ -13,7 +13,7 @@
 | 架构约束 | 单进程、单个 SQLite 文件、一个网页；替代 MyEMS 6 进程 + 13 库 + 166 表 |
 | 明确排除 | Vite/React/MUI/Tailwind、Docker、微服务、ORM、Redis/MQ、用户角色权限 |
 | 认证 | 一个固定密码 + session cookie（httponly，无角色） |
-| 现场环境 | Windows；采集机 192.0.2.50；E90 双通道网关 192.0.2.11:8886、192.0.2.21:8886（Modbus TCP） |
+| 现场环境 | Windows；采集机 192.0.2.50；E90 双通道网关 192.0.2.11:8886、192.0.2.21:8886（Modbus TCP）。示例地址取自 RFC 5737 文档专用网段，非真实 IP |
 | 现状 | 已有 P0 骨架：`schema.sql`（12 表）、`db.py`、`auth.py`、`requirements.txt` |
 | 本轮范围 | **Phase 0~3**（数据采进来、配起来、算出来）；Phase 4~6 后置 |
 
