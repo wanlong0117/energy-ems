@@ -5,7 +5,7 @@
 ## [0.1.4] - 2026-11-26
 
 **复审加固：一个阻断级 + 六个高优先级 + 六个中优先级问题全修。**
-测试 188 → 218 项，覆盖率 88.30%。本版不改计量口径，**无需重算历史**，但升级前请备份数据库
+测试 188 → 219 项，覆盖率 88.30%。本版不改计量口径，**无需重算历史**，但升级前请备份数据库
 （含一次实体表重建迁移）。
 
 > ⚠️ **升级必读（两处行为变化）**
@@ -73,7 +73,11 @@
 - **构建脚本适配 Windows 控制台**：`scripts/*.py` 统一把 stdout/stderr 定为 UTF-8，
   构建 job 加 `PYTHONUTF8=1`。v0.1.4 首次构建就挂在「生成 exe 版本资源」——控制台
   是 cp1252，`print` 一句中文直接 `UnicodeEncodeError`，而本地 UTF-8 环境复现不出来；
-  已补 `tests/test_release_scripts.py` 用 `PYTHONIOENCODING=cp1252` 显式回放这一环境。
+  已补 `tests/test_release_scripts.py` 用 `PYTHONIOENCODING=cp1252` 显式回放这一环境；
+- **发布包校验适配 PyInstaller 6 的 onedir 布局**：资源在 `_internal/` 下（实测 v0.1.3
+  的 zip：`energy_ems.exe` 在根、`schema.sql` 与 `dashboard/index.html` 在 `_internal/`），
+  校验改为按路径结尾匹配；顺带发现旧包里**没有任何顶层许可文本**，只有依赖自带的
+  `*.dist-info/licenses/LICENSE`，因此 `licenses/LICENSE` 这条只认我们自己的顶层目录。
 
 ## [0.1.3] - 2026-11-26
 

@@ -144,6 +144,60 @@ def test_workflow_actions_are_pinned_to_commit_sha(isolated_db):
             assert match.group(3), f"{path.name}:{lineno} 缺少 `# vX` 注释，后续无法判断版本: {stripped}"
 
 
+def test_package_verifier_handles_pyinstaller_onedir_layout(isolated_db):
+    """发布包清单校验必须认 PyInstaller 6 的 onedir 布局（数据文件在 `_internal/`）。
+
+    实测 v0.1.3 的 zip：`energy_ems.exe` 在根，而 `schema.sql`、`dashboard/index.html`
+    在 `_internal/` 下。此前校验写死根路径，第一次跑就必然失败。
+    同时确认依赖自带的 `*.dist-info/licenses/LICENSE` 不能冒充我们的 MIT 许可。
+    """
+    import re as _re
+
+    yml = (SRC_ROOT / ".github" / "workflows" / "build-windows.yml").read_text(encoding="utf-8")
+    block = yml.split("$required = @(", 1)[1].split(")", 1)[0]
+    patterns = _re.findall(r"'([^']+)'", block)
+    assert patterns, "校验步骤必须列出必需条目"
+
+    def missing(entries: list[str]) -> list[str]:
+        return [
+            pattern for pattern in patterns
+            if not any(_re.search(pattern, entry) for entry in entries)
+        ]
+
+    # PyInstaller 6 onedir：exe 在根，资源在 _internal/
+    onedir_new = [
+        "energy_ems.exe",
+        "_internal/schema.sql",
+        "_internal/dashboard/index.html",
+        "licenses/LICENSE",
+        "licenses/THIRD_PARTY_NOTICES.md",
+        "build_win11.bat",
+    ]
+    assert missing(onedir_new) == [], f"onedir 布局应全部通过：{missing(onedir_new)}"
+
+    # 老布局（资源平铺在根）也要继续认
+    onedir_old = [
+        "energy_ems.exe",
+        "schema.sql",
+        "dashboard/index.html",
+        "licenses/LICENSE",
+        "licenses/THIRD_PARTY_NOTICES.md",
+    ]
+    assert missing(onedir_old) == [], f"平铺布局应全部通过：{missing(onedir_old)}"
+
+    # 依赖自带的许可不能替代我们的顶层 licenses/
+    fake = [
+        "energy_ems.exe",
+        "_internal/schema.sql",
+        "_internal/dashboard/index.html",
+        "_internal/pydantic-2.14.4.dist-info/licenses/LICENSE",
+    ]
+    lacking = missing(fake)
+    assert any(pattern.startswith("^licenses/LICENSE") for pattern in lacking), \
+        "缺少顶层 MIT 许可必须被拦下，不能靠 dist-info 里的 LICENSE 蒙过去"
+    assert any("THIRD_PARTY" in pattern for pattern in lacking), "第三方声明缺失也要被拦下"
+
+
 def test_readme_deploy_covers_mode_switch_backup_vcredist(isolated_db):
     """Arrange/Act: 读取部署说明。Assert: 覆盖启动/模式切换/备份/VC++ 运行库。"""
     readme = (SRC_ROOT / "README_DEPLOY.md").read_text(encoding="utf-8")
