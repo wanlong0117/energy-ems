@@ -106,9 +106,13 @@ class ConfigService:
 
     @classmethod
     def _diff_text(cls, before: dict[str, Any], after: dict[str, Any]) -> str:
-        """把变更压成「字段 旧值→新值」，敏感字段全部列出，其余只给字段名。"""
+        """把变更压成「字段 旧值→新值」，敏感字段全部列出，其余只给字段名。
+
+        遍历两侧键的并集：只遍历 after 时，payload 里被去掉的字段（旧值→缺失）
+        永远不出现，而删除操作传的就是空 after，于是恒返回「（无字段变化）」。
+        """
         parts: list[str] = []
-        for key in sorted(after.keys()):
+        for key in sorted(set(before.keys()) | set(after.keys())):
             if key in ("id", "rowid"):
                 continue
             old_value: Any = before.get(key)
@@ -122,6 +126,27 @@ class ConfigService:
                     parts.append(f"{key}*")
         if not parts:
             return "（无字段变化）"
+        text: str = "，".join(parts)
+        return text if len(text) <= 600 else text[:600] + "…"
+
+    @classmethod
+    def _snapshot_text(cls, record: dict[str, Any]) -> str:
+        """删除时的审计快照：连值一起留痕，而不是只说「字段变没了」。
+
+        删掉一台设备后，审计里只剩「同时清理 reading 1200 行」这类痕迹，
+        查不出删的是哪台（name/host/port）、哪块表（量程多少）。事后追责与
+        误删恢复都靠这一行，所以这里逐个字段留值。
+        """
+        parts: list[str] = []
+        for key in sorted(record.keys()):
+            if key in ("id", "rowid"):
+                continue
+            value: Any = record[key]
+            if value is None or value == "":
+                continue
+            parts.append(f"{key}={value!r}")
+            if len(parts) >= cls.AUDIT_MAX_FIELDS:
+                break
         text: str = "，".join(parts)
         return text if len(text) <= 600 else text[:600] + "…"
 
@@ -265,7 +290,7 @@ class ConfigService:
             )
         if resource in ("device", "point"):
             collector.reload()
-        detail: str = self._diff_text(old, {})
+        detail: str = self._snapshot_text(old)
         if cleaned:
             detail += "；同时清理 " + "、".join(
                 f"{table} {count} 行" for table, count in cleaned.items() if count

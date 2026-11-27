@@ -17,8 +17,7 @@ router = APIRouter(prefix="/api", tags=["auth"])
 @router.post("/login")
 def login(body: LoginIn, request: Request, response: Response) -> JSONResponse:
     """固定密码登录，成功写 ems_session cookie；连续失败会被临时锁定。"""
-    client: str = request.client.host if request.client else ""
-    return auth.login(body.password, response, client)
+    return auth.login(body.password, response, auth.client_from_request(request))
 
 
 @router.post("/logout", dependencies=[Depends(require_auth)])

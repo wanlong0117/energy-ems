@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS device (
   port          INTEGER NOT NULL DEFAULT 502,  -- TCP=端口；rtu_serial=波特率；manual=占位
   timeout_ms    INTEGER NOT NULL DEFAULT 3000,
   retry         INTEGER NOT NULL DEFAULT 2,
+  parity        TEXT    NOT NULL DEFAULT 'N',  -- 串口校验位 N/E/O（rtu_serial 用，8E1 现场填 E）
   poll_interval INTEGER NOT NULL DEFAULT 60,   -- 秒
   is_enabled    INTEGER NOT NULL DEFAULT 1,
   is_demo       INTEGER NOT NULL DEFAULT 0,

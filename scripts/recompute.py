@@ -32,7 +32,7 @@ if str(ROOT) not in sys.path:
 
 import db  # noqa: E402
 from aggregation import Aggregator  # noqa: E402
-from settings import SECONDS_PER_HOUR, day_floor  # noqa: E402
+from settings import DAY_BOUNDARY_UTC_HOUR, SECONDS_PER_HOUR, day_floor  # noqa: E402
 
 
 # Windows 控制台默认按 cp1252 编码，打印中文会抛 UnicodeEncodeError，把整个 CI 步骤
@@ -44,15 +44,30 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 def _parse_day(text: str | None) -> int | None:
-    """把 YYYY-MM-DD 解析成本地日切点时间戳；None 表示不限。"""
+    """把 YYYY-MM-DD 解析成该统计日的 day_start；None 表示不限。
+
+    报表里的日期标签是 day_start 的 UTC 日期（reports.py），所以正确的反解是
+    「该日 00:00 UTC + 日切点在 UTC 的偏移」。用 day_floor() 会把 00:00 UTC
+    归到前一天——默认日切点（08:00 本地 = 00:00 UTC）下两者等价，改过
+    EMS_DAY_START_HOUR 的现场就会整体错一天。
+    """
     if not text:
         return None
     moment = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return day_floor(int(moment.timestamp()))
+    return int(moment.timestamp()) + DAY_BOUNDARY_UTC_HOUR * SECONDS_PER_HOUR
 
 
 def _hours_to_rebuild(from_ts: int | None, to_ts: int | None) -> list[int]:
-    """reading 覆盖到的所有整点（与已有 hourly 取并集）。"""
+    """需要重建的小时集合：读数所在的整点，加上跨小时区间途经的整点。
+
+    电量窗是左开右闭的：10:00 整点这条读数，既是 09:00 那个小时的收口值，
+    也是 10:00 那个小时的基准。老实现只按 `ts // 3600` 归档，于是「08:30 与
+    10:00 各一条读数」时 09:00 那个小时（真实有电量）根本不在重建名单里。
+    这里改成按相邻两条读数的区间扫一遍，把途经的整点全部纳入。
+
+    不能简单地「每个整点再补上 hour-3600」：那会给上一个小时造出一行 energy=0
+    的假数据（窗口里只有本小时的整点读数、没有基准），正是本脚本要清掉的那种脏行。
+    """
     conditions: list[str] = []
     params: list[object] = []
     if from_ts is not None:
@@ -62,8 +77,25 @@ def _hours_to_rebuild(from_ts: int | None, to_ts: int | None) -> list[int]:
         conditions.append("ts<?")
         params.append(int(to_ts))
     where: str = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-    rows = db.query(f"SELECT DISTINCT ts FROM reading{where}", tuple(params))
-    hours: set[int] = {(int(row["ts"]) // SECONDS_PER_HOUR) * SECONDS_PER_HOUR for row in rows}
+    rows = db.query(f"SELECT DISTINCT ts FROM reading{where} ORDER BY ts", tuple(params))
+    stamps: list[int] = [int(row["ts"]) for row in rows]
+    if not stamps:
+        return []
+
+    # 窗口前最近一条读数：它是窗口内第一条读数的基准，跨小时区间要从它算起
+    previous: int | None = None
+    if from_ts is not None:
+        prior = db.query_one("SELECT MAX(ts) AS ts FROM reading WHERE ts<?", (int(from_ts),))
+        if prior is not None and prior["ts"] is not None:
+            previous = int(prior["ts"])
+
+    hours: set[int] = set()
+    for ts in stamps:
+        hours.add((ts // SECONDS_PER_HOUR) * SECONDS_PER_HOUR)
+        if previous is not None:
+            for index in range(previous // SECONDS_PER_HOUR + 1, ts // SECONDS_PER_HOUR + 1):
+                hours.add(index * SECONDS_PER_HOUR)
+        previous = ts
     return sorted(hours)
 
 
@@ -109,7 +141,13 @@ def main(argv: list[str] | None = None) -> int:
     if to_ts is not None:
         to_ts += 86400  # --to 是闭区间
 
-    db.init_db()
+    if args.dry_run:
+        # --dry-run 的承诺是「只统计影响面，不写库」。原先无条件先 init_db()，
+        # 等于在看影响面之前就把 schema.sql 与迁移执行了一遍（改库结构 + 写
+        # schema_version），升级后、备份前最需要只读的时候恰好是它最不老实的时候。
+        db.use_readonly(db_path)
+    else:
+        db.init_db()
     hours = _hours_to_rebuild(from_ts, to_ts)
     if not hours:
         print("指定范围内没有可用于重算的原始读数，未做任何改动。")
@@ -140,12 +178,23 @@ def main(argv: list[str] | None = None) -> int:
         "DELETE FROM hourly WHERE hour_start>=? AND hour_start<?", (span_start, span_end)
     )
     rebuilt = 0
-    for hour in hours:
-        try:
-            aggregator.rollup_hour(hour)
-            rebuilt += 1
-        except sqlite3.Error as exc:
-            print(f"  小时 {hour} 重算失败，已跳过: {exc}", file=sys.stderr)
+    # 这一段刻意不包成单个大事务：整段包起来会让本进程长时间持有写锁，
+    # 正在跑的服务端采集写 reading 会连吃 busy_timeout（5 秒）失败，
+    # 用「可重跑」换「采集停摆」不划算。中断时按小时重跑即可（脚本幂等）。
+    try:
+        for hour in hours:
+            try:
+                aggregator.rollup_hour(hour)
+                rebuilt += 1
+            except sqlite3.Error as exc:
+                print(f"  小时 {hour} 重算失败，已跳过: {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print(
+            f"\n已中断：hourly 在 {span_start}~{span_end} 区间内只重建了 {rebuilt}/{len(hours)} 小时，"
+            "汇总表此刻不完整。重新执行本脚本即可补齐（按小时幂等）。",
+            file=sys.stderr,
+        )
+        return 130
 
     settled = 0
     kept_final = 0

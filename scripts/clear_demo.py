@@ -113,7 +113,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"数据库不存在: {db_path}")
         return 2
     db.DB_PATH = db_path
-    db.init_db()
+    if args.dry_run:
+        # dry-run 承诺只统计。原先先 init_db() 会把 schema.sql 与迁移跑一遍，
+        # 「先看看会删多少」的动作本身就在改库结构。
+        db.use_readonly(db_path)
+    else:
+        db.init_db()
 
     real_row = db.query_one(
         "SELECT COUNT(*) AS cnt FROM meter WHERE is_demo=0 AND is_enabled=1 AND is_counted=1"

@@ -16,6 +16,7 @@ from auth import require_auth
 from schemas import SettleIn, fail, ok
 from settings import (
     DATA_MODE_DEFAULT,
+    DAY_BOUNDARY_UTC_HOUR,
     QUERY_DAILY_DEFAULT_DAYS,
     QUERY_HOURLY_DEFAULT_DAYS,
     QUERY_MAX_ROWS,
@@ -278,6 +279,9 @@ def mode() -> Any:
             "simulate_interval_sec": int(config.get("simulate_interval_sec", 300)),
             "simulate_rollup_sec": int(config.get("simulate_rollup_sec", 600)),
             "today_start": day_floor(time.time()),
+            # 日切点在 UTC 的整点偏移：前端按日期筛选日报时必须用它对齐，
+            # 否则改了 EMS_DAY_START_HOUR 的现场会整体错一个日界。
+            "day_boundary_utc_hour": DAY_BOUNDARY_UTC_HOUR,
             "now": int(time.time()),
         })
     except Exception as exc:

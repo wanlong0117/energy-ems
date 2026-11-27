@@ -476,6 +476,7 @@ const I18N = {
     limit: "条数", no_data: "暂无数据 / No data", saved: "保存成功", failed: "操作失败",
     confirm_delete: "确认删除该记录？", overwritten: "已覆盖同时间点原记录", trial_fail: "试读失败",
     need_login: "请先登录", session_expired: "登录已过期，请重新登录", welcome: "当前数据模式",
+    select_point: "请先选择点位", value_required: "请填写数值",
     accumulating: "数据积累中，至少需要 3 个小时点",
     pw_change_title: "修改密码", pw_old: "原密码", pw_new: "新密码", pw_confirm: "确认新密码",
     pw_submit: "设置新密码", pw_rule: "默认密码仅用于首次登录，请设置至少 8 位新密码。",
@@ -501,6 +502,7 @@ const I18N = {
     limit: "Limit", no_data: "No data", saved: "Saved", failed: "Operation failed",
     confirm_delete: "Delete this record?", overwritten: "Existing record at same timestamp was overwritten",
     trial_fail: "Probe failed", need_login: "Please sign in first",
+    select_point: "Select a point first", value_required: "value is required",
     session_expired: "Session expired. Please sign in again.", welcome: "Current data mode",
     accumulating: "Accumulating — at least 3 hourly points needed",
     pw_change_title: "Change Password", pw_old: "Current password", pw_new: "New password",
@@ -510,7 +512,8 @@ const I18N = {
   }
 };
 const state = { lang: "zh", authed: false, mode: "simulate", mustChangePassword: false,
-                editing: {}, latest: [], daily: [], hourly: [], todayStart: 0 };
+                editing: {}, latest: [], daily: [], hourly: [], todayStart: 0,
+                dayBoundaryUtcHour: 0 };
 const $ = (id) => document.getElementById(id);
 const t = (key) => (I18N[state.lang] && I18N[state.lang][key]) || key;
 const ALL = "\u5168\u90e8 / ALL";
@@ -548,9 +551,20 @@ async function api(path, options) {
   }
   return payload.data;
 }
+function pad2(value) { return String(value).padStart(2, "0"); }
+function fmtHourLabel(ts) {
+  // 用本地字段，不要 toISOString()（那是 UTC）
+  const moment = new Date(Number(ts) * 1000);
+  return pad2(moment.getMonth() + 1) + "-" + pad2(moment.getDate()) + " " +
+    pad2(moment.getHours()) + ":00";
+}
 function dayStart(dateText) {
+  // 日切点可配（EMS_DAY_START_HOUR / EMS_TZ_OFFSET_HOURS → 后端 day_boundary_utc_hour）。
+  // 写死 "T00:00:00Z" 只在默认 08:00 本地口径下正确；改了日切点，前端筛选窗
+  // 就整体平移，报表会少算/多算一截首尾小时。
   if (!dateText) return "";
-  return String(Math.floor(Date.parse(dateText + "T00:00:00Z") / 1000));
+  const boundary = Number(state.dayBoundaryUtcHour) || 0;
+  return String(Math.floor(Date.parse(dateText + "T00:00:00Z") / 1000) + boundary * 3600);
 }
 function fmtTime(ts) {
   if (!ts) return "-";
@@ -727,6 +741,7 @@ async function loadSession() {
     state.mode = mode.data_mode || "simulate";
     // 日切点由后端给（默认本地 08:00 且可配），前端不要自己按 00:00 算
     state.todayStart = Number(mode.today_start) || 0;
+    state.dayBoundaryUtcHour = Number(mode.day_boundary_utc_hour) || 0;
     $("modeSelect").value = state.mode;
   } catch (e) { state.mode = "simulate"; state.todayStart = 0; }
   renderModeBadge();
@@ -780,9 +795,14 @@ async function submitConfigPassword() {
 async function doLogin() {
   try {
     await api("/api/login", { method: "POST", body: { password: $("password").value } });
-    await loadFilters();
+    // 顺序不能反：默认密码状态下后端对 /api/config/* 一律 403，
+    // 先 loadFilters() 会让整段抛错、loadSession() 永不执行，用户被卡在登录页
+    // 只能看到「登录失败: 请先修改默认密码」，必须手动刷新才看得到改密卡片。
     await loadSession();
-    toast(t("welcome") + ": " + state.mode);
+    if (state.authed && !state.mustChangePassword) {
+      await loadFilters();
+      toast(t("welcome") + ": " + state.mode);
+    }
   } catch (e) { toast(t("login_fail") + ": " + e.message, true); }
 }
 async function loadDashboard() {
@@ -812,8 +832,9 @@ async function loadDashboard() {
       hourlyMap.set(key, (hourlyMap.get(key) || 0) + (Number(row.energy_wh) || 0));
     });
     const series = Array.from(hourlyMap.entries()).sort((a, b) => a[0] - b[0]).map(([ts, wh]) => ({
-      label: new Date(ts * 1000).toISOString().slice(5, 10) + " " +
-        new Date(ts * 1000).toISOString().slice(11, 13) + ":00",
+      // 必须用本地字段格式化：toISOString() 输出的是 UTC，UTC+8 现场会整体早 8 小时，
+      // 和同一行的 fmtTime()/日报日期对不上，看着像「数据串到昨天去了」。
+      label: fmtHourLabel(ts),
       value: wh / 1000000,
     }));
     svgLine($("lineChart"), series, "kWh");
@@ -835,7 +856,7 @@ async function loadDashboard() {
 const RESOURCES = ["node", "device", "point", "energy_category", "meter", "meter_point", "tariff"];
 const FIELDS = {
   node: ["name", "parent_id", "kind", "sort_order", "is_active", "remark"],
-  device: ["name", "node_id", "protocol", "host", "port", "timeout_ms", "retry", "poll_interval", "is_enabled", "remark"],
+  device: ["name", "node_id", "protocol", "host", "port", "parity", "timeout_ms", "retry", "poll_interval", "is_enabled", "remark"],
   point: ["name", "device_id", "slave_id", "func_code", "reg_offset", "reg_count", "data_type", "byte_order", "scale", "offset_const", "min_val", "max_val", "unit", "is_enabled", "remark"],
   energy_category: ["name", "unit"],
   meter: ["name", "node_id", "category_id", "purpose", "is_counted", "is_enabled", "shutdown_power_w", "max_reading_kwh", "remark"],
@@ -943,7 +964,7 @@ async function saveConfig() {
 }
 async function trialRead() {
   const id = $("trialPoint").value;
-  if (!id) { toast(t("need_login"), true); return; }
+  if (!id) { toast(t("select_point"), true); return; }
   try {
     const result = await api("/api/point/" + id + "/read", { method: "POST" });
     $("trialResult").textContent = JSON.stringify(result, null, 2);
@@ -1044,14 +1065,19 @@ async function loadManualList() {
   } catch (e) { toast(e.message, true); }
 }
 async function submitManual() {
+  const rawValue = $("manValue").value.trim();
   const body = {
     point_id: Number($("manPoint").value),
     ts: Math.floor(Date.parse($("manTs").value) / 1000),
-    value: Number($("manValue").value),
+    // Number("") === 0：空着提交会把 0 当成实测值写进库，覆盖真实读数也看不出来
+    value: rawValue === "" ? NaN : Number(rawValue),
     operator: $("manOperator").value.trim(),
     remark: $("manRemark").value.trim()
   };
-  if (!body.point_id || !body.ts || !body.operator) { toast(t("failed"), true); return; }
+  if (!body.point_id || !body.ts || !body.operator || !Number.isFinite(body.value)) {
+    toast(t("failed") + (rawValue === "" ? "：" + t("value_required") : ""), true);
+    return;
+  }
   try {
     const result = await api("/api/manual", { method: "POST", body: body });
     toast(t("saved") + (result.overwritten ? " / " + t("overwritten") : ""));
@@ -1095,13 +1121,23 @@ function bind() {
   $("password").onkeydown = (event) => { if (event.key === "Enter") doLogin(); };
   $("logoutBtn").onclick = async () => {
     try { await api("/api/logout", { method: "POST" }); } catch (e) {}
-    state.authed = false; switchTab("login");
+    // 会话过期那条路径（api() 里）会自己隐藏按钮，主动登出不补这一句就
+    // 会在登录页顶部留一个「退出登录」，看着像没退干净
+    state.authed = false; state.mustChangePassword = false;
+    $("logoutBtn").style.display = "none";
+    switchTab("login");
   };
   $("dashRefresh").onclick = loadDashboard;
   $("cfgRefresh").onclick = loadConfig;
   $("cfgResource").onchange = () => { state.editing = {}; loadConfig(); };
   $("cfgSave").onclick = saveConfig;
-  $("cfgNew").onclick = () => buildForm($("cfgResource").value || RESOURCES[0], null);
+  // 「重置」= 放弃当前编辑态转新增。必须同时清掉 editing，否则随后保存会走
+  // PUT /api/config/{res}/{旧ID}，把刚才点开的那条记录静默覆盖掉。
+  $("cfgNew").onclick = () => {
+    const res = $("cfgResource").value || RESOURCES[0];
+    state.editing[res] = null;
+    buildForm(res, null);
+  };
   $("trialBtn").onclick = trialRead;
   $("modeSwitchBtn").onclick = doSwitchMode;
   $("repLoad").onclick = loadReport;

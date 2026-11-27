@@ -44,6 +44,9 @@ class Collector:
         # 被改过，旧任务必须重建，否则会一直连旧地址直到重启。
         self._sigs: dict[int, str] = {}
         self.reload_event: asyncio.Event = asyncio.Event()
+        # 调度器所在的事件循环；reload() 可能由线程池里的同步路由调用，
+        # 跨线程置事件必须走 call_soon_threadsafe。
+        self._loop: asyncio.AbstractEventLoop | None = None
         # 复活退避：任务若崩溃后立即又崩（配置本身有问题），不能每秒重建一次，
         # 否则 CPU 空转 + 每秒一条日志。device_id -> 允许下次复活的时间（单调时钟）。
         self._revive_hold: dict[int, float] = {}
@@ -51,6 +54,7 @@ class Collector:
 
     async def start(self) -> None:
         """常驻调度器：监听 reload_event，增删设备采集协程，并定期复活异常退出的任务。"""
+        self._loop = asyncio.get_running_loop()
         self.reload_event.set()  # 首次启动立即加载配置
         while True:
             try:
@@ -199,7 +203,9 @@ class Collector:
                 raise ModbusError(f"串口波特率非法: {raw_port!r}") from exc
             if baudrate <= 0:
                 raise ModbusError(f"串口波特率必须为正整数，当前为 {raw_port!r}")
-            return ModbusRTUSerialClient(host, baudrate, timeout_ms, retry)
+            # 现场不少电表出厂是 8E1；校验位必须透传，写死 N 时一帧都收不到
+            parity: str = str(device.get("parity") or "N")
+            return ModbusRTUSerialClient(host, baudrate, timeout_ms, retry, parity=parity)
         port: int = int(raw_port or 502)
         if protocol == "modbus_tcp":
             return ModbusClient(host, port, timeout_ms, retry)
@@ -210,20 +216,25 @@ class Collector:
         raise ModbusError(f"不支持的协议: {protocol}")
 
     async def poll_device(self, device: dict[str, Any]) -> None:
-        """单设备轮询：读配置快照 -> 合并读取 -> 解码写库 -> 休眠 -> 重连退避。"""
+        """单设备轮询：读配置快照 -> 合并读取 -> 解码写库 -> 休眠 -> 重连退避。
+
+        所有 DB 操作都丢进线程池（asyncio.to_thread）。这些调用看着都是「毫秒级短查询」，
+        但 db 用的是全局单连接 + 进程内互斥锁：报表导出、日结补算、90 天清理这类
+        长查询持锁期间，直接在事件循环线程里等这把锁，会把整个循环按住——
+        /healthz 变慢、其它设备的采集也一起停摆。卸载到线程池后，等锁的是工作线程。
+        """
         device_id: int = int(device["id"])
         backoff: float = RECONNECT_BACKOFF_BASE_SEC
 
         while True:
             try:
-                points: list[dict[str, Any]] = [
-                    dict(row)
-                    for row in db.query(
-                        "SELECT * FROM point WHERE device_id=? AND is_enabled=1 "
-                        "ORDER BY slave_id, func_code, reg_offset",
-                        (device_id,),
-                    )
-                ]
+                point_rows = await asyncio.to_thread(
+                    db.query,
+                    "SELECT * FROM point WHERE device_id=? AND is_enabled=1 "
+                    "ORDER BY slave_id, func_code, reg_offset",
+                    (device_id,),
+                )
+                points: list[dict[str, Any]] = [dict(row) for row in point_rows]
                 if not points:
                     # 无点位时仅休眠，等待配置热生效
                     await asyncio.sleep(int(device.get("poll_interval") or DEFAULT_POLL_INTERVAL))
@@ -243,20 +254,28 @@ class Collector:
                     except (ModbusError, OSError, ValueError) as exc:
                         # 读取失败只影响本组：其余分组照常采集，不整轮丢弃；
                         # 本组点位按「保持上一值 + 质量码 1」补点，缺口在看板上可见
-                        carried: list[tuple[int, int, float, int]] = self._carry_forward(
-                            group["points"], now_ts
+                        carried: list[tuple[int, int, float, int]] = await asyncio.to_thread(
+                            self._carry_forward, group["points"], now_ts
                         )
                         rows.extend(carried)
                         code: str = (
                             "READ_TIMEOUT" if isinstance(exc, ModbusTimeoutError) else "READ_FAIL"
                         )
-                        db.log_event_throttled(
-                            "warn", "collector", code,
-                            f"设备 {device_id} 分组读取失败，{len(carried)} 个点位保持上一值"
-                            f"并标记超时: {exc}", device_id,
+                        # 首次掉线与「已经连续掉了几轮」要分开说：第 2 轮起没有可保持的
+                        # 正常值，文案还写「0 个点位保持上一值并标记超时」，现场会以为
+                        # 采集器只处理了 0 个点位（而不是全部都在超时）。
+                        detail: str = (
+                            f"{len(carried)} 个点位保持上一值并标记超时"
+                            if carried else "持续离线（本轮没有可保持的正常值）"
                         )
-                        db.execute(
-                            "UPDATE device SET last_error=? WHERE id=?", (str(exc), device_id)
+                        await asyncio.to_thread(
+                            db.log_event_throttled,
+                            "warn", "collector", code,
+                            f"设备 {device_id} 分组读取失败，{detail}: {exc}", device_id,
+                        )
+                        await asyncio.to_thread(
+                            db.execute,
+                            "UPDATE device SET last_error=? WHERE id=?", (str(exc), device_id),
                         )
                         continue
                     finally:
@@ -270,27 +289,31 @@ class Collector:
                         try:
                             value, quality = client.decode(chunk, point)
                         except (ValueError, IndexError) as exc:
-                            db.log_event(
+                            await asyncio.to_thread(
+                                db.log_event,
                                 "warn", "collector", "DECODE_FAIL",
                                 f"点位 {point['id']} 解析失败: {exc}", int(point["id"]),
                             )
                             continue
                         rows.append((int(point["id"]), now_ts, value, quality))
                         if quality == QUALITY_TIMEOUT:
-                            db.log_event_throttled(
+                            await asyncio.to_thread(
+                                db.log_event_throttled,
                                 "warn", "collector", "READ_TIMEOUT",
                                 f"点位 {point['id']} 读取超时", int(point["id"]),
                             )
                         elif quality == QUALITY_OUT_OF_RANGE:
-                            db.log_event_throttled(
+                            await asyncio.to_thread(
+                                db.log_event_throttled,
                                 "warn", "collector", "VALUE_OUT_OF_RANGE",
                                 f"点位 {point['id']} 越界: {value}", int(point["id"]),
                             )
 
-                self.write_batch(rows)
+                await asyncio.to_thread(self.write_batch, rows)
                 if any_ok:
                     self._clear_revive_backoff(device_id)
-                    db.execute(
+                    await asyncio.to_thread(
+                        db.execute,
                         "UPDATE device SET last_ok_at=?, last_error=NULL WHERE id=?",
                         (now_ts, device_id),
                     )
@@ -306,12 +329,14 @@ class Collector:
             except asyncio.CancelledError:
                 raise  # 热生效/关停时正常退出
             except (ModbusError, OSError, ValueError, sqlite3.Error) as exc:
-                db.log_event_throttled(
+                await asyncio.to_thread(
+                    db.log_event_throttled,
                     "error", "collector", "READ_FAIL",
                     f"设备 {device_id}({device.get('host')}) 采集失败: {exc}", device_id,
                 )
-                db.execute(
-                    "UPDATE device SET last_error=? WHERE id=?", (str(exc), device_id)
+                await asyncio.to_thread(
+                    db.execute,
+                    "UPDATE device SET last_error=? WHERE id=?", (str(exc), device_id),
                 )
                 # 断网/异常：指数退避重连，上限 60 秒
                 await asyncio.sleep(backoff)
@@ -423,8 +448,26 @@ class Collector:
         ]
 
     def reload(self) -> None:
-        """配置变更后调用：置事件，调度器在下一轮起点重建采集任务。"""
-        self.reload_event.set()
+        """配置变更后调用：置事件，调度器在下一轮起点重建采集任务。
+
+        这个方法经常从线程池（FastAPI 的同步路由）里被调用，而 asyncio.Event 不是
+        线程安全的：直接 set() 只是把 waiter 的 future 标成已完成，不会唤醒事件循环，
+        极端情况下还会和循环里的 wait/clear 抢同一批 waiter。表现是「点了保存，
+        配置过一会儿才生效」——旧实现完全靠 start() 里那 1 秒超时轮询兜着。
+        跨线程一律走 call_soon_threadsafe，把 set 排进循环线程执行。
+        """
+        loop: asyncio.AbstractEventLoop | None = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                self.reload_event.set()
+            else:
+                loop.call_soon_threadsafe(self.reload_event.set)
+        else:
+            self.reload_event.set()  # 调度器还没起来（启动前/测试里）：先置位，start() 会读
         db.log_event("info", "api", "COLLECTOR_RELOAD", "采集配置热生效触发")
 
     async def probe_point(self, point_id: int) -> dict[str, Any]:

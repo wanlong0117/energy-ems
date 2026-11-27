@@ -37,7 +37,7 @@ Energy EMS 的取舍：
 
 | 模块 | 说明 |
 |---|---|
-| 采集 | Modbus TCP、RTU-over-TCP、RTU 串口（自研实现，CRC16/MBAP 完整） |
+| 采集 | Modbus TCP、RTU-over-TCP、RTU 串口（自研实现，CRC16/MBAP 完整）；串口可配校验位（`parity` N/E/O，8E1 现场表可直接接）；同一 COM 口挂多台从站时按端口排队发帧 + 3.5 字符帧间静默 |
 | 规模 | 默认预置 100 块电表 + 5 组冷却塔电极 + 5 个机械排水手动点 |
 | 数据 | 13 张表，SQLite WAL；读数质量分级（正常/超时/越界/人工），超时按「保持上一值 + 质量码 1」落库 |
 | 汇总 | 小时 / 日 / 周 / 月；累计读数回退时区分满量程翻转（按 `max_reading_kwh` 补回）、换表（按新表基准重算）与异常（按 0 计），三者分别记 `METER_ROLLOVER` / `METER_SWAP` / `METER_RESET`；`live` 模式内置小时汇总任务；小时电量用左开右闭区间 `(整点, 次整点]`，相邻小时首尾相接、24 小时合计等于首末读数差；日结算按本地 08:00（UTC 00:00）口径，**逐表**判定覆盖，不足 90% 该表不定稿 |
@@ -123,6 +123,7 @@ EMS_PASSWORD='your-strong-password' ./energy_ems
 | `EMS_DAY_START_HOUR` | `8` | 本地几点算新的一天（现场抄表口径） |
 | `EMS_TZ_OFFSET_HOURS` | `8` | 时区偏移，用于报表本地时刻与分时电价时段匹配 |
 | `EMS_COOKIE_SECURE` | 空 | 叠 HTTPS 反向代理后设为 `1`，会话 Cookie 加 Secure |
+| `EMS_TRUST_PROXY_HEADERS` | 空 | 仅在反向代理后开启：按 `X-Forwarded-For` 首跳识别来源，避免登录失败锁定把全厂一起锁掉（直连可伪造，不要对着公网开） |
 
 ### 电价（峰平谷）
 
@@ -219,6 +220,9 @@ Excel/PDF 结构与单位、认证与密码策略（服务端改密拦截、失�
 - 同来源连续 5 次登录失败锁定 60 秒，并记事件日志
 - `/docs`、`/openapi.json` 需登录后访问（Swagger 静态资源取自 CDN，纯内网可能渲染不出）
 - 会话为 httponly + SameSite=Lax cookie，7 天过期；叠 HTTPS 后设 `EMS_COOKIE_SECURE=1`
+- 登录失败锁定按来源 IP 计数（5 次 / 60 秒）。置于 Nginx、Caddy 之后时对端恒为
+  `127.0.0.1`，一个人输错 5 次就会锁住全厂——此时设 `EMS_TRUST_PROXY_HEADERS=1`
+  改用 `X-Forwarded-For` 首跳；该头可被伪造，所以后端只能让代理可达
 - `config.json` 以 0600 权限原子写入；解析失败时**拒绝登录**（503）而不是回退默认密码
 - 建议仅在内网使用，公网访问请置于反向代理后并启用 HTTPS
 - 漏洞上报请见 [SECURITY.md](SECURITY.md)

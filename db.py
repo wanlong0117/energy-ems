@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 from settings import app_dir, resource_dir
 
@@ -22,6 +23,9 @@ _conn: sqlite3.Connection | None = None
 # 进程内可重入锁：单进程多线程（事件循环线程 + 线程池里的同步路由）共用一条连接，
 # 读写的「执行 + 提交」必须成对持有，否则一个线程的提交会把另一个线程未提交的写入带走。
 _lock: threading.RLock = threading.RLock()
+# 当前线程是否正处在 transaction() 块内。用来把「事务里误用全局连接」从
+# 「卡满 busy_timeout 再报 database is locked」变成一句能直接照做的错误。
+_txn_state: threading.local = threading.local()
 
 
 def get_conn() -> sqlite3.Connection:
@@ -63,7 +67,20 @@ def query_one(sql: str, params: tuple | list = ()) -> sqlite3.Row | None:
 
 
 def execute(sql: str, params: tuple | list = ()) -> int:
-    """执行写语句并立即提交，返回 lastrowid 或受影响行数。"""
+    """执行写语句并立即提交，返回 lastrowid 或受影响行数。
+
+    ⚠️ 不得在 `with transaction() as conn:` 块内调用。transaction() 在独立连接上
+    已用 BEGIN IMMEDIATE 占住写锁，这里再走全局连接写同一个库，SQLite 只认连接不认
+    线程——同一线程会把自己堵死，卡满 busy_timeout 后抛 database is locked。
+    事务内要写，请用块内那个 conn；要记审计日志，用 log_event_on(conn, ...)。
+    """
+    if getattr(_txn_state, "depth", 0) > 0:
+        raise RuntimeError(
+            "事务块内不能调用 db.execute / db.log_event："
+            "transaction() 已持有写锁，全局连接再写会自锁到 busy_timeout。"
+            "请改用 `with db.transaction() as conn:` 的 conn，"
+            "或用 db.log_event_on(conn, ...) 记日志。"
+        )
     with _lock:
         conn = get_conn()
         cur = conn.execute(sql, params)
@@ -89,14 +106,31 @@ def transaction() -> Iterator[sqlite3.Connection]:
     用法：
         with db.transaction() as conn:
             conn.execute(...)   # 多条语句同生共死
-    退出时统一 commit；抛异常则 rollback。锁为可重入锁，事务内可继续调用
-    db.query / log_event（同线程），不会自锁。
+        # 需要留审计痕迹时：
+        with db.transaction() as conn:
+            conn.execute(...)
+            db.log_event_on(conn, "info", "api", "X", "说明")   # 同一事务
+
+    退出时统一 commit；抛异常则 rollback。
+
+    不要在块内调用 db.execute / db.log_event。`_lock` 是可重入锁，所以那样做不会
+    在锁上卡住，但会卡在 SQLite 的写锁上：本事务已 BEGIN IMMEDIATE，全局连接再写
+    同一库只能等 busy_timeout（5 秒）然后报 database is locked。旧注释写成「可继续
+    调用 db.query / log_event 不会自锁」是错的——query 在 WAL 下能读（读到的是事务
+    外快照），log_event 一定自锁。现在这种误用会直接抛 RuntimeError。
     """
     with _lock:
+        depth: int = int(getattr(_txn_state, "depth", 0))
+        if depth > 0:
+            # 嵌套会另开一条连接再 BEGIN IMMEDIATE，必然自锁；直接说清楚
+            raise RuntimeError(
+                "transaction() 不支持嵌套：外层已持有写锁，内层另开连接会自锁。请复用外层 conn。"
+            )
         conn: sqlite3.Connection = sqlite3.connect(DB_PATH, timeout=5.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 5000")
+        _txn_state.depth = depth + 1
         try:
             conn.execute("BEGIN IMMEDIATE")
             yield conn
@@ -105,7 +139,40 @@ def transaction() -> Iterator[sqlite3.Connection]:
             conn.rollback()
             raise
         finally:
+            _txn_state.depth = depth
             conn.close()
+
+
+def use_readonly(path: Path) -> None:
+    """把全局连接切换成只读 URI（运维脚本 --dry-run 用）。
+
+    只读模式由 SQLite 自己保证：写语句直接报 attempt to write a readonly database，
+    比「代码里记得别写」可靠。也不会顺带执行 schema.sql / 迁移——那正是
+    `--dry-run` 最不该做的事（升级后、备份前想看影响面，却先把库结构改了）。
+    """
+    global _conn
+    with _lock:
+        if _conn is not None:
+            _conn.close()
+        uri: str = f"{path.resolve().as_uri()}?mode=ro"
+        _conn = sqlite3.connect(uri, uri=True)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA busy_timeout = 5000")
+
+
+def log_event_on(
+    conn: sqlite3.Connection,
+    level: str,
+    source: str,
+    code: str | None,
+    message: str,
+    ref_id: int | None = None,
+) -> None:
+    """在事务块内记审计日志：复用调用方的连接，随事务一起提交/回滚。"""
+    conn.execute(
+        "INSERT INTO event_log (ts, level, source, code, message, ref_id) VALUES (?,?,?,?,?,?)",
+        (int(time.time()), level, source, code, message, ref_id),
+    )
 
 
 def log_event(
@@ -115,7 +182,10 @@ def log_event(
     message: str,
     ref_id: int | None = None,
 ) -> None:
-    """写审计/事件日志（source ∈ collector/api/user）。"""
+    """写审计/事件日志（source ∈ collector/api/user）。
+
+    事务块内请改用 log_event_on(conn, ...)，否则会抛 RuntimeError（原因见 execute）。
+    """
     execute(
         "INSERT INTO event_log (ts, level, source, code, message, ref_id) VALUES (?,?,?,?,?,?)",
         (int(time.time()), level, source, code, message, ref_id),

@@ -114,6 +114,7 @@ CREATE TABLE {name} (
   protocol      TEXT    NOT NULL,
   host          TEXT    NOT NULL,
   port          INTEGER NOT NULL DEFAULT 502,
+  parity        TEXT    NOT NULL DEFAULT 'N',
   timeout_ms    INTEGER NOT NULL DEFAULT 3000,
   retry         INTEGER NOT NULL DEFAULT 2,
   poll_interval INTEGER NOT NULL DEFAULT 60,
@@ -183,8 +184,9 @@ _REBUILD_COLUMNS: dict[str, tuple[str, ...]] = {
     "energy_category": ("id", "name", "unit"),
     "node": ("id", "name", "parent_id", "kind", "sort_order", "is_active", "is_demo", "remark"),
     "device": (
-        "id", "name", "node_id", "protocol", "host", "port", "timeout_ms", "retry",
-        "poll_interval", "is_enabled", "is_demo", "last_ok_at", "last_error", "remark",
+        "id", "name", "node_id", "protocol", "host", "port", "parity", "timeout_ms",
+        "retry", "poll_interval", "is_enabled", "is_demo", "last_ok_at", "last_error",
+        "remark",
     ),
     "point": (
         "id", "name", "device_id", "slave_id", "func_code", "reg_offset", "reg_count",
@@ -258,6 +260,16 @@ def _v9_meter_rollover(conn: sqlite3.Connection) -> None:
     _add_column(conn, "meter", "max_reading_kwh", "REAL")
 
 
+def _v10_device_parity(conn: sqlite3.Connection) -> None:
+    """串口校验位：device.parity（N/E/O），默认 N。
+
+    工业现场有相当一部分电表出厂就是 8E1（偶校验）。旧版客户端把校验位写死成 N，
+    这类表连一帧都收不到，只能看到「无响应」，现场很容易误判成接线或波特率问题。
+    默认 N 保持既有行为，存量设备不受影响；需要时在设备上填 E/O 即可。
+    """
+    _add_column(conn, "device", "parity", "TEXT NOT NULL DEFAULT 'N'")
+
+
 MIGRATIONS: list[Migration] = [
     (1, "baseline: 13 张表", _v1_baseline),
     (2, "daily 增加电价与价格快照字段", _v2_daily_price_snapshot),
@@ -268,6 +280,7 @@ MIGRATIONS: list[Migration] = [
     (7, "实体主键改 AUTOINCREMENT", _v7_autoincrement),
     (8, "停机判定：meter.shutdown_power_w 与 daily.shutdown_hours", _v8_shutdown_threshold),
     (9, "电表满量程翻转：meter.max_reading_kwh", _v9_meter_rollover),
+    (10, "串口校验位：device.parity", _v10_device_parity),
 ]
 
 # 需要临时关闭外键的迁移：SQLite 不允许在事务内改 PRAGMA foreign_keys

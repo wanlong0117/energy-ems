@@ -152,6 +152,8 @@ class DeviceIn(_BaseIn):
     protocol: str = "modbus_tcp"
     host: str
     port: int = 502
+    # 串口校验位：现场 8E1 的表必须填 E，旧版写死 N 时连不上且看不出原因
+    parity: str = "N"
     timeout_ms: int = 3000
     retry: int = 2
     poll_interval: int = 60
@@ -159,6 +161,14 @@ class DeviceIn(_BaseIn):
     last_ok_at: int | None = None
     last_error: str | None = None
     remark: str | None = None
+
+    @field_validator("parity")
+    @classmethod
+    def _parity(cls, value: str) -> str:
+        normalized: str = str(value or "N").strip().upper()[:1] or "N"
+        if normalized not in ("N", "E", "O"):
+            raise ValueError("parity 仅支持 N / E / O")
+        return normalized
 
     @field_validator("protocol")
     @classmethod

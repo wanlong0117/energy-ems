@@ -331,6 +331,11 @@ class ModbusTCPClient(BaseModbusClient):
                 header: bytes = await asyncio.wait_for(self._reader.readexactly(7), timeout=timeout)
                 # MBAP.length 计入了单元号，而单元号已在这 7 字节头里，故剩余 PDU 为 length-1
                 length: int = struct.unpack(">H", header[4:6])[0]
+                # 先校验再读：length=0 会让 readexactly(-1) 抛 ValueError（最后变成一句
+                # 看不出所以然的「参数错误」），length=65535 则会一直等到超时白占 64KB。
+                # 合法上界：单元号 1B + PDU(功能码 1B + 字节数 1B + 250B 数据)。
+                if not 3 <= length <= MODBUS_MAX_BYTE_COUNT + 3:
+                    raise ModbusError(f"MBAP 长度字段非法: {length}（合法 3~{MODBUS_MAX_BYTE_COUNT + 3}）")
                 body: bytes = await asyncio.wait_for(
                     self._reader.readexactly(length - 1), timeout=timeout
                 )
@@ -471,8 +476,33 @@ class ModbusRTUSerialClient(BaseModbusClient):
         return _parse_rtu_response(data, expect_slave)
 
     async def connect(self) -> None:
-        """串口无需持久连接，空实现以兼容统一接口。"""
-        return None
+        """真实打开一次 COM 口再关掉，用于「连接测试」校验驱动与端口。
+
+        旧实现是 `return None` 空实现：设备还没配点位时，连接测试直接回
+        「串口已打开（该设备未配置点位，未读取寄存器）」并刷新 last_ok_at——
+        端口号写错、USB 转 485 没插、机器上根本没装 pyserial，全都报成功。
+        只在这条路径做实际打开：采集路径每帧自己开合，多一次探测纯属浪费。
+        """
+        if serial is None:
+            raise ModbusError("未安装 pyserial，无法使用 modbus_rtu_serial 协议")
+        await asyncio.to_thread(self._probe_open)
+
+    def _probe_open(self) -> None:
+        """同步打开并立即关闭串口；失败统一转成人话的 ModbusError。"""
+        try:
+            with serial.Serial(
+                port=self.port_name,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=getattr(serial, f"PARITY_{self.parity()}", serial.PARITY_NONE),
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.05,
+            ):
+                pass
+        except Exception as exc:  # pyserial 的 SerialException 继承 OSError，这里统一兜住
+            raise ModbusError(
+                f"串口 {self.port_name} 打开失败（波特率 {self.baudrate}，校验 {self.parity()}）: {exc}"
+            ) from exc
 
     async def close(self) -> None:
         """串口帧读毕即关，空实现以兼容统一接口。"""
@@ -494,15 +524,29 @@ class ModbusRTUSerialClient(BaseModbusClient):
                 handle.reset_input_buffer()
                 handle.write(adu)
                 head: bytes = handle.read(3)
+                if not head:
+                    # 从站无应答时 read() 等满 timeout 返回 b""。这里必须报超时，
+                    # 否则会被上层归到 READ_FAIL（「设备故障」），现场查错方向全反。
+                    raise ModbusTimeoutError(
+                        f"串口 {self.port_name} 无响应（等待 {self.timeout_ms}ms）"
+                    )
                 if len(head) < 3:
-                    raise ModbusError("串口响应头不完整")
+                    raise ModbusError(f"串口响应头不完整: {head.hex()}")
                 if head[1] & 0x80:
-                    tail: bytes = handle.read(2)
+                    tail = handle.read(2)
+                    if len(tail) < 2:
+                        raise ModbusError(f"串口异常响应不完整: {(head + tail).hex()}")
                 else:
                     byte_count: int = head[2]
                     if byte_count < 1 or byte_count > MODBUS_MAX_BYTE_COUNT or byte_count % 2:
                         raise ModbusError(f"非法寄存器字节数: {byte_count}")
                     tail = handle.read(byte_count + 2)
+                    if len(tail) < byte_count + 2:
+                        # 只收到半帧：CRC 必然校验不过，但要区分「慢表」与「错帧」
+                        raise ModbusTimeoutError(
+                            f"串口 {self.port_name} 响应不完整：期望 {byte_count + 2} 字节，"
+                            f"实收 {len(tail)} 字节"
+                        )
                 return head + tail
         except ModbusError:
             raise

@@ -355,6 +355,11 @@ class Aggregator:
         avg_power: float | None = sum(avg_parts) / len(avg_parts) if avg_parts else None
 
         sample_row = db.query_one(
+            # 窗口与上面的功率聚合一致（左闭右开）：sample_cnt 的用途是给
+            # avg_power 当日加权当「时长代理」，必须和功率的取样窗同源。
+            # 注意它和电量窗（左开右闭）本来就不同——电量取的是整点收口值，
+            # 功率取的是本小时内的采样。两边差异由日结侧兜底（见 settle_day
+            # 里 max(samples, 1) 的注释），不要为了「看起来一致」把它们改成同一个。
             "SELECT COUNT(*) AS cnt FROM reading WHERE point_id=? AND ts>=? "
             "AND ts<? AND quality IN (0,3)",
             (point_id, hour_start, hour_end),
@@ -431,8 +436,12 @@ class Aggregator:
             )
             samples: int = int(row["sample_cnt"] or 0)
             if row["avg_power"] is not None:
-                bucket["weighted_sum"] += float(row["avg_power"]) * samples
-                bucket["samples"] += samples
+                # 权重至少算 1：只有整点那一条读数的小时，电量窗（左开右闭）能取到
+                # 收口值、功率窗（左闭右开）却是 0 个样本，按 0 加权等于把这一小时
+                # 从当日平均功率里悄悄抹掉。宁可给一个等效「1 个采样」的权重。
+                weight: int = max(samples, 1)
+                bucket["weighted_sum"] += float(row["avg_power"]) * weight
+                bucket["samples"] += weight
             if row["max_power"] is not None:
                 peak: float = float(row["max_power"])
                 if bucket["peak"] is None or peak > bucket["peak"]:
@@ -461,6 +470,18 @@ class Aggregator:
         short_meters: list[str] = []
         settled_meters: int = 0
         shutdown_meters: list[str] = []
+        # 电价与「原有日报」都只查一次：日结算要遍历上百块表，逐表再查一遍电价表
+        # 是纯 N+1（100 表 × 30 天补算约 3000 次重复查询），逐表 db.execute 又会让
+        # 每块表各提交一次事务。改成预加载 + 末位一次 executemany。
+        preloaded_tariffs: list[dict[str, Any]] = tariff.load_tariffs()
+        previous_map: dict[int, Any] = {
+            int(row["meter_id"]): row
+            for row in db.query(
+                "SELECT meter_id, cost_cent, price_cent, is_final FROM daily WHERE day_start=?",
+                (day_start,),
+            )
+        }
+        pending_rows: list[tuple[Any, ...]] = []
         # 正式结算时，应结算但整日无数据的表也要落一行零值（P2-4）：
         # 旧行为是「没数据就不产行」，报表按行求和会静默少计，而页面仍显示「已结算」。
         # 补零行 + covered_hours=0 + is_final=0，缺哪块表一眼能看出来。
@@ -476,9 +497,11 @@ class Aggregator:
                 if bucket and bucket["samples"] > 0 else None
             )
             # 分时电价：按当天各小时电量逐段计价，并把「按什么价算的」存成快照
-            cost: tariff.CostResult = tariff.cost_for_hourly(hours)
+            cost: tariff.CostResult = tariff.cost_for_hourly(
+                hours, tariffs=preloaded_tariffs
+            )
             if bucket:
-                self._warn_if_reprice(meter_id, day_start, cost)
+                self._warn_if_reprice(meter_id, day_start, cost, previous_map.get(meter_id))
             covered_hours: int = len(hours)
             # 停机小时：该小时功率点均值低于阈值 → 现场没在生产，不该要求「有数据」。
             # 只认有功率读数的小时：没有功率点、或该小时没采到功率，一律不当停机，
@@ -521,20 +544,28 @@ class Aggregator:
                         + (f",停机{shutdown_observed}" if shutdown_observed else "")
                         + ")"
                     )
-            db.execute(
-                "INSERT OR REPLACE INTO daily "
-                "(meter_id, day_start, energy_wh, peak_power, avg_power, cost_cent, "
-                "is_final, covered_hours, shutdown_hours, price_cent, tariff_snapshot) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            pending_rows.append(
                 (
                     meter_id, day_start, energy_wh,
                     bucket["peak"] if bucket else None, avg_power,
                     cost.cost_cent, meter_final, covered_hours, shutdown_hours,
                     cost.price_cent,
                     tariff.dumps(cost, covered_hours),
-                ),
+                )
             )
             settled_meters += 1
+
+        if pending_rows:
+            # 单事务批量写：100 块表一次提交，断电/异常时要么全在要么全不在，
+            # 不会留下「前 60 块表已定稿、后 40 块还是旧数」的半天状态。
+            with db.transaction() as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO daily "
+                    "(meter_id, day_start, energy_wh, peak_power, avg_power, cost_cent, "
+                    "is_final, covered_hours, shutdown_hours, price_cent, tariff_snapshot) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    pending_rows,
+                )
 
         if short_meters:
             db.log_event(
@@ -561,12 +592,18 @@ class Aggregator:
         )
 
     @staticmethod
-    def _warn_if_reprice(meter_id: int, day_start: int, cost: tariff.CostResult) -> None:
-        """已定稿日按新电价改写电费时留痕，避免「历史电费悄悄变了」无从追溯。"""
-        previous = db.query_one(
-            "SELECT cost_cent, price_cent, is_final FROM daily WHERE meter_id=? AND day_start=?",
-            (meter_id, day_start),
-        )
+    def _warn_if_reprice(
+        meter_id: int, day_start: int, cost: tariff.CostResult, previous: Any = None
+    ) -> None:
+        """已定稿日按新电价改写电费时留痕，避免「历史电费悄悄变了」无从追溯。
+
+        previous 由调用方预加载传入（日结算里一次查完当天所有日报），不传则现查。
+        """
+        if previous is None:
+            previous = db.query_one(
+                "SELECT cost_cent, price_cent, is_final FROM daily WHERE meter_id=? AND day_start=?",
+                (meter_id, day_start),
+            )
         if previous is None or int(previous["is_final"] or 0) != 1:
             return
         old_price: Any = previous["price_cent"]

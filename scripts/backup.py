@@ -12,6 +12,7 @@ NAS/移动硬盘。备份文件是完整数据库快照，恢复时停服务、�
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 import time
@@ -27,18 +28,31 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 def backup(db_path: Path, out_dir: Path) -> Path:
-    """把 db_path 备份成 out_dir/energy-YYYYmmdd-HHMMSS.db，返回备份文件路径。"""
+    """把 db_path 备份成 out_dir/energy-YYYYmmdd-HHMMSS.db，返回备份文件路径。
+
+    先写 `*.db.tmp`，quick_check 通过后再 os.replace 成正式名。直接往正式名里
+    backup() 的话，磁盘写满或中途异常会留下 0 字节/半截的 .db；而 prune() 按
+    mtime 保留最新 N 份——正好会把这份坏的当最新留下，删掉最老的好备份。
+    """
     if not db_path.is_file():
         raise FileNotFoundError(f"数据库不存在: {db_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
     target: Path = out_dir / f"energy-{time.strftime('%Y%m%d-%H%M%S')}.db"
+    temp: Path = target.with_suffix(".db.tmp")  # 不匹配 prune 的 energy-*.db
     source = sqlite3.connect(db_path, timeout=10.0)
     try:
-        destination = sqlite3.connect(target)
+        destination = sqlite3.connect(temp)
         try:
             source.backup(destination)  # 在线备份：不阻塞采集写入
+            check = destination.execute("PRAGMA quick_check").fetchone()
+            if not check or str(check[0]).lower() != "ok":
+                raise sqlite3.DatabaseError(f"备份文件完整性校验失败: {check}")
         finally:
             destination.close()
+        os.replace(temp, target)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
     finally:
         source.close()
     return target

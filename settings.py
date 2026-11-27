@@ -218,6 +218,12 @@ SESSION_TTL_SEC: int = 7 * SECONDS_PER_DAY
 # 会话 Cookie 的 Secure 标志：纯内网 HTTP 下必须为 False，否则浏览器不回传 Cookie；
 # 叠反向代理启用 HTTPS 后设 EMS_COOKIE_SECURE=1 即可打开。
 SESSION_COOKIE_SECURE: bool = os.environ.get("EMS_COOKIE_SECURE", "") not in ("", "0", "false")
+# 反向代理后取真实来源：默认关闭。
+# 挂在 Nginx/Caddy 后面时 request.client.host 恒为 127.0.0.1，登录失败锁定会变成
+# 「任何人输错 5 次就锁全厂」——包括正在输正确密码的管理员。开启后按
+# X-Forwarded-For 第一跳识别来源；只能在后端不可被直连（仅代理可达）时开启，
+# 否则伪造该头即可绕过锁定。
+TRUST_PROXY_HEADERS: bool = os.environ.get("EMS_TRUST_PROXY_HEADERS", "") not in ("", "0", "false")
 
 # ---------- HTTP 入口（单进程 uvicorn） ----------
 # 默认只绑本机：默认密码是公开的，一旦直接监听 0.0.0.0，同一网段任何人都能抢先

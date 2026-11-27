@@ -100,11 +100,17 @@ def price_at(hour: int, segments: list[dict[str, Any]], fallback: float | None) 
     return fallback
 
 
-def cost_for_hourly(hourly: Iterable[tuple[int, int]]) -> CostResult:
-    """按小时电量计费：hourly 为 (hour_start, energy_wh) 序列。"""
-    tariffs: list[dict[str, Any]] = load_tariffs()
-    segments: list[dict[str, Any]] = _segments(tariffs)
-    fallback: float | None = _default_price(tariffs)
+def cost_for_hourly(
+    hourly: Iterable[tuple[int, int]], tariffs: list[dict[str, Any]] | None = None
+) -> CostResult:
+    """按小时电量计费：hourly 为 (hour_start, energy_wh) 序列。
+
+    tariffs 可由调用方预加载传入：日结算要跑上百块表，每块表都重新查一次电价表
+    就是纯浪费（100 表 × 30 天补算 = 3000 次重复查询）。不传则保持原行为。
+    """
+    loaded: list[dict[str, Any]] = load_tariffs() if tariffs is None else tariffs
+    segments: list[dict[str, Any]] = _segments(loaded)
+    fallback: float | None = _default_price(loaded)
     result = CostResult(
         mode="tou" if segments else ("flat" if fallback is not None else "none"),
         segments=segments,

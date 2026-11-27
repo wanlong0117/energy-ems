@@ -537,6 +537,9 @@ sequenceDiagram
 - **打包入口契约（关键，v0.1.8）**：`main.py` 的启动必须是 `uvicorn.run(app, host, port, workers=1)`，**绝不能**写成 `uvicorn.run("main:app", ...)`。PyInstaller 冻结后入口脚本在 `sys.modules` 里只注册为 `__main__`，不存在名叫 `main` 的可导入模块，按名字导入会抛 `Could not import module "main"` 并以退出码 3 结束——源码运行完全正常，只有打包产物坏，所以单测发现不了。两层防线：`tests/test_entrypoint.py` 用 AST 断言首参是 `app` 对象且 `workers ≤ 1`；CI 打包后真正启动 exe 并请求 `/healthz`，非 200 即构建失败。同理不要用「在 exe 目录放一个 main.py 存根」来绕——那依赖运行时 cwd 在 `sys.path` 里，换个启动方式（计划任务/服务/快捷方式）又会失效。
 - **quality**：0=正常、1=超时、2=越界（超出 min/max）、3=人工。
 - **单一连接**：`db.py` 全局连接、`check_same_thread=False`；所有 DB 调用同步短事务，`execute()` 内 commit，避免在 `await` 间持有游标。
+- **事务边界（v0.1.9，关键）**：`db.transaction()` 在**独立连接**上 `BEGIN IMMEDIATE`，并全程持有进程内 `_lock`。因此：① 块内**不得**调用 `db.execute` / `db.log_event`——同一线程会把自己堵死，卡满 `busy_timeout`（5 秒）后报 `database is locked`（旧注释写的「可继续调用不会自锁」是错的）；要写就用块内的 `conn`，要记审计用 `db.log_event_on(conn, ...)`。② 块内 `db.query` 能读但要意识到读到的是**事务外快照**。③ 不支持嵌套 `transaction()`。两条误用现在都直接抛 `RuntimeError`（线程内标记 `_txn_state`），不再用 5 秒卡顿当提示。④ 反过来，不要为了「原子」把分钟级批处理包成一个大事务：那会让采集写 `reading` 连吃 `busy_timeout` 失败，宁可写成「按批提交 + 可重跑」。
+- **串口校验位（v0.1.9）**：`device.parity`（N/E/O，默认 N）经 `_client_for()` 透传给 `ModbusRTUSerialClient`。现场 8E1 的表把校验位写死成 N 时一帧都收不到，现象与接线/波特率错误无法区分，所以必须可配。串口的 `connect()` 是**真开一次端口**（供连接测试用），采集路径不用它——每帧自己开合，多一次探测纯属浪费。
+- **采集侧不阻塞事件循环（v0.1.9）**：`poll_device` 里的点位查询、保底补点、`write_batch`、设备状态更新全部经 `asyncio.to_thread`。它们都是毫秒级短查询，但共用全局连接 + 进程内锁：报表导出/日结补算持锁期间，在事件循环线程等锁会把整个循环按住（`/healthz` 变慢、其它设备一起停摆）。
 - **寄存器合并**：同 (device, slave, func) 按 offset 排序，相邻/重叠合并为单次请求，单次 `reg_count ≤ 125`，超限拆分。
 - **幂等**：写库用 `INSERT OR REPLACE`（`reading` 主键 point_id+ts，`daily`/`hourly` 各自复合主键），保证重跑不重复。
 - **事件日志**：`log_event(level, source, code, message, ref_id)`，source 取值 collector/api/user；登录失败、采集失败、结算完成均写日志。

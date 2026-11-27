@@ -18,6 +18,8 @@ import hashlib
 import json
 import os
 import secrets
+import tempfile
+import threading
 import time
 from typing import Any
 
@@ -32,11 +34,14 @@ from settings import (
     SESSION_COOKIE_SECURE,
     SESSION_TTL_SEC,
     SIMULATE_INTERVAL_SEC,
+    TRUST_PROXY_HEADERS,
     SIMULATE_ROLLUP_SEC,
     app_dir,
 )
 
 CONFIG_PATH = app_dir() / "config.json"
+# 配置文件写入串行化（见 save_config）
+_config_write_lock: threading.Lock = threading.Lock()
 
 
 class ConfigError(RuntimeError):
@@ -48,6 +53,10 @@ class ConfigError(RuntimeError):
 
 # token -> 过期时间戳
 _sessions: dict[str, float] = {}
+# 内存状态锁：登录/登出/校验都在 AnyIO 线程池里的同步路由上跑，多个请求会真的并发
+# 操作这两个 dict。CPython 的 dict 单次操作是原子的，但「读-改-写」不是：
+# 并发 login 时 token 写入与 _prune_sessions 的遍历删除交错，可能让刚发的会话被清掉。
+_state_lock: threading.Lock = threading.Lock()
 _last_prune: float = 0.0
 SESSION_TTL: int = SESSION_TTL_SEC  # 兼容原有命名，7 天
 COOKIE_NAME: str = SESSION_COOKIE_NAME
@@ -189,19 +198,44 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any]) -> None:
-    """整体写回配置（调用方负责合并已有键）；原子替换 + 收紧文件权限。"""
+    """整体写回配置（调用方负责合并已有键）；原子替换 + 收紧文件权限。
+
+    临时文件名必须唯一：固定叫 config.json.tmp 时，两个并发写（改密 + 切模式）
+    会往同一个文件里写，后一个 os.replace 还可能在 Windows 上直接
+    FileNotFoundError（文件已被前一个挪走）；写入交错则可能落下半截 JSON，
+    而 load_config 对解析失败是「失败关闭」，整个服务从此登不进去。
+    """
     global _config_cache, _config_stamp
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload: str = json.dumps(config, indent=2, ensure_ascii=False)
-    temp_path = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
-    temp_path.write_text(payload, encoding="utf-8")
-    try:
-        os.chmod(temp_path, 0o600)  # 配置含口令哈希，仅属主可读
-    except OSError:
-        pass
-    os.replace(temp_path, CONFIG_PATH)
-    _config_cache = None
-    _config_stamp = None
+    with _config_write_lock:
+        handle: int = -1
+        temp_path: str = ""
+        try:
+            handle, temp_path = tempfile.mkstemp(
+                prefix=CONFIG_PATH.name + ".", suffix=".tmp", dir=str(CONFIG_PATH.parent)
+            )
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                handle = -1
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.chmod(temp_path, 0o600)  # 配置含口令哈希，仅属主可读
+            except OSError:
+                pass
+            os.replace(temp_path, CONFIG_PATH)
+        except BaseException:
+            if handle >= 0:
+                os.close(handle)
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+            raise
+        _config_cache = None
+        _config_stamp = None
 
 
 def set_data_mode(mode: str) -> str:
@@ -254,11 +288,27 @@ def change_password(old_password: str, new_password: str) -> JSONResponse:
     config["password"] = hash_password(candidate)
     config["password_changed"] = True
     save_config(config)
-    _sessions.clear()
+    with _state_lock:
+        _sessions.clear()
     log_event("warn", "user", "PASSWORD_CHANGED", "管理员密码已修改，所有会话失效")
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(COOKIE_NAME)
     return resp
+
+
+def client_from_request(request: Request) -> str:
+    """请求来源标识：默认取 socket 对端地址。
+
+    置于反向代理之后时对端恒为 127.0.0.1，所有人共用一个锁定计数——一个人输错
+    5 次就把全厂锁在门外。显式开启 EMS_TRUST_PROXY_HEADERS 后改用
+    X-Forwarded-For 的第一跳。该头可被伪造，所以只在后端仅代理可达时开启。
+    """
+    if TRUST_PROXY_HEADERS:
+        forwarded: str = request.headers.get("x-forwarded-for", "")
+        first: str = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else ""
 
 
 def _client_key(client: str) -> str:
@@ -267,20 +317,25 @@ def _client_key(client: str) -> str:
 
 def is_login_locked(client: str = "") -> bool:
     """该来源是否处于登录失败锁定期。"""
-    state: dict[str, float] | None = _fail_state.get(_client_key(client))
-    if not state:
-        return False
-    return float(state.get("until", 0.0)) > time.time()
+    with _state_lock:
+        state: dict[str, float] | None = _fail_state.get(_client_key(client))
+        if not state:
+            return False
+        return float(state.get("until", 0.0)) > time.time()
 
 
 def _record_login_failure(client: str = "") -> None:
     """记录一次失败；达到阈值则锁定一段时间并清空计数。"""
     key: str = _client_key(client)
-    state: dict[str, float] = _fail_state.setdefault(key, {"count": 0.0, "until": 0.0})
-    state["count"] = float(state.get("count", 0.0)) + 1.0
-    if state["count"] >= LOGIN_FAIL_LIMIT:
-        state["until"] = time.time() + LOGIN_LOCK_SEC
-        state["count"] = 0.0
+    locked: bool = False
+    with _state_lock:
+        state: dict[str, float] = _fail_state.setdefault(key, {"count": 0.0, "until": 0.0})
+        state["count"] = float(state.get("count", 0.0)) + 1.0
+        if state["count"] >= LOGIN_FAIL_LIMIT:
+            state["until"] = time.time() + LOGIN_LOCK_SEC
+            state["count"] = 0.0
+            locked = True
+    if locked:  # 日志在锁外写：db 有自己的一把锁，不要嵌套持有
         log_event(
             "warn", "api", "LOGIN_LOCKED",
             f"登录失败次数达到 {LOGIN_FAIL_LIMIT} 次，来源 {key} 锁定 {int(LOGIN_LOCK_SEC)} 秒",
@@ -288,7 +343,8 @@ def _record_login_failure(client: str = "") -> None:
 
 
 def _clear_login_failures(client: str = "") -> None:
-    _fail_state.pop(_client_key(client), None)
+    with _state_lock:
+        _fail_state.pop(_client_key(client), None)
 
 
 def _upgrade_plaintext_password(password: str) -> None:
@@ -309,14 +365,22 @@ def _upgrade_plaintext_password(password: str) -> None:
 
 
 def _prune_sessions(now: float) -> None:
-    """定期清掉过期会话，避免内存里长期堆积无效 token。"""
+    """定期清掉过期会话与失效的失败计数，避免内存长期堆积。
+
+    _fail_state 原来只增不减：扫描器换着源 IP 撞库时，每个 IP 留一条记录永不释放。
+    锁定已过期且计数归零的来源在这里一并清掉。
+    """
     global _last_prune
-    if now - _last_prune < 300:
-        return
-    _last_prune = now
-    for token, expire_at in list(_sessions.items()):
-        if expire_at < now:
-            _sessions.pop(token, None)
+    with _state_lock:
+        if now - _last_prune < 300:
+            return
+        _last_prune = now
+        for token, expire_at in list(_sessions.items()):
+            if expire_at < now:
+                _sessions.pop(token, None)
+        for key, state in list(_fail_state.items()):
+            if float(state.get("until", 0.0)) < now and float(state.get("count", 0.0)) <= 0.0:
+                _fail_state.pop(key, None)
 
 
 def login(password: str, response: Response, client: str = "") -> JSONResponse:
@@ -348,7 +412,8 @@ def login(password: str, response: Response, client: str = "") -> JSONResponse:
             status_code=503,
         )
     token = secrets.token_hex(32)
-    _sessions[token] = time.time() + SESSION_TTL
+    with _state_lock:
+        _sessions[token] = time.time() + SESSION_TTL
     resp = JSONResponse({"ok": True, "must_change_password": must_change_password()})
     resp.set_cookie(
         COOKIE_NAME, token, max_age=SESSION_TTL,
@@ -362,7 +427,8 @@ def logout(request: Request) -> JSONResponse:
     """清除内存会话与浏览器 cookie。"""
     token: str | None = request.cookies.get(COOKIE_NAME)
     if token:
-        _sessions.pop(token, None)
+        with _state_lock:
+            _sessions.pop(token, None)
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(COOKIE_NAME)
     return resp
@@ -375,10 +441,11 @@ def current_user(request: Request) -> bool:
         return False
     now: float = time.time()
     _prune_sessions(now)
-    exp: float | None = _sessions.get(token)
-    if not exp or exp < now:
-        _sessions.pop(token, None)
-        return False
+    with _state_lock:
+        exp: float | None = _sessions.get(token)
+        if not exp or exp < now:
+            _sessions.pop(token, None)
+            return False
     return True
 
 
