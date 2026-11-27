@@ -288,6 +288,10 @@ class MeterIn(_BaseIn):
 
     shutdown_power_w 是停机判定阈值（W）：该小时平均功率低于它就当停机，
     不计入日结算的覆盖率分母。留空则用全局 EMS_SHUTDOWN_POWER_W（0=不判定）。
+
+    max_reading_kwh 是累计电量量程（kWh）：机械表走到满量程会归零重计，
+    填了量程才能把「读数回退」判定为翻转并补回那一小时的用量。留空则维持
+    「按 0 计 + METER_RESET 留痕」的保守行为。
     """
 
     name: str
@@ -297,6 +301,7 @@ class MeterIn(_BaseIn):
     is_counted: int = 1
     is_enabled: int = 1
     shutdown_power_w: float | None = None
+    max_reading_kwh: float | None = None
     remark: str | None = None
 
     @field_validator("purpose")
@@ -318,6 +323,25 @@ class MeterIn(_BaseIn):
             raise ValueError("停机阈值不能为负（0 表示不判定停机）")
         if value > MANUAL_MAX_ABS_VALUE:
             raise ValueError("停机阈值过大，请确认单位是 W")
+        return value
+
+    @field_validator("max_reading_kwh")
+    @classmethod
+    def _max_reading(cls, value: float | None) -> float | None:
+        """量程必须为正有限值。
+
+        填 0 或负数会被聚合侧当成「不修正」，等于静默失效；填 inf/nan 更会让
+        「量程 − 旧值」算出 inf，直接污染 hourly。因此在这里就拒掉，让填错的人
+        当场看到 400，而不是三个月后发现电量少了。
+        """
+        if value is None:
+            return None
+        if not math.isfinite(value):
+            raise ValueError("表计量程必须是有限数值")
+        if value <= 0:
+            raise ValueError("表计量程必须大于 0（留空表示不做翻转修正）")
+        if value > MANUAL_MAX_ABS_VALUE:
+            raise ValueError("表计量程过大，请确认单位是 kWh")
         return value
 
 

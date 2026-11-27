@@ -38,6 +38,24 @@ from settings import (
 )
 
 
+def _rollover_max(per_meter: Any) -> float:
+    """单表累计电量量程（kWh）：NULL/非法值一律视为「不修正」。
+
+    只有正有限值才启用翻转判定。填错量程（比如把 10000 写成 100000）会让一次
+    正常的换表回退被算成「翻了半圈」，产出几十万度的假电量，因此宁可保守：
+    值不合理就退回「按 0 计 + 留痕」，让人在事件日志里看到原始读数。
+    """
+    if per_meter is None:
+        return 0.0
+    try:
+        value: float = float(per_meter)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
+    return value
+
+
 def _shutdown_threshold(per_meter: Any) -> float:
     """单表停机阈值（W）：表上填了就用表上的，否则回退全局 EMS_SHUTDOWN_POWER_W。
 
@@ -185,6 +203,83 @@ class Aggregator:
                 "info", "collector", "ROLLUP_HOUR_DONE", f"小时汇总完成 hour_start={hour_start}"
             )
 
+    def _resolve_backward_reading(
+        self,
+        meter_id: int,
+        point_id: int,
+        base: dict[str, Any],
+        end: dict[str, Any],
+        hour_start: int,
+        hour_end: int,
+        delta_kwh: float,
+    ) -> float:
+        """累计读数回退时的三种处置：满量程翻转 / 换表 / 无法判定。
+
+        「累计值回退」只有三种成因，旧实现一律按 0 计，代价是那一小时的电量直接
+        丢掉且日报照常定稿（偏小无声）。现在按证据分派：
+
+        1. **满量程翻转**：表配了 `max_reading_kwh` 且两端读数都落在 [0, 量程] 内，
+           按 `(量程 − 旧值) + 新值` 补回真实用量。机械表走到 99999.9 归零是硬件
+           行为，不是数据异常，丢掉这一小时等于每月白送一段电量。
+        2. **换表**：旧表被拆、新表底数更小。旧表在换表那一刻的读数不可知，但
+           「本小时窗口内新表第一条读数 → 收口读数」是可测的，用它当基准，本小时
+           记新表这一段的用量，而不是记 0。
+        3. **无法判定**：在窗口里找不到可用的新基准，或算出来仍是负数。维持旧行为
+           记 0，但事件里带上旧/新两个原始读数，方便现场核对底数。
+
+        返回值恒 ≥ 0：任何分支算出的负数都退化成 0，绝不把负电量写进 hourly。
+        """
+        old_reading: float = float(base["value"])
+        new_reading: float = float(end["value"])
+
+        meter = db.query_one("SELECT max_reading_kwh FROM meter WHERE id=?", (meter_id,))
+        rollover_max: float = _rollover_max(meter["max_reading_kwh"] if meter else None)
+        if rollover_max > 0 and 0 <= old_reading <= rollover_max and 0 <= new_reading <= rollover_max:
+            wrapped: float = (rollover_max - old_reading) + new_reading
+            if 0 <= wrapped < rollover_max:
+                db.log_event(
+                    "warn", "collector", "METER_ROLLOVER",
+                    f"表 {meter_id} 满量程翻转 {old_reading:.3f} → {new_reading:.3f}"
+                    f"（量程 {rollover_max:g} kWh），本小时按 {wrapped:.6f} kWh 计",
+                    meter_id,
+                )
+                return wrapped
+
+        # 换表：用窗口内新表首条读数当基准。要求它严格早于收口读数、且不大于它，
+        # 否则说明读数在一小时内还在往下掉（异常/回零中），交给下面的「无法判定」。
+        first_in_window = db.query_one(
+            "SELECT value, ts FROM reading WHERE point_id=? AND ts>? AND ts<=? "
+            "AND quality IN (0,3) ORDER BY ts ASC LIMIT 1",
+            (point_id, hour_start, hour_end),
+        )
+        if (
+            first_in_window is not None
+            and int(first_in_window["ts"]) < int(end["ts"])
+            and int(first_in_window["ts"]) > int(base["ts"])
+        ):
+            first_value: float = float(first_in_window["value"])
+            swapped: float = new_reading - first_value
+            # 有量程时用它兜底：超过一个量程的「换表增量」只能是脏数据
+            sane_upper: float = rollover_max if rollover_max > 0 else math.inf
+            if 0 <= swapped < sane_upper:
+                db.log_event(
+                    "warn", "collector", "METER_SWAP",
+                    f"表 {meter_id} 累计值回退，疑似换表：旧表基准 {old_reading:.3f}，"
+                    f"新表首条 {first_value:.3f} → 收口 {new_reading:.3f}，"
+                    f"本小时按新表 {swapped:.6f} kWh 计（旧表末段不可知，未计入）",
+                    meter_id,
+                )
+                return swapped
+
+        db.log_event(
+            "warn", "collector", "METER_RESET",
+            f"表 {meter_id} 累计值回退 {delta_kwh:.6f} kWh（{old_reading:.3f} → "
+            f"{new_reading:.3f}），无法判定翻转或换表，本小时按 0 计；"
+            "若为满量程翻转请在表上填 max_reading_kwh，若为换表请核对新表底数",
+            meter_id,
+        )
+        return 0.0
+
     def _rollup_one_meter(self, meter_id: int, hour_start: int, hour_end: int) -> bool:
         """单表小时汇总：返回是否回退了「窗口内首条」作为基准。
 
@@ -228,12 +323,9 @@ class Aggregator:
 
         delta_kwh: float = float(end["value"]) - float(base["value"])
         if delta_kwh < 0:
-            # 累计值回退（换表/溢出）：本小时记 0 并留审计痕迹
-            db.log_event(
-                "warn", "collector", "METER_RESET",
-                f"表 {meter_id} 累计值回退 {delta_kwh:.6f} kWh，按 0 计", meter_id,
+            delta_kwh = self._resolve_backward_reading(
+                meter_id, point_id, base, end, hour_start, hour_end, delta_kwh
             )
-            delta_kwh = 0.0
         energy_wh: int = int(round(delta_kwh * MILLI_PER_KWH))
 
         # 瞬时功率：同表所有 role='power' 的点的平均/最大值（仅 quality=0）。

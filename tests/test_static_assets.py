@@ -234,3 +234,37 @@ def test_workflow_smoke_tests_packaged_exe(isolated_db):
     assert "/healthz" in yml, "冒烟步骤必须真的请求 /healthz"
     assert "Start-Process" in yml, "冒烟步骤必须实际启动 exe"
     assert "HasExited" in yml and "ExitCode" in yml, "必须捕获「启动即退出」并把退出码带进报错"
+
+
+def test_docs_use_local_swagger_assets(isolated_db):
+    """`/docs` 必须完全离线：不能出现 CDN 域名，且本地资源确实存在且非空。
+
+    工控机现场通常断网，`get_swagger_ui_html` 默认的 jsdelivr 地址会让文档页变成
+    空白——这与「解压即用、零外部依赖」的定位直接冲突。
+    """
+    source = (SRC_ROOT / "main.py").read_text(encoding="utf-8")
+    assert "cdn.jsdelivr.net" not in source, "main.py 不得引用 CDN"
+    assert "/vendor/swagger-ui/swagger-ui-bundle.js" in source
+    assert "/vendor/swagger-ui/swagger-ui.css" in source
+    # favicon 也走本地/占位，否则仍是一条第必然失败的外部请求
+    assert "swagger_favicon_url" in source
+
+    for name, min_size in (("swagger-ui-bundle.js", 500_000), ("swagger-ui.css", 50_000)):
+        path = SRC_ROOT / "dashboard" / "vendor" / "swagger-ui" / name
+        assert path.is_file(), f"缺少本地 Swagger 资源 {name}"
+        assert path.stat().st_size >= min_size, f"{name} 疑似下载不完整（{path.stat().st_size} 字节）"
+
+    spec = (SRC_ROOT / "energy-ems.spec").read_text(encoding="utf-8")
+    assert "dashboard/vendor/swagger-ui" in spec, "PyInstaller 必须把离线文档资源打进包"
+
+
+def test_docs_response_points_to_local_assets(isolated_db):
+    """真正渲染出来的 HTML 里也必须是本地地址（改参数不等于改行为）。"""
+    import main
+    from helpers import run
+
+    response = run(main.swagger_docs())
+    body = response.body.decode("utf-8")
+    assert "/vendor/swagger-ui/swagger-ui-bundle.js" in body
+    assert "/vendor/swagger-ui/swagger-ui.css" in body
+    assert "cdn.jsdelivr.net" not in body

@@ -85,6 +85,8 @@ class ConfigService:
         # 停机阈值直接决定「哪天算已结算」，改它必须连新旧值一起留痕，
         # 否则事后只能看到「shutdown_power_w 变了」，查不出改成多少。
         "shutdown_power_w",
+        # 量程决定翻转修正是否生效：改错会让某小时电量翻倍或归零，同样要留痕。
+        "max_reading_kwh",
     })
     AUDIT_MAX_FIELDS: int = 12
 

@@ -14,6 +14,11 @@ block_cipher = None
 datas = [
     ("schema.sql", "."),
     ("dashboard/index.html", "dashboard"),
+    # /docs 的 Swagger UI 资源：纯内网工控机打不开 CDN，必须随包分发。
+    # 目录结构要与 StaticFiles(directory=resource_dir()/dashboard) 的挂载点一致，
+    # 即运行时 URL /vendor/swagger-ui/*.js 对应 _internal/dashboard/vendor/swagger-ui/*.js。
+    ("dashboard/vendor/swagger-ui/swagger-ui-bundle.js", "dashboard/vendor/swagger-ui"),
+    ("dashboard/vendor/swagger-ui/swagger-ui.css", "dashboard/vendor/swagger-ui"),
 ]
 
 hiddenimports = [

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import struct
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -32,6 +34,40 @@ try:  # pyserial 为可选依赖：仅 modbus_rtu_serial 协议需要
     import serial  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover - 未安装时惰性报错，不影响 TCP 协议
     serial = None  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------- 串口总线互斥
+# 一个 COM 口（一根 RS485 线）上通常挂多台从站，各点位在 collector 里是独立任务。
+# 两帧交错写下去，从站会回错帧或干脆不回：CRC 校验可能通过、站号校验也可能通过
+# （同一总线上确有该站），最终表现为「某台表读数偶尔乱跳」这种最难查的现场故障。
+# 因此按端口做进程内互斥，并保证帧间静默 ≥ 3.5 字符时间（Modbus RTU 规范要求）。
+_serial_port_locks: dict[str, asyncio.Lock] = {}
+_serial_last_io: dict[str, float] = {}
+
+
+def _serial_port_key(port_name: str) -> str:
+    """端口键：去空白 + normcase（Windows 上 COM3/com3 视为同一口）。"""
+    return os.path.normcase(str(port_name).strip())
+
+
+def _serial_port_lock(port_name: str) -> asyncio.Lock:
+    """取该端口专属的互斥锁（同端口跨客户端实例共享同一把）。"""
+    key: str = _serial_port_key(port_name)
+    lock: asyncio.Lock | None = _serial_port_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _serial_port_locks[key] = lock
+    return lock
+
+
+def serial_frame_gap_sec(baudrate: int, parity: str = "N") -> float:
+    """RTU 帧间静默时间（秒）：3.5 个字符时间。
+
+    一个字符 = 1 起始位 + 8 数据位 +（有校验时 1 位）+ 1 停止位，即 10 或 11 位。
+    9600-8N1 约 3.6ms，115200-8N1 约 0.3ms。
+    """
+    bits: int = 11 if str(parity or "N").upper() in ("E", "O") else 10
+    return 3.5 * bits / float(max(1, int(baudrate)))
 
 
 class ModbusError(Exception):
@@ -457,7 +493,11 @@ class ModbusRTUSerialClient(BaseModbusClient):
             raise ModbusError(f"串口读取失败: {exc}") from exc
 
     async def read_registers(self, slave: int, func: int, offset: int, count: int) -> list[int]:
-        """线程池内完成串口 I/O，失败按 retry 重试。"""
+        """线程池内完成串口 I/O，失败按 retry 重试。
+
+        整段（含重试）持有该 COM 口的互斥锁：同一条 485 总线上的多台从站必须排队
+        发帧，否则两帧会交错写进同一根线。锁内先补足帧间静默（3.5 字符时间）再发。
+        """
         if func not in (3, 4):
             raise ValueError("func 仅支持 3 或 4")
         if not 1 <= count <= MODBUS_MAX_REGISTERS:
@@ -465,26 +505,35 @@ class ModbusRTUSerialClient(BaseModbusClient):
         adu: bytes = self.build_adu(slave, func, offset, count)
         expected_unit: int | None = self._pending_unit
         last_error: ModbusError = ModbusError("未知读取错误")
-        for attempt in range(self.retry + 1):
-            try:
-                frame: bytes = await asyncio.wait_for(
-                    asyncio.to_thread(self._read_sync, adu),
-                    timeout=max(0.1, self.timeout_ms / 1000.0 + 0.5),
-                )
-                registers: list[int] = self.parse_response(frame, expected_unit)
-                if len(registers) < count:
-                    raise ModbusError(f"返回寄存器数量不足：需要 {count}，实际 {len(registers)}")
-                return registers[:count]
-            except asyncio.TimeoutError:
-                last_error = ModbusTimeoutError(f"串口 {self.port_name} 读取超时")
-            except (OSError, ValueError, struct.error) as exc:
-                last_error = ModbusError(str(exc))
-            except ModbusExceptionResponse:
-                raise
-            except ModbusError as exc:
-                last_error = exc
-            if attempt < self.retry:
-                await asyncio.sleep(min(0.05 * (2 ** attempt), 1.0))
+        key: str = _serial_port_key(self.port_name)
+        gap: float = serial_frame_gap_sec(self.baudrate, self.parity())
+        async with _serial_port_lock(self.port_name):
+            for attempt in range(self.retry + 1):
+                # 帧间静默：距上一帧（本口任意从站）不足 3.5 字符时间就等够再发
+                wait: float = gap - (time.monotonic() - _serial_last_io.get(key, 0.0))
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                try:
+                    frame: bytes = await asyncio.wait_for(
+                        asyncio.to_thread(self._read_sync, adu),
+                        timeout=max(0.1, self.timeout_ms / 1000.0 + 0.5),
+                    )
+                    registers: list[int] = self.parse_response(frame, expected_unit)
+                    if len(registers) < count:
+                        raise ModbusError(f"返回寄存器数量不足：需要 {count}，实际 {len(registers)}")
+                    return registers[:count]
+                except asyncio.TimeoutError:
+                    last_error = ModbusTimeoutError(f"串口 {self.port_name} 读取超时")
+                except (OSError, ValueError, struct.error) as exc:
+                    last_error = ModbusError(str(exc))
+                except ModbusExceptionResponse:
+                    raise
+                except ModbusError as exc:
+                    last_error = exc
+                finally:
+                    _serial_last_io[key] = time.monotonic()
+                if attempt < self.retry:
+                    await asyncio.sleep(min(0.05 * (2 ** attempt), 1.0))
         raise last_error
 
 

@@ -32,6 +32,15 @@ PyInstaller 产物内置以下运行时组件，同样需要在使用者文档�
 | zlib / libffi / XZ | zlib / MIT / Public Domain | 标准库压缩与 FFI 依赖 |
 | tzdata（若随包） | Apache-2.0 | 时区数据 |
 
+## 随包静态资源
+
+| 组件 | 版本 | 许可证 | 说明 |
+|---|---|---|---|
+| [Swagger UI](https://github.com/swagger-api/swagger-ui) | 5.17.14 | Apache-2.0 | `/docs` 接口文档页的前端资源，位于 `dashboard/vendor/swagger-ui/`。**为支持纯内网离线使用，按原样内置，未做修改**；其中内嵌 normalize.css（MIT）。 |
+
+> Swagger UI 原文件头部保留其版权与许可声明；本项目未修改其源码，仅作为静态资源分发。
+> 若需完整许可文本，见 <https://github.com/swagger-api/swagger-ui/blob/master/LICENSE>。
+
 ## 说明
 
 - 本项目**未使用** `pymodbus`，Modbus TCP / RTU-over-TCP / RTU 串口均为自研实现（`modbus.py`），

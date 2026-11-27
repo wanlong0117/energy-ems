@@ -1,10 +1,13 @@
 """aggregation.py 验证：小时汇总、08:00(UTC 00:00) 日结算、电费与 purpose 拆分。"""
 from __future__ import annotations
 
+import pytest
+
 from datetime import datetime, timezone
 
 import db
 from aggregation import Aggregator
+from settings import MILLI_PER_KWH
 from helpers import (
     add_reading, create_device, create_meter, create_node, create_point,
     create_tariff, fill_hourly, link_point,
@@ -116,3 +119,79 @@ def test_meter_reset_is_clamped_and_logged(isolated_db):
     row = db.query_one("SELECT energy_wh FROM hourly WHERE meter_id=?", (meter_id,))
     assert row["energy_wh"] == 0  # 累计值回退按 0 计
     assert db.query_one("SELECT 1 FROM event_log WHERE code='METER_RESET'") is not None
+
+
+# ---------------------------------------------------------------- 满量程翻转 / 换表
+def _meter_with_readings(readings: list[tuple[int, float]], *, max_kwh: float | None = None) -> tuple[int, int]:
+    """建一块表 + 一个累计电量点，按 (ts 偏移, 读数) 灌读数，可选设置量程。"""
+    node_id = create_node(name="翻转楼")
+    device_id = create_device(name="翻转网关")
+    point_id = create_point(device_id, name="翻转电量", reg_offset=0, reg_count=2, data_type="u32")
+    meter_id = create_meter(node_id, name="翻转表")
+    link_point(meter_id, point_id, "reading")
+    if max_kwh is not None:
+        db.execute("UPDATE meter SET max_reading_kwh=? WHERE id=?", (max_kwh, meter_id))
+    for offset, value in readings:
+        add_reading(point_id, DAY_START + offset, value)
+    return meter_id, point_id
+
+
+def test_rollover_uses_configured_max_reading(isolated_db):
+    """配置量程后，999→5 这类满量程归零必须按 (量程-旧)+新 补回，而不是记 0。"""
+    # Arrange：量程 1000 kWh，本小时从 980 走到 5（翻过 1000 归零）
+    meter_id, _ = _meter_with_readings(
+        [(-600, 980.0), (600, 992.0), (1800, 5.0)], max_kwh=1000.0
+    )
+    # Act
+    Aggregator().rollup_hour(DAY_START)
+    # Assert：跨量程真实用量 = (1000-980) + 5 = 25 kWh
+    row = db.query_one("SELECT energy_wh FROM hourly WHERE meter_id=?", (meter_id,))
+    assert row["energy_wh"] == 25 * MILLI_PER_KWH
+    event = db.query_one("SELECT message FROM event_log WHERE code='METER_ROLLOVER'")
+    assert event is not None and "1000" in event["message"]
+
+
+def test_rollover_ignored_when_max_not_configured(isolated_db):
+    """没配量程时不得擅自猜测：维持按 0 计，但事件里要给出现场可行动的提示。"""
+    meter_id, _ = _meter_with_readings([(-600, 980.0), (1800, 5.0)])
+    Aggregator().rollup_hour(DAY_START)
+    row = db.query_one("SELECT energy_wh FROM hourly WHERE meter_id=?", (meter_id,))
+    assert row["energy_wh"] == 0
+    event = db.query_one("SELECT message FROM event_log WHERE code='METER_RESET'")
+    assert event is not None
+    assert "max_reading_kwh" in event["message"], "提示必须告诉现场该填哪个字段"
+
+
+def test_rollover_rejects_out_of_range_readings(isolated_db):
+    """读数超出量程（量程填小了）时不做翻转修正，避免算出假电量。"""
+    meter_id, _ = _meter_with_readings([(-600, 1200.0), (1800, 5.0)], max_kwh=1000.0)
+    Aggregator().rollup_hour(DAY_START)
+    row = db.query_one("SELECT energy_wh FROM hourly WHERE meter_id=?", (meter_id,))
+    assert row["energy_wh"] == 0
+
+
+def test_meter_swap_uses_first_reading_in_window(isolated_db):
+    """换表：旧表 5000 被拆，新表底数 3，本小时走 3→12，应记 9 kWh 而不是 0。"""
+    meter_id, _ = _meter_with_readings([(-600, 5000.0), (600, 3.0), (1800, 12.0)])
+    Aggregator().rollup_hour(DAY_START)
+    row = db.query_one("SELECT energy_wh FROM hourly WHERE meter_id=?", (meter_id,))
+    assert row["energy_wh"] == 9 * MILLI_PER_KWH
+    assert db.query_one("SELECT 1 FROM event_log WHERE code='METER_SWAP'") is not None
+
+
+def test_meter_swap_never_writes_negative_energy(isolated_db):
+    """读数在一小时内继续往下掉时，换表分支必须退化为 0，绝不写负电量。"""
+    meter_id, _ = _meter_with_readings([(-600, 5000.0), (1200, 30.0), (1800, 12.0)])
+    Aggregator().rollup_hour(DAY_START)
+    row = db.query_one("SELECT energy_wh FROM hourly WHERE meter_id=?", (meter_id,))
+    assert row["energy_wh"] == 0
+    assert db.query_one("SELECT 1 FROM event_log WHERE code='METER_RESET'") is not None
+
+
+@pytest.mark.parametrize("bad_max", [0.0, -5.0])
+def test_invalid_max_reading_falls_back_to_conservative_path(isolated_db, bad_max):
+    """量程被写成 0/负数（绕过 API 直接改库）时，按「未配置」处理。"""
+    meter_id, _ = _meter_with_readings([(-600, 980.0), (1800, 5.0)], max_kwh=bad_max)
+    Aggregator().rollup_hour(DAY_START)
+    row = db.query_one("SELECT energy_wh FROM hourly WHERE meter_id=?", (meter_id,))
+    assert row["energy_wh"] == 0, f"量程 {bad_max} 不应触发翻转修正"

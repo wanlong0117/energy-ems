@@ -66,6 +66,15 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$dist/scripts" | Out-Null
           Copy-Item -Path scripts/backup.py, scripts/recompute.py, scripts/clear_demo.py `
             -Destination "$dist/scripts" -Force
+          # 服务化安装脚本随包：README_DEPLOY 第 9 节是生产默认方式，
+          # 用户从 zip 解压后必须能直接拿到，不能让人回源码仓库找。
+          New-Item -ItemType Directory -Force -Path "$dist/scripts/windows" | Out-Null
+          Copy-Item -Path scripts/windows/* -Destination "$dist/scripts/windows" -Force
+          $winFiles = @("energy-ems-service.xml", "install-service.bat", "uninstall-service.bat",
+                        "install-autostart-task.bat", "uninstall-autostart-task.bat")
+          foreach ($f in $winFiles) {
+            if (-not (Test-Path "$dist/scripts/windows/$f")) { throw "发布目录缺少 scripts/windows/$f" }
+          }
           foreach ($f in @("LICENSE", "THIRD_PARTY_NOTICES.md")) {
             if (-not (Test-Path "$dist/licenses/$f")) { throw "发布目录缺少 licenses/$f" }
           }
@@ -116,7 +125,13 @@ jobs:
             '^licenses/LICENSE$',
             '^licenses/THIRD_PARTY_NOTICES\.md$',
             '(^|/)schema\.sql$',
-            '(^|/)dashboard/index\.html$'
+            '(^|/)dashboard/index\.html$',
+            # 离线 Swagger：纯内网工控机打不开 CDN，资源必须随包
+            '(^|/)dashboard/vendor/swagger-ui/swagger-ui-bundle\.js$',
+            '(^|/)dashboard/vendor/swagger-ui/swagger-ui\.css$',
+            # 服务化脚本：生产部署第一步就要用
+            '(^|/)scripts/windows/install-service\.bat$',
+            '(^|/)scripts/windows/energy-ems-service\.xml$'
           )
           $missing = @()
           foreach ($pattern in $required) {

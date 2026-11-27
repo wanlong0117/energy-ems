@@ -157,6 +157,7 @@ CREATE TABLE {name} (
   is_enabled    INTEGER NOT NULL DEFAULT 1,
   is_demo       INTEGER NOT NULL DEFAULT 0,
   shutdown_power_w REAL,
+  max_reading_kwh REAL,
   remark        TEXT
 )""",
     "tariff": """
@@ -192,7 +193,7 @@ _REBUILD_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "meter": (
         "id", "name", "node_id", "category_id", "purpose", "is_counted", "daily_8am",
-        "is_enabled", "is_demo", "shutdown_power_w", "remark",
+        "is_enabled", "is_demo", "shutdown_power_w", "max_reading_kwh", "remark",
     ),
     "tariff": ("id", "name", "price_cent", "start_hour", "end_hour", "is_default"),
 }
@@ -243,6 +244,20 @@ def _v8_shutdown_threshold(conn: sqlite3.Connection) -> None:
     _add_column(conn, "daily", "shutdown_hours", "INTEGER NOT NULL DEFAULT 0")
 
 
+def _v9_meter_rollover(conn: sqlite3.Connection) -> None:
+    """电表满量程翻转：meter.max_reading_kwh（可选，单位 kWh）。
+
+    机械式/部分电子式电度表累计到量程上限会归零重计（如 99999.9 → 0.0）。
+    不做修正时，聚合侧只能看到「累计值回退」，按 0 计——那一小时的电量直接丢掉，
+    日报偏小但没有任何异常提示。填了量程后，回退可判定为翻转并按
+    `(量程 - 旧值) + 新值` 补回；没填则保持原行为（记 0 + METER_RESET 留痕）。
+
+    默认 NULL 而不是猜一个量程：错判量程会把真实的换表/异常读数算成天文数字电量，
+    比少计更难收拾。历史小时/日报不回填——当时的读数已清理（90 天），无从重算。
+    """
+    _add_column(conn, "meter", "max_reading_kwh", "REAL")
+
+
 MIGRATIONS: list[Migration] = [
     (1, "baseline: 13 张表", _v1_baseline),
     (2, "daily 增加电价与价格快照字段", _v2_daily_price_snapshot),
@@ -252,6 +267,7 @@ MIGRATIONS: list[Migration] = [
     (6, "daily 增加 covered_hours", _v6_daily_covered_hours),
     (7, "实体主键改 AUTOINCREMENT", _v7_autoincrement),
     (8, "停机判定：meter.shutdown_power_w 与 daily.shutdown_hours", _v8_shutdown_threshold),
+    (9, "电表满量程翻转：meter.max_reading_kwh", _v9_meter_rollover),
 ]
 
 # 需要临时关闭外键的迁移：SQLite 不允许在事务内改 PRAGMA foreign_keys

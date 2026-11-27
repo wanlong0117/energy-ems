@@ -148,8 +148,20 @@ async def openapi_spec() -> JSONResponse:
 
 @app.get("/docs", include_in_schema=False, dependencies=[Depends(require_auth)])
 async def swagger_docs() -> HTMLResponse:
-    """带鉴权的接口文档页（Swagger UI 静态资源取自 CDN，纯内网可能渲染不出）。"""
-    return get_swagger_ui_html(openapi_url="/openapi.json", title="energy_ems API")
+    """带鉴权的接口文档页。
+
+    Swagger UI 的 js/css 走本地 `dashboard/vendor/swagger-ui/`（由下方 `/` 静态挂载提供），
+    不再引用 CDN：工控机现场普遍断网，`get_swagger_ui_html` 默认的 jsdelivr 地址会让
+    `/docs` 变成一张空白页——而「离线零依赖」正是本项目的定位之一。
+    favicon 用 `data:,` 占位，同样避免一条必然失败的外部请求。
+    """
+    return get_swagger_ui_html(
+        openapi_url="/openapi.json",
+        title="energy_ems API",
+        swagger_js_url="/vendor/swagger-ui/swagger-ui-bundle.js",
+        swagger_css_url="/vendor/swagger-ui/swagger-ui.css",
+        swagger_favicon_url="data:,",
+    )
 
 
 @app.exception_handler(HTTPException)

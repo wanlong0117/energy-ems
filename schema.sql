@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS meter (
   is_enabled    INTEGER NOT NULL DEFAULT 1,
   is_demo       INTEGER NOT NULL DEFAULT 0,        -- 1=模拟器预置表，live 模式下自动停用并排除结算
   shutdown_power_w REAL,                           -- 停机功率阈值(W)；NULL=用全局 EMS_SHUTDOWN_POWER_W
+  max_reading_kwh REAL,                            -- 累计电量量程(kWh)；配了才做满量程翻转修正，NULL=不修正
   remark        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_meter_node ON meter(node_id);

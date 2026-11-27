@@ -12,6 +12,7 @@ energy_ems/
 ├── README_DEPLOY.md      # 本说明
 ├── licenses/             # LICENSE（MIT）与 THIRD_PARTY_NOTICES.md，随包分发不可删除
 ├── scripts/              # backup.py / recompute.py / clear_demo.py
+│   └── windows/          # 服务化安装脚本（WinSW / 计划任务），见第 9 节
 ├── config.json           # 首次运行自动生成（可写，exe 同级）
 └── energy.db             # 首次运行自动生成（可写，exe 同级）
 ```
@@ -28,9 +29,11 @@ energy_ems/
 > 原因是打包后按名字导入 `main` 模块失效（源码运行不受影响）。已在 v0.1.8 修复，
 > 并加了「CI 真跑 exe 打 `/healthz`」的冒烟检查防止复发。
 
-1. 解压 `energy-ems-v0.1.8-win11-x64.zip` 到任意目录（建议非中文路径、非 `C:\Program Files`，
+1. 解压 `energy-ems-v0.1.9-win11-x64.zip` 到任意目录（建议非中文路径、非 `C:\Program Files`，
    避免权限问题）。资产文件名带版本号，同一天的多个补丁包不会再同名。
 2. **双击 `energy_ems.exe`** 启动（`build_win11.bat` 为可选备用脚本）。
+   > 这是**试用**方式。生产现场请按**第 9 节**注册成 Windows 服务：断电重启 / 误关黑框
+   > 都会导致采集断档，而双击方式没有任何自动拉起能力。
 3. 打开浏览器访问 `http://127.0.0.1:8000/`，即可看到单文件看板。
 4. 默认密码 `ems2026`（见 config.json 的 `password`，可自行修改后重启）。
 
@@ -134,6 +137,31 @@ python scripts\recompute.py --db energy.db --strict-coverage  :: 按当前口径
 
 不加 `--strict-coverage` 时会保留原来的定稿标记，只更新数字与 `shutdown_hours`。
 
+## 4.1 累计值回退：满量程翻转与换表
+
+电表的累计电量只会往上走，一旦本小时收口读数比基准读数**小**，只可能是三种情况之一。
+0.1.8 及以前一律按 0 计（事件码 `METER_RESET`），代价是那一小时的电量凭空消失，
+而日报照常定稿——数字偏小但没有任何提示。0.1.9 起按证据分派：
+
+| 情况 | 判定依据 | 处置 | 事件码 |
+|---|---|---|---|
+| **满量程翻转** | 表上填了 `max_reading_kwh`，且新旧读数都在 `[0, 量程]` 内 | 按 `(量程 − 旧值) + 新值` 补回真实用量 | `METER_ROLLOVER` |
+| **换表** | 本小时窗口内还有新表读数，且严格晚于基准、不高于收口读数 | 以新表首条为基准重算本小时，旧表末段明确不计入 | `METER_SWAP` |
+| **无法判定** | 以上都不成立（读数还在往下掉、量程没填、窗口内无新基准） | 按 0 计，事件里带旧/新原始读数 | `METER_RESET` |
+
+**怎么填量程**：「配置 → meter → `max_reading_kwh`」，单位 kWh，就是表盘满量程。
+常见值：5(6) 位表 99999.9 / 999999.9，CT 变比要在一次侧折算。**不确定就别填**——
+填错量程的后果比少计严重得多：一次正常换表会被算成「翻了半圈」，直接产出几十万度的假电量。
+留空时行为与 0.1.8 完全一致。
+
+**换表注意**：换表那一小时只能算新表可测的那一段，旧表在被拆走那一刻的读数不可知，
+这部分电量永久丢失，需要的话从旧表铭牌/照片手工补录。换表后**不要**沿用旧表的
+`max_reading_kwh` 之外的假设：新表若接着旧表底数继续计（有些施工会做底数移植），
+就不会出现读数回退，按正常情况处理即可。
+
+> 三条事件都带 `ref_id` = 表 ID，可在事件日志页签按 `METER_` 前缀筛。
+> 翻转/换表是**硬件与施工事实**，不是故障：建议每次现场动作后核对一遍当日 `hourly`。
+
 ## 5. Modbus 三协议配置
 
 在「配置」页签的 `device` 资源中按协议填写：
@@ -147,6 +175,12 @@ python scripts\recompute.py --db energy.db --strict-coverage  :: 按当前口径
 
 点位试读（`/api/point/{id}/read`）返回原始寄存器十六进制、解析值和四种字节序对照值，
 超时上限 3 秒。若现场字节序未确认，用试读结果比对 `parsed_orders`。
+
+**一根 485 总线挂多台表**：给每块表建独立 `device`，但 `host` 填**同一个** COM 口
+（如都填 `COM3`），靠点位上的 `slave_id` 区分站号。0.1.9 起程序按 COM 口做了进程内
+互斥，多台表会排队发帧并保证 3.5 字符帧间静默；0.1.8 及以前没有这层保护，两帧可能
+交错写进同一根线，表现为「某台表读数偶尔乱跳」——这类故障 CRC 与站号校验都拦不住。
+如果现场仍跑着旧包，且出现个别表读数跳变，优先升级到 0.1.9 再排查接线与终端电阻。
 
 ## 6. 备份与恢复
 
@@ -224,16 +258,78 @@ python -m venv .venv
 ```
 
 macOS 不交叉产 exe；Windows 安装包仅由 GitHub Actions 的 `windows-latest` runner 产出，
-在 Actions 页面下载 `energy-ems-v0.1.8-win11-x64.zip` artifact 即可。
+在 Actions 页面下载 `energy-ems-v0.1.9-win11-x64.zip` artifact 即可。
 
 校验下载是否完整，两种都行：
 
 ```bat
 :: Windows
-certutil -hashfile energy-ems-v0.1.8-win11-x64.zip SHA256
+certutil -hashfile energy-ems-v0.1.9-win11-x64.zip SHA256
 ```
 
 ```bash
 # macOS / Linux：.sha256 自 0.1.7 起为纯 LF 行尾，可直接校验
-shasum -a 256 -c energy-ems-v0.1.8-win11-x64.zip.sha256
+shasum -a 256 -c energy-ems-v0.1.9-win11-x64.zip.sha256
 ```
+
+## 9. 设为 Windows 服务（开机自启，生产默认方式）
+
+双击 exe 只适合试用。**生产现场必须注册成服务**：工控机断电重启、值班员误关黑框、
+远程桌面掉线导致控制台被关，都会让采集断档，而断档期间的日结算会缺小时数据。
+
+`scripts/windows/` 下两套方案，按现场条件选：
+
+| 方案 | 需要什么 | 崩溃自动拉起 | 适用 |
+|---|---|---|---|
+| **A. WinSW 服务**（推荐） | 一个 `WinSW.exe`（约 1MB，需联网下载一次） | ✅ 15s→30s→60s 三级重启 | 7×24 无人值守，绝大多数现场 |
+| **B. 计划任务** | 不需要任何额外文件，纯系统自带 | ❌ 只有开机自启 | 现场完全断网、无法带入 WinSW |
+
+两套都会把 `config.json`、`energy.db`、`logs/` 留在 **exe 同级目录**（程序用
+`sys.executable` 定位数据目录，与工作目录无关），升级时只替换 exe 与 `_internal/` 即可。
+
+### 方案 A：WinSW 服务
+
+1. 从 https://github.com/winsw/winsw/releases 下载 **WinSW v3 x64**，重命名为 `WinSW.exe`。
+2. 把 `scripts/windows/` 下的 `energy-ems-service.xml`、`install-service.bat`、
+   `uninstall-service.bat` 与 `WinSW.exe` **一起复制到 `energy_ems.exe` 同级目录**。
+3. 右键 `install-service.bat` → **以管理员身份运行**。脚本会依次完成：
+   注册服务 → 启动 → 等 6 秒后打 `/healthz`，返回 200 才报 `[OK]`。
+4. 收尾确认：
+   - `services.msc` 里看到 **Energy EMS**，启动类型「自动（延迟启动）」；
+   - 浏览器打开 `http://127.0.0.1:8000/`；
+   - 日志落在 `logs\service-YYYYMMDD.log`（应用日志本是 stdout 单行 JSON，由 WinSW 落盘），
+     保留 14 天、单文件 10MB 自动轮转。
+5. 卸载：以管理员身份运行 `uninstall-service.bat`。**数据与日志不会被删除。**
+
+开机自启用了 30 秒延迟（`delayedAutoStart`），避免与工控机上其它采集软件抢 COM 口。
+停止服务时应用会收到 Ctrl+C，正常取消后台任务并记 `SHUTDOWN` 事件；20 秒未退出才强杀。
+
+### 方案 B：计划任务（无 WinSW 时）
+
+把 `install-autostart-task.bat` 复制到 exe 同级目录，管理员运行。它以 **SYSTEM** 身份
+在开机 30 秒后启动 `energy_ems.exe`，开机后无可见黑框。底层等价于：
+
+```bat
+schtasks /create /tn "Energy EMS" /tr "\"%CD%\energy_ems.exe\"" ^
+         /sc onstart /delay 0000:30 /ru SYSTEM /rl HIGHEST /f
+```
+
+> 注意：计划任务**不是服务**，进程崩了不会自动重启，也没有日志重定向——排查只能看
+> `energy.db` 的事件日志页签。能带入 `WinSW.exe` 就优先用方案 A。
+
+### 报错码对照
+
+| 码 | 含义 | 处理 |
+|---|---|---|
+| `E01` | 当前目录找不到 `energy_ems.exe` | 把脚本复制到解压目录（与 exe 同级）再运行 |
+| `E02` | 找不到 `WinSW.exe` | 下载 WinSW v3 x64 并改名为 `WinSW.exe`；或改用方案 B |
+| `E03` | 缺管理员权限 | 右键 → 以管理员身份运行 |
+| `E04` | 无法覆盖 `energy-ems-service.exe` | 先停服务：`energy-ems-service.exe stop` |
+| `E05` | 服务注册失败 | 确认系统有 .NET Framework 4.6.1+ |
+| `E06` | 服务起不来 | 看 `logs\service-*.log`，常见是 8000 端口被占 |
+| `E11` / `E12` | 卸载时找不到/删不掉服务 | 手工执行 `energy-ems-service.exe uninstall` |
+| `E21` / `E22` / `E23` | 计划任务创建/启动/删除失败 | 检查 Task Scheduler 服务与任务名 `Energy EMS` |
+
+> 脚本内的提示信息是英文：`cmd.exe` 按当前代码页解析批处理，UTF-8 中文在部分机器上会
+> 乱码甚至截断命令。中文说明只放在本文档里，脚本只输出稳定可查的错误码。
+

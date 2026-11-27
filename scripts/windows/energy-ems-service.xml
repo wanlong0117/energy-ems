@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Energy EMS · WinSW 服务配置（v0.1.9）
+  用法：把本文件与 install-service.bat / uninstall-service.bat / WinSW.exe
+        一起复制到 energy_ems.exe 同级的解压目录，然后以管理员身份运行 install-service.bat。
+  %BASE% = 本 XML 所在目录（即 energy_ems.exe 同级），因此可写数据 config.json / energy.db
+  仍然落在 exe 同级，与服务的工作目录无关。
+-->
+<service>
+  <id>energy-ems</id>
+  <name>Energy EMS</name>
+  <description>轻量能源管理系统（FastAPI + SQLite，默认监听 127.0.0.1:8000）</description>
+
+  <executable>%BASE%\energy_ems.exe</executable>
+  <workingdirectory>%BASE%</workingdirectory>
+  <startmode>Automatic</startmode>
+  <!-- 开机延迟自启：避免与工控机上其它采集软件抢 COM 口/CPU -->
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- 崩溃自动拉起：15s → 30s → 60s，稳定运行 1 小时后计数清零 -->
+  <onfailure action="restart" delay="15 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="restart" delay="60 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- 停止服务：先发 Ctrl+C（应用会取消后台任务并记 SHUTDOWN 事件），超时再强杀 -->
+  <stoptimeout>20 sec</stoptimeout>
+  <sleep>2000</sleep>
+
+  <!-- 应用日志是 stdout 单行 JSON（logging_config.py），由 WinSW 落盘并自动轮转 -->
+  <logpath>%BASE%\logs</logpath>
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10240</sizeThreshold>
+    <pattern>service-%d{yyyyMMdd}.log</pattern>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+    <keepFiles>14</keepFiles>
+  </log>
+</service>

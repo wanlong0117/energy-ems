@@ -838,12 +838,12 @@ const FIELDS = {
   device: ["name", "node_id", "protocol", "host", "port", "timeout_ms", "retry", "poll_interval", "is_enabled", "remark"],
   point: ["name", "device_id", "slave_id", "func_code", "reg_offset", "reg_count", "data_type", "byte_order", "scale", "offset_const", "min_val", "max_val", "unit", "is_enabled", "remark"],
   energy_category: ["name", "unit"],
-  meter: ["name", "node_id", "category_id", "purpose", "is_counted", "is_enabled", "shutdown_power_w", "remark"],
+  meter: ["name", "node_id", "category_id", "purpose", "is_counted", "is_enabled", "shutdown_power_w", "max_reading_kwh", "remark"],
   meter_point: ["meter_id", "point_id", "role"],
   tariff: ["name", "price_cent", "start_hour", "end_hour", "is_default"]
 };
 const INT_FIELDS = new Set(["parent_id", "node_id", "category_id", "meter_id", "point_id", "port", "timeout_ms", "retry", "poll_interval", "slave_id", "func_code", "reg_offset", "reg_count", "sort_order", "is_active", "is_enabled", "is_counted", "price_cent", "start_hour", "end_hour", "is_default"]);
-const FLOAT_FIELDS = new Set(["scale", "offset_const", "min_val", "max_val", "shutdown_power_w"]);
+const FLOAT_FIELDS = new Set(["scale", "offset_const", "min_val", "max_val", "shutdown_power_w", "max_reading_kwh"]);
 function selectOptions(field) {
   const map = {
     protocol: ["modbus_tcp", "modbus_rtu_tcp", "modbus_rtu_serial", "manual"],
