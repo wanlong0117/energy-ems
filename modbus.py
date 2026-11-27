@@ -77,6 +77,11 @@ def serial_frame_gap_sec(baudrate: int, parity: str = "N") -> float:
 
     一个字符 = 1 起始位 + 8 数据位 +（有校验时 1 位）+ 1 停止位，即 10 或 11 位。
     9600-8N1 约 3.6ms，115200-8N1 约 0.3ms。
+
+    配套计时必须用 `time.perf_counter()` 而不是 `time.monotonic()`：Windows 上
+    Python 3.11/3.12 的 monotonic 走 `GetTickCount64`，分辨率 15.6ms，毫秒级的
+    帧间隔会被整体量化掉（两次写都落在同一个 tick 里 → 差值为 0 → 帧间静默等于没做）。
+    perf_counter 走 QPC，亚微秒分辨率，跨平台可用。
     """
     bits: int = 11 if str(parity or "N").upper() in ("E", "O") else 10
     return 3.5 * bits / float(max(1, int(baudrate)))
@@ -522,7 +527,7 @@ class ModbusRTUSerialClient(BaseModbusClient):
         async with _serial_port_lock(self.port_name):
             for attempt in range(self.retry + 1):
                 # 帧间静默：距上一帧（本口任意从站）不足 3.5 字符时间就等够再发
-                wait: float = gap - (time.monotonic() - _serial_last_io.get(key, 0.0))
+                wait: float = gap - (time.perf_counter() - _serial_last_io.get(key, 0.0))
                 if wait > 0:
                     await asyncio.sleep(wait)
                 try:
@@ -543,7 +548,7 @@ class ModbusRTUSerialClient(BaseModbusClient):
                 except ModbusError as exc:
                     last_error = exc
                 finally:
-                    _serial_last_io[key] = time.monotonic()
+                    _serial_last_io[key] = time.perf_counter()
                 if attempt < self.retry:
                     await asyncio.sleep(min(0.05 * (2 ** attempt), 1.0))
         raise last_error

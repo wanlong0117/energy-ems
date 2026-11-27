@@ -17,6 +17,9 @@
   现在按端口做进程内互斥（`_serial_port_locks`，键做 `normcase` 归一，同端口
   跨客户端实例共享一把锁），整段重试都在锁内，并在发帧前补足 RTU 规范要求的
   **3.5 字符帧间静默**（`serial_frame_gap_sec`，9600-8N1 约 3.6ms）。
+  计时用 `time.perf_counter()` 而非 `time.monotonic()`：Windows 上 Python 3.11/3.12
+  的 monotonic 走 `GetTickCount64`，分辨率 15.6ms，毫秒级帧间隔会被整体量化成 0，
+  等于白做。
 
 ### 新增
 

@@ -48,7 +48,7 @@ def _fake_pyserial(response: bytes, hold_sec: float = 0.02) -> tuple[SimpleNames
             with guard:
                 state["concurrent"] += 1
                 state["max_concurrent"] = max(state["max_concurrent"], state["concurrent"])
-            self.entered_at = time.monotonic()
+            self.entered_at = time.perf_counter()
             return self
 
         def __exit__(self, *exc):
@@ -61,7 +61,7 @@ def _fake_pyserial(response: bytes, hold_sec: float = 0.02) -> tuple[SimpleNames
 
         def write(self, data):
             self._call = 0
-            state["frames"].append(("write", time.monotonic(), bytes(data)))
+            state["frames"].append(("write", time.perf_counter(), bytes(data)))
 
         def read(self, n):
             time.sleep(hold_sec)
@@ -130,7 +130,12 @@ def test_serial_reads_on_same_port_are_serialized(monkeypatch):
 
 
 def test_inter_frame_gap_enforced_between_transactions(monkeypatch):
-    """同一端口相邻两帧之间必须 ≥ 3.5 字符时间（9600-8N1 约 3.65ms）。"""
+    """同一端口相邻两帧之间必须 ≥ 3.5 字符时间（9600-8N1 约 3.65ms）。
+
+    计时必须用 perf_counter：Windows 上 Python 3.11/3.12 的 time.monotonic() 分辨率
+    只有 15.6ms（GetTickCount64），相邻两次写会落在同一个 tick，差值为 0，这个测试
+    会在 Windows 上间歇性失败——不是被测代码的问题，而是尺子太粗。
+    """
     response = _rtu_response(1, 3, [0x1234, 0x5678])
     fake, state = _fake_pyserial(response, hold_sec=0.0)
     monkeypatch.setattr(modbus, "serial", fake)
