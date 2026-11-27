@@ -38,6 +38,11 @@ from settings import (
 )
 
 
+# 预加载哨兵：区分「调用方没预加载」与「预加载后确认这天没有日报」。
+# 两者都用 None 会让「还没有日报」的表每块补查一次库（见 _warn_if_reprice）。
+_UNLOADED: Any = object()
+
+
 def _rollover_max(per_meter: Any) -> float:
     """单表累计电量量程（kWh）：NULL/非法值一律视为「不修正」。
 
@@ -74,7 +79,12 @@ def _shutdown_threshold(per_meter: Any) -> float:
     return threshold
 
 
-def _assumed_shutdown_hours(observed: set[int], shutdown: set[int], max_gap: int) -> int:
+def _assumed_shutdown_hours(
+    observed: set[int],
+    shutdown: set[int],
+    max_gap: int,
+    silent: set[int] | None = None,
+) -> int:
     """把「夹在两段已观测停机之间、长度不超过 max_gap」的缺口小时也算作停机。
 
     为什么需要它（v0.1.6 修正）：覆盖率门槛的分子与分母必须同源。分母剔除停机
@@ -89,10 +99,17 @@ def _assumed_shutdown_hours(observed: set[int], shutdown: set[int], max_gap: int
     （凌晨/收班前后正是可能开工的时段），长缺口也不推断（那是采集中断，
     半天的空白不该由系统替人签字）。
 
-    observed / shutdown 都是当日 0~23 的小时序号集合，shutdown ⊆ observed。
+    **silent：该小时内整台设备一个读数都没有的「断线小时」（v0.1.10）。**
+    现场口径：「断电就直接显示断线」，断线不等于停机——停机是「设备在线、只是
+    没在生产」，断线是「连数据链路都没了」。二者混为一谈会把一次整段断电
+    算成停产豁免，让当天带着电量缺口定稿。因此 silent 里的小时即使夹在
+    两段停机之间也不推断为停机，只保留真正「设备还活着但没采到」的那部分。
+
+    observed / shutdown / silent 都是当日 0~23 的小时序号集合，shutdown ⊆ observed。
     """
     if not shutdown or max_gap <= 0:
         return 0
+    blind: set[int] = set(silent or ())
     missing: list[int] = [hour for hour in range(24) if hour not in observed]
     assumed: int = 0
     index: int = 0
@@ -103,8 +120,10 @@ def _assumed_shutdown_hours(observed: set[int], shutdown: set[int], max_gap: int
         run: int = end - index + 1
         left_ok: bool = (missing[index] - 1) in shutdown
         right_ok: bool = (missing[end] + 1) in shutdown
-        if run <= max_gap and left_ok and right_ok:
-            assumed += run
+        # 断线小时不享受停机豁免：整段断电的缺口按「缺数据」处理，拖住定稿
+        countable: int = sum(1 for hour in missing[index:end + 1] if hour not in blind)
+        if run <= max_gap and left_ok and right_ok and countable:
+            assumed += countable
         index = end + 1
     return assumed
 
@@ -374,6 +393,44 @@ class Aggregator:
         )
         return used_fallback
 
+    def _device_silent_hours(self, meter_id: int, day_start: int) -> set[int]:
+        """该表所属设备当日哪些小时「一个有效读数都没有」，即断电 / 链路断。
+
+        为什么要区分：只要设备还活着（哪怕在待机），功率点每小时都会报一个低于
+        阈值的值，这些小时早就被 shutdown_idx 抓到了，根本不需要缺口推断。
+        缺口推断真正会命中的场景只有两种——整台设备断电，或者采集进程挂了。
+        前者按现场口径是「断线」，不该当成停产豁免；后者更不该。
+
+        只认 quality IN (0,3)：采集失败时 _carry_forward 会补一条 quality=1 的
+        「保持上一值」，它在 reading 表里有行，但恰恰是「没读到」的证据，算进来
+        就等于把断线当成有数据。
+
+        代价控制：调用方只在「确实存在停机小时、且当日有缺口」时才调它，
+        一次结算里百来块表通常只有少数几块会进来，每次是一条按 (point_id, ts)
+        主键走区间扫描的点查。
+        """
+        device_rows = db.query(
+            "SELECT DISTINCT p.device_id AS device_id FROM meter_point mp "
+            "JOIN point p ON p.id=mp.point_id WHERE mp.meter_id=?",
+            (meter_id,),
+        )
+        device_ids: list[int] = [int(row["device_id"]) for row in device_rows]
+        if not device_ids:
+            return set()
+        placeholders: str = ",".join("?" for _ in device_ids)
+        rows = db.query(
+            f"SELECT DISTINCT CAST((r.ts - ?) / ? AS INTEGER) AS hour_idx "
+            f"FROM reading r JOIN point p ON p.id=r.point_id "
+            f"WHERE p.device_id IN ({placeholders}) AND r.ts>=? AND r.ts<? "
+            "AND r.quality IN (0,3)",
+            (
+                day_start, SECONDS_PER_HOUR, *device_ids,
+                day_start, day_start + SECONDS_PER_DAY,
+            ),
+        )
+        alive: set[int] = {int(row["hour_idx"]) for row in rows}
+        return {hour for hour in range(24) if hour not in alive}
+
     def settle_day(
         self, day_start: int, is_final: int = 1, enforce_coverage: bool = True
     ) -> None:
@@ -390,6 +447,8 @@ class Aggregator:
             夜间停产、周末停线这类小时本就不该有生产电量，把它们算进分母等于
             要求「停产也得报数」，0 度停产日就永远定不了稿；但「没采到数」也
             不能自己判成停机，否则门槛形同虚设——折中见 _assumed_shutdown_hours。
+          · 断电（整台设备静默）不算停机：见 _device_silent_hours。设备离线时那些
+            小时对缺口的推断要排除掉，否则一次整段断电会被当成停产豁免、带着缺口定稿。
 
         模拟模式（is_final=0）与人工回填（enforce_coverage=False）不受门槛限制：
         前者本就只是当天实时视图，后者是操作员对历史数据的明确修正。
@@ -518,8 +577,13 @@ class Aggregator:
                     for hour_start, power in power_by_hour.items()
                     if power is not None and power < threshold
                 }
+            silent: set[int] = set()
+            if shutdown_idx and len(observed) < 24:
+                # 只在「真的会去推断缺口」时才查设备静默小时：这是结算里唯一
+                # 需要额外查询的分支，绝大多数表走不到（缺失小时为 0 或没停机证据）。
+                silent = self._device_silent_hours(meter_id, day_start)
             assumed: int = _assumed_shutdown_hours(
-                observed, shutdown_idx, SHUTDOWN_GAP_MAX_HOURS
+                observed, shutdown_idx, SHUTDOWN_GAP_MAX_HOURS, silent
             )
             shutdown_observed: int = len(shutdown_idx)
             shutdown_hours: int = shutdown_observed + assumed
@@ -593,13 +657,16 @@ class Aggregator:
 
     @staticmethod
     def _warn_if_reprice(
-        meter_id: int, day_start: int, cost: tariff.CostResult, previous: Any = None
+        meter_id: int, day_start: int, cost: tariff.CostResult, previous: Any = _UNLOADED
     ) -> None:
         """已定稿日按新电价改写电费时留痕，避免「历史电费悄悄变了」无从追溯。
 
-        previous 由调用方预加载传入（日结算里一次查完当天所有日报），不传则现查。
+        previous 由调用方预加载传入（日结算里一次查完当天所有日报）。
+        **必须用哨兵区分「没预加载」与「预加载后确认不存在」**：旧实现两件事都
+        用 None 表示，于是「这天还没有日报」的表每块都再补查一次库，
+        100 表 × 30 天补算 ≈ 6000 次重复查询，而且查回来的结论还是「不存在」。
         """
-        if previous is None:
+        if previous is _UNLOADED:
             previous = db.query_one(
                 "SELECT cost_cent, price_cent, is_final FROM daily WHERE meter_id=? AND day_start=?",
                 (meter_id, day_start),

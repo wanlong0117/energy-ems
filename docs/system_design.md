@@ -55,7 +55,8 @@ Docker、微服务、ORM（SQLAlchemy）、Redis、MQ、pymodbus、角色权限�
 | 10 | `collector.py` | 新建 | 采集调度、合并读取、写 `reading`/`reading_latest`、重连、`reload()`、`probe_point()` |
 | 11 | `aggregation.py` | 新建 | 小时汇总、日汇总（08:00 口径）、电费、purpose 分栋、定时结算 |
 | 12 | `api_config.py` | 新建 | 7 类资源 CRUD、试读、连接测试、事件日志、采集重载 |
-| 13 | `api_data.py` | 新建 | `latest/hourly/daily` 查询、手动触发结算 |
+| 13 | `api_data.py` | 新建 | `latest/hourly/daily` 查询、手动触发结算、设备链路 `devices/link` |
+| 14 | `link.py` | 新建（v0.1.10） | 设备链路状态判定（在线/断线/从未连通/停用/人工/演示），供 API 与日结共用 |
 
 ---
 
@@ -534,8 +535,11 @@ sequenceDiagram
 - **停机判定与覆盖率分母**：某个小时 `hourly.avg_power` 低于阈值即判为停机，覆盖分母取 `24 − 停机小时`，**分子同源取「有数据且非停机」的小时数**（整日停机时无应有生产小时，直接放行，使 0 度停产日也能定稿）。阈值逐表解析：`meter.shutdown_power_w` 优先，`NULL` 回退全局 `EMS_SHUTDOWN_POWER_W`，`0` 表示关闭。缺口推断有界：缺口左右两侧最近的有数据小时都判停机、且连续长度 ≤ `EMS_SHUTDOWN_GAP_MAX_HOURS`（默认 3）时才按停机算，日界缺口与长缺口不推断。四条不能松的口子：① 只认有功率读数的小时——采不到数据不能算停机，否则「采集断了」会被伪装成「停机」；② 分子分母同源，只剔分母会让比值被放大（12 小时待机 + 12 小时生产全缺也能算出 1.0 并定稿）；③ 停机只改覆盖率口径，不改电量与电费；④ 无数据的小时默认仍计入分母，只有满足缺口推断条件才豁免。结算结果把 `shutdown_hours` 落到 `daily`，并记 `SETTLE_SHUTDOWN` 事件，供事后解释「为什么这天定稿了」。
 - **累计值回退三分支（v0.1.9，关键）**：`end - base < 0` 时不能一律记 0。① 配了 `meter.max_reading_kwh` 且新旧读数都在 `[0, 量程]` 内 → 按 `(量程 − 旧值) + 新值` 补回，记 `METER_ROLLOVER`；② 否则用「本小时窗口内首条读数」当新基准重算，记 `METER_SWAP`（换表；要求该首条严格晚于 `base` 且不大于 `end`，算出的值必须 ≥ 0 且小于量程）；③ 都不成立才按 0 计并记 `METER_RESET`。返回值恒 ≥ 0，任何分支都不许把负电量写进 `hourly`。量程默认 `NULL`（不修正）：错填量程会让一次换表被算成「翻了半圈」，产出几十万度假电量，比少计更难收拾。
 - **串口总线互斥（v0.1.9，关键）**：`modbus.py` 的 `_serial_port_locks` 按端口（`os.path.normcase` 归一，跨客户端实例共享）串行化整个 `read_registers`（含重试），并在发帧前用 `_serial_last_io` 补足 3.5 字符帧间静默。原因：一根 485 总线挂多台从站时，两帧交错写进同一根线**不会报错**——同总线上确实有该站，CRC 与站号校验都能通过，表现为「某表读数偶尔乱跳」。新增协议客户端时必须复用这把锁，不要各自开锁。
+- **断电/断线不算停机（v0.1.10，关键）**：缺口推断（上一条）会把「夹在两段停机之间的短缺口」按停机算，这对**设备在线、只是这台表没数据**的场景是对的，对**整台设备断电**就是错的——后者是断线，不是停产，把它豁免掉等于给一次断电发了「已结算」证书。因此结算时对每块表再做一次核对：`Aggregator._device_silent_hours(meter_id, day_start)` 查该表所属设备当日各小时是否**一个有效读数都没有**（只认 `quality IN (0,3)`；采集失败补的 `quality=1` 保持值恰恰是「没读到」的证据，不能算有数据），静默小时从缺口推断里扣掉。这条只在「存在停机小时且当日有缺口」时触发，一次结算通常只有少数几块表会查库。
+- **链路状态（v0.1.10）**：`link.py` 把 `device.last_ok_at` 与 `reading_latest` 最新时间取**较晚者**，按 `poll_interval × 3`（夹在 [120s, 3600s]）判 `online/offline`，另有 `never`（从未成功）、`disabled`、`manual`、`demo` 四档。只认 `last_ok_at` 会让模拟实例整片显示「从未连通」（模拟器不写该字段），只用最新读数又会让「刚加点位还没读数」的健康设备误判断线。对外暴露为 `GET /api/devices/link`，看板「设备链路」卡片直接消费。
+- **负功率记异常（v0.1.10）**：功率点（`meter_point.role='power'`）的负值记 `quality=2` 并留 `POWER_NEGATIVE`，原值照常入库供现场识别反接。必须只在 power 角色上做：累计电量点的回退是翻转/换表，有 `METER_*` 那套处置，统一按负值拦截会把换表路径堵死。判定所需的 `is_power` 由 point 查询里的 `EXISTS(meter_point ...)` 带出，不额外查库。
 - **打包入口契约（关键，v0.1.8）**：`main.py` 的启动必须是 `uvicorn.run(app, host, port, workers=1)`，**绝不能**写成 `uvicorn.run("main:app", ...)`。PyInstaller 冻结后入口脚本在 `sys.modules` 里只注册为 `__main__`，不存在名叫 `main` 的可导入模块，按名字导入会抛 `Could not import module "main"` 并以退出码 3 结束——源码运行完全正常，只有打包产物坏，所以单测发现不了。两层防线：`tests/test_entrypoint.py` 用 AST 断言首参是 `app` 对象且 `workers ≤ 1`；CI 打包后真正启动 exe 并请求 `/healthz`，非 200 即构建失败。同理不要用「在 exe 目录放一个 main.py 存根」来绕——那依赖运行时 cwd 在 `sys.path` 里，换个启动方式（计划任务/服务/快捷方式）又会失效。
-- **quality**：0=正常、1=超时、2=越界（超出 min/max）、3=人工。
+- **quality**：0=正常、1=超时、2=越界（超出 min/max，或功率点为负）、3=人工。电量统计取 0 与 3，功率统计只取 0。
 - **单一连接**：`db.py` 全局连接、`check_same_thread=False`；所有 DB 调用同步短事务，`execute()` 内 commit，避免在 `await` 间持有游标。
 - **事务边界（v0.1.9，关键）**：`db.transaction()` 在**独立连接**上 `BEGIN IMMEDIATE`，并全程持有进程内 `_lock`。因此：① 块内**不得**调用 `db.execute` / `db.log_event`——同一线程会把自己堵死，卡满 `busy_timeout`（5 秒）后报 `database is locked`（旧注释写的「可继续调用不会自锁」是错的）；要写就用块内的 `conn`，要记审计用 `db.log_event_on(conn, ...)`。② 块内 `db.query` 能读但要意识到读到的是**事务外快照**。③ 不支持嵌套 `transaction()`。两条误用现在都直接抛 `RuntimeError`（线程内标记 `_txn_state`），不再用 5 秒卡顿当提示。④ 反过来，不要为了「原子」把分钟级批处理包成一个大事务：那会让采集写 `reading` 连吃 `busy_timeout` 失败，宁可写成「按批提交 + 可重跑」。
 - **串口校验位（v0.1.9）**：`device.parity`（N/E/O，默认 N）经 `_client_for()` 透传给 `ModbusRTUSerialClient`。现场 8E1 的表把校验位写死成 N 时一帧都收不到，现象与接线/波特率错误无法区分，所以必须可配。串口的 `connect()` 是**真开一次端口**（供连接测试用），采集路径不用它——每帧自己开合，多一次探测纯属浪费。

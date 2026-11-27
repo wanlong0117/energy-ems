@@ -1,4 +1,4 @@
-"""数据查询 API：/api/latest、/api/hourly、/api/daily、/api/settle。
+"""数据查询 API：/api/latest、/api/hourly、/api/daily、/api/settle、/api/devices/link。
 
 支持 meter_id/from/to/purpose/node_id/is_final 过滤；全部路由需登录。
 """
@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Query
 
 import auth
 import db
+import link
 from aggregation import aggregator
 from auth import require_auth
 from schemas import SettleIn, fail, ok
@@ -263,6 +264,31 @@ def monthly(
         return ok(aggregator.monthly(meter_id, from_, to, purpose, node_id, is_final))
     except Exception as exc:
         return _internal("MONTHLY_QUERY_FAIL", "查询月汇总", exc)
+
+
+@router.get("/devices/link")
+def devices_link() -> Any:
+    """GET /api/devices/link：逐设备链路状态（在线 / 断线 / 从未连通 / 停用 / 人工）。
+
+    现场最常见的故障是「设备彻底断电」，表现是整台设备一个读数都不再进来。
+    旧版没有任何地方把这件事说出来：看板最新读数表停在几小时前，报表却照常
+    显示「已结算」——人只能靠盯时间戳发现问题。这里把它显式化成状态字段。
+
+    last_data_at 走 reading_latest 的子查询（point_id 是主键，按 device 过滤后
+    每个点位一次索引点查），只查最新值表，不扫历史读数，探活不会被大表拖慢。
+    """
+    try:
+        rows = db.query(
+            "SELECT d.id, d.name, d.protocol, d.poll_interval, d.is_enabled, d.is_demo, "
+            "d.last_ok_at, d.last_error, "
+            "(SELECT MAX(rl.ts) FROM reading_latest rl JOIN point p ON p.id=rl.point_id "
+            " WHERE p.device_id=d.id) AS last_data_at "
+            "FROM device d ORDER BY d.id"
+        )
+        moment: int = int(time.time())
+        return ok([link.classify(dict(row), moment) for row in rows])
+    except Exception as exc:
+        return _internal("DEVICE_LINK_FAIL", "查询设备链路", exc)
 
 
 @router.get("/mode")

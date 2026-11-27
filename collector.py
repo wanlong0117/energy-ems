@@ -27,6 +27,7 @@ from settings import (
     DEFAULT_TIMEOUT_MS,
     MODBUS_MAX_REGISTERS,
     PROBE_TIMEOUT_MS,
+    QUALITY_OK,
     QUALITY_OUT_OF_RANGE,
     QUALITY_TIMEOUT,
     RECONNECT_BACKOFF_BASE_SEC,
@@ -230,8 +231,14 @@ class Collector:
             try:
                 point_rows = await asyncio.to_thread(
                     db.query,
-                    "SELECT * FROM point WHERE device_id=? AND is_enabled=1 "
-                    "ORDER BY slave_id, func_code, reg_offset",
+                    # is_power：该点位是否被挂在某块表的 power 角色上。功率为负要判异常，
+                    # 但只有「功率点」才有这个语义——累计电量点回退是翻转/换表（另有处置），
+                    # 统一按负值拦截会把换表那一路也堵死。EXISTS 走 meter_point 主键前缀，
+                    # 每个点位一次索引点查，不随点位数量放大。
+                    "SELECT p.*, EXISTS(SELECT 1 FROM meter_point mp WHERE mp.point_id=p.id "
+                    "AND mp.role='power') AS is_power "
+                    "FROM point p WHERE p.device_id=? AND p.is_enabled=1 "
+                    "ORDER BY p.slave_id, p.func_code, p.reg_offset",
                     (device_id,),
                 )
                 points: list[dict[str, Any]] = [dict(row) for row in point_rows]
@@ -295,12 +302,31 @@ class Collector:
                                 f"点位 {point['id']} 解析失败: {exc}", int(point["id"]),
                             )
                             continue
+                        # 负功率一律判异常（quality=2）：现场断路、CT 反接、寄存器错位
+                        # 都会给出负值，若照常当成 quality=0，小时表会把它平均进
+                        # avg_power、日结再拿它跟停机阈值比，等于用坏数据判停机。
+                        # 原始值照常入库（现场要看到 -3.2 才知道是反接），只是不进统计。
+                        negative_power: bool = (
+                            bool(point.get("is_power"))
+                            and quality == QUALITY_OK
+                            and value < 0
+                        )
+                        if negative_power:
+                            quality = QUALITY_OUT_OF_RANGE
                         rows.append((int(point["id"]), now_ts, value, quality))
                         if quality == QUALITY_TIMEOUT:
                             await asyncio.to_thread(
                                 db.log_event_throttled,
                                 "warn", "collector", "READ_TIMEOUT",
                                 f"点位 {point['id']} 读取超时", int(point["id"]),
+                            )
+                        elif negative_power:
+                            await asyncio.to_thread(
+                                db.log_event_throttled,
+                                "warn", "collector", "POWER_NEGATIVE",
+                                f"点位 {point['id']} 功率为负 {value}，已按异常处理"
+                                "（不计入功率统计，请检查接线与寄存器映射）",
+                                int(point["id"]),
                             )
                         elif quality == QUALITY_OUT_OF_RANGE:
                             await asyncio.to_thread(

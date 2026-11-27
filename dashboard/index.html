@@ -211,6 +211,27 @@
 
   #latestTable th:first-child, #latestTable td:first-child { display: none; }
 
+  /* ===== 设备链路 ===== */
+  .link-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .link-item { display: flex; align-items: center; gap: 7px; padding: 6px 11px;
+    border: 1px solid var(--line); border-radius: 20px; background: var(--surface-2);
+    font-size: 12px; max-width: 100%; }
+  .link-item .link-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+  .link-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: 0 0 8px; }
+  .link-state { color: var(--muted); font-size: 11px; }
+  .link-item.online .link-dot { background: var(--ok); }
+  .link-item.offline { border-color: color-mix(in srgb, var(--err) 42%, transparent); background: var(--err-soft); }
+  .link-item.offline .link-dot { background: var(--err); }
+  .link-item.offline .link-name, .link-item.offline .link-state { color: var(--err); }
+  .link-item.never { border-color: color-mix(in srgb, var(--warn) 42%, transparent); background: var(--warn-soft); }
+  .link-item.never .link-dot { background: var(--warn); }
+  .link-item.never .link-state { color: var(--warn); }
+  .link-item.disabled, .link-item.manual, .link-item.demo { opacity: .62; }
+  .qtag { font-size: 11px; padding: 1px 7px; border-radius: 20px; background: var(--surface-3); color: var(--ink-2); }
+  .qtag.bad { background: var(--err-soft); color: var(--err); }
+  .qtag.warn { background: var(--warn-soft); color: var(--warn); }
+  .qtag.manual { background: var(--brand-soft); color: var(--brand-ink); }
+
   /* ===== 报表预览 ===== */
   .report-preview { max-height: 620px; overflow: auto; border: 1px solid var(--line);
                     border-radius: var(--radius-sm); }
@@ -335,6 +356,11 @@
         </div>
       </div>
     </div>
+    <div class="card">
+      <div class="card-head"><h3 data-i18n="link_title">设备链路</h3><span class="chip" id="linkSummary">—</span></div>
+      <div id="linkList" class="link-list"></div>
+      <div class="hint" id="linkHint" hidden></div>
+    </div>
     <div class="grid charts">
       <div class="card">
         <div class="card-head"><h3 data-i18n="trend_hour">小时电量趋势</h3><span class="chip">kWh · 48H</span></div>
@@ -411,6 +437,7 @@
         </div>
       </div>
       <div id="repPreview" class="report-preview"></div>
+      <p class="muted" id="repHint" data-i18n="rep_coverage_hint" style="margin:10px 0 0;font-size:12px"></p>
     </div>
   </section>
 
@@ -480,7 +507,14 @@ const I18N = {
     accumulating: "数据积累中，至少需要 3 个小时点",
     pw_change_title: "修改密码", pw_old: "原密码", pw_new: "新密码", pw_confirm: "确认新密码",
     pw_submit: "设置新密码", pw_rule: "默认密码仅用于首次登录，请设置至少 8 位新密码。",
-    pw_mismatch: "两次输入的新密码不一致", pw_changed: "密码已修改，请重新登录"
+    pw_mismatch: "两次输入的新密码不一致", pw_changed: "密码已修改，请重新登录",
+    link_title: "设备链路", link_online: "在线", link_offline: "断线", link_never: "从未连通",
+    link_disabled: "已停用", link_manual: "人工录入", link_demo: "演示数据", link_empty: "暂无设备",
+    link_all_ok: "全部在线", link_offline_n: "断线", link_never_n: "未连通",
+    link_hint: "断线按缺数据计，不算停机豁免：该时段会拖住日结定稿，而不是被当成停产放行。",
+    q_ok: "正常", q_timeout: "超时", q_bad: "异常", q_manual: "人工",
+    rep_covered: "覆盖小时", rep_shutdown: "停机小时",
+    rep_coverage_hint: "覆盖小时=当日有数据的小时数（满值 24）；停机小时=功率低于停机阈值的时段，不计入完整度分母。周/月汇总没有小时概念，导出 Excel 可看每日明细。"
   },
   en: {
     app_title: "Energy EMS", logout_btn: "Logout", tab_login: "Login", tab_dashboard: "Dashboard",
@@ -508,7 +542,14 @@ const I18N = {
     pw_change_title: "Change Password", pw_old: "Current password", pw_new: "New password",
     pw_confirm: "Confirm new password", pw_submit: "Set new password",
     pw_rule: "The default password is for first sign-in only. Use at least 8 characters.",
-    pw_mismatch: "The two new passwords do not match", pw_changed: "Password changed. Please sign in again."
+    pw_mismatch: "The two new passwords do not match", pw_changed: "Password changed. Please sign in again.",
+    link_title: "Device Links", link_online: "Online", link_offline: "Offline", link_never: "Never connected",
+    link_disabled: "Disabled", link_manual: "Manual entry", link_demo: "Demo data", link_empty: "No devices",
+    link_all_ok: "All online", link_offline_n: "Offline", link_never_n: "Never connected",
+    link_hint: "Offline hours count as missing data, not as shutdown: they hold the daily settlement back instead of being exempted.",
+    q_ok: "OK", q_timeout: "Timeout", q_bad: "Invalid", q_manual: "Manual",
+    rep_covered: "Covered hrs", rep_shutdown: "Shutdown hrs",
+    rep_coverage_hint: "Covered hrs = hours with data that day (max 24). Shutdown hrs = periods below the shutdown threshold, excluded from the completeness denominator. Weekly/monthly buckets have no hourly notion — export Excel for per-day detail."
   }
 };
 const state = { lang: "zh", authed: false, mode: "simulate", mustChangePassword: false,
@@ -847,9 +888,57 @@ async function loadDashboard() {
     table.innerHTML = "<thead><tr><th>ID</th><th>Name</th><th>Value</th><th>Unit</th><th>Quality</th><th>TS</th></tr></thead><tbody>" +
       (state.latest.length ? state.latest.slice(0, 100).map((row) =>
         "<tr><td>" + esc(row.point_id) + "</td><td>" + esc(row.name) + "</td><td>" + esc(fmtValue(row.value)) +
-        "</td><td>" + esc(row.unit || "") + "</td><td>" + esc(row.quality) + "</td><td>" + esc(fmtTime(row.ts)) + "</td></tr>"
+        "</td><td>" + esc(row.unit || "") + "</td><td>" + qualityTag(row.quality) + "</td><td>" + esc(fmtTime(row.ts)) + "</td></tr>"
       ).join("") : '<tr><td colspan="6">' + esc(t("no_data")) + "</td></tr>") + "</tbody>";
+    await loadDeviceLink();
   } catch (e) { toast(e.message, true); }
+}
+/* 质量码翻译成人话：0 正常 / 1 超时 / 2 越界（含负功率）/ 3 人工录入。
+   直接显示数字时，现场看到的是一列 0/1/2，没人会把它和「这块表数据可信吗」联系起来。 */
+function qualityTag(code) {
+  const value = Number(code);
+  if (value === 1) return '<span class="qtag warn">' + esc(t("q_timeout")) + "</span>";
+  if (value === 2) return '<span class="qtag bad">' + esc(t("q_bad")) + "</span>";
+  if (value === 3) return '<span class="qtag manual">' + esc(t("q_manual")) + "</span>";
+  return '<span class="qtag">' + esc(t("q_ok")) + "</span>";
+}
+/* 设备链路：断电的设备在这里变成「断线」，而不是让看板停在几小时前的读数上装没事。 */
+async function loadDeviceLink() {
+  const list = $("linkList");
+  if (!state.authed || !list) return;
+  try {
+    const devices = await api("/api/devices/link") || [];
+    const count = (stateName) => devices.filter((item) => item.state === stateName).length;
+    if (!devices.length) {
+      list.innerHTML = '<span class="muted">' + esc(t("link_empty")) + "</span>";
+      $("linkSummary").textContent = "0";
+      $("linkHint").hidden = true;
+      return;
+    }
+    const offline = count("offline");
+    const never = count("never");
+    const demo = count("demo");
+    const parts = [t("link_online") + " " + count("online")];
+    if (offline) parts.push(t("link_offline_n") + " " + offline);
+    if (never) parts.push(t("link_never_n") + " " + never);
+    if (demo) parts.push(t("link_demo") + " " + demo);
+    $("linkSummary").textContent = offline || never || demo
+      ? parts.join(" · ") : t("link_all_ok");
+    // 只有真的在采集的设备才谈「多久没数据」：演示/人工/停用的设备显示 stale 是噪音
+    const timed = new Set(["online", "offline"]);
+    list.innerHTML = devices.map((item) => {
+      const label = t("link_" + item.state) || item.label;
+      const stale = timed.has(item.state) && item.stale_sec !== null && item.stale_sec !== undefined
+        ? " · " + Math.round(item.stale_sec / 60) + "m" : "";
+      const title = item.last_error ? esc(item.last_error) : esc(label);
+      return '<span class="link-item ' + esc(item.state) + '" title="' + title + '">' +
+        '<span class="link-dot"></span>' +
+        '<span class="link-name">' + esc(item.name || ("#" + item.device_id)) + "</span>" +
+        '<span class="link-state">' + esc(label) + esc(stale) + "</span></span>";
+    }).join("");
+    $("linkHint").hidden = !(offline || never);
+    $("linkHint").textContent = offline || never ? t("link_hint") : "";
+  } catch (e) { /* 链路状态查不到不该把整个看板打红 */ }
 }
 
 /* ===== 配置 ===== */
@@ -995,8 +1084,16 @@ async function loadReport() {
   const query = reportQuery();
   try {
     const rows = await api("/api/" + kind + (query ? "?" + query : ""));
+    // 覆盖小时 / 停机小时：日汇总才有这两个字段（周/月是从 daily 二次聚合的，
+    // 没有「小时」概念，导出报表里也是留空而不是补 24——否则看起来像数据齐全）。
+    // 这两列的意义是解释「这天只有 3 小时数据，为什么已经定稿了」。
+    const isDaily = kind === "daily";
     const columns = [t("rep_period"), t("rep_meter"), t("rep_purpose_col"), t("rep_node"),
-                     t("rep_energy"), t("rep_cost"), t("rep_final")];
+                     t("rep_energy"), t("rep_cost"), t("rep_covered"), t("rep_shutdown"),
+                     t("rep_final")];
+    const cell = (row, key) => (
+      isDaily && row[key] !== null && row[key] !== undefined ? String(row[key]) : "—"
+    );
     const display = rows.map((row) => {
       const item = {};
       item[columns[0]] = fmtTime(row.period_start || row.day_start).slice(0, 16);
@@ -1005,10 +1102,13 @@ async function loadReport() {
       item[columns[3]] = row.node_name || "";
       item[columns[4]] = fmtKwh(row.energy_wh);
       item[columns[5]] = fmtYuan(row.cost_cent);
-      item[columns[6]] = Number(row.is_final) === 1 ? t("yes") : t("no");
+      item[columns[6]] = cell(row, "covered_hours");
+      item[columns[7]] = cell(row, "shutdown_hours");
+      item[columns[8]] = Number(row.is_final) === 1 ? t("yes") : t("no");
       return item;
     });
     htmlTable($("repPreview"), display, columns);
+    $("repHint").textContent = t("rep_coverage_hint");
   } catch (e) { toast(e.message, true); }
 }
 async function exportReport(fmt) {
