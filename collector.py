@@ -309,14 +309,11 @@ class Collector:
                                 f"点位 {point['id']} 越界: {value}", int(point["id"]),
                             )
 
-                await asyncio.to_thread(self.write_batch, rows)
+                await asyncio.to_thread(
+                    self.write_batch, rows, device_id if any_ok else None
+                )
                 if any_ok:
                     self._clear_revive_backoff(device_id)
-                    await asyncio.to_thread(
-                        db.execute,
-                        "UPDATE device SET last_ok_at=?, last_error=NULL WHERE id=?",
-                        (now_ts, device_id),
-                    )
                     backoff = RECONNECT_BACKOFF_BASE_SEC
                     await asyncio.sleep(
                         max(1, int(device.get("poll_interval") or DEFAULT_POLL_INTERVAL))
@@ -400,12 +397,18 @@ class Collector:
                 merged.append(current)
         return merged
 
-    def write_batch(self, rows: list[tuple[int, int, float, int]]) -> None:
+    def write_batch(
+        self, rows: list[tuple[int, int, float, int]], mark_ok_device_id: int | None = None
+    ) -> None:
         """同步短事务写原始读数与最新值；latest 仅在时间戳更新时覆盖。
 
         两条 executemany 必须同生共死：旧实现用全局连接，第一条成功后第二条失败时
         不会回滚，随后任意线程的提交（例如 log_event 里的 execute）会把「reading 写进去了、
         reading_latest 没写」的半截状态一并提交，于是最新值与历史读数长期不一致。
+
+        mark_ok_device_id 把「本轮采集成功」的设备状态更新并进同一个事务：
+        分两条语句写时，中间被取消（热重载/关停）会留下「读数已落库、last_ok_at 还是旧的」，
+        看上去像这一轮没成功；而且这两件事本来就该同生共死。
         """
         if not rows:
             return
@@ -422,6 +425,11 @@ class Collector:
                     "WHERE excluded.ts >= reading_latest.ts",
                     rows,
                 )
+                if mark_ok_device_id is not None:
+                    conn.execute(
+                        "UPDATE device SET last_ok_at=?, last_error=NULL WHERE id=?",
+                        (int(rows[0][1]), int(mark_ok_device_id)),
+                    )
         except sqlite3.Error as exc:
             # 事务已回滚，raw 与 latest 都没有落库，下个轮询周期会重试
             db.log_event("error", "collector", "WRITE_FAIL", f"写读数失败（整批已回滚）: {exc}")

@@ -65,16 +65,20 @@ jobs:
           python -m pip install -r requirements-dev.txt
 
       - name: Run tests
-        # 覆盖率门槛那条腿已含全量用例，其余腿不重复跑
-        if: matrix.os != 'ubuntu-latest' || matrix.python != '3.12'
         env:
           PYTHONUTF8: "1"
         shell: bash
-        # 同时落一份日志：失败时把尾部写进 Job Summary。否则矩阵里某一条腿红了，
-        # 只有仓库管理员能下载日志，维护者只能靠猜是哪条用例挂的。
+        # 覆盖率门槛只在一条矩阵腿上统计，避免四份重复计数；但日志与失败摘要必须
+        # 每条腿都有——上一轮 ubuntu/3.12 就是「唯一没落日志的那条腿」挂了，
+        # 网页上只有一句 exit code 1，annotation 也抓不到用例名。
         run: |
           set -o pipefail
-          python -m pytest -q --tb=short 2>&1 | tee pytest-${{ matrix.os }}-${{ matrix.python }}.log
+          COV=""
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ] && [ "${{ matrix.python }}" = "3.12" ]; then
+            COV="--cov=. --cov-report=term"
+          fi
+          python -m pytest -q --tb=short $COV 2>&1 \
+            | tee "pytest-${{ matrix.os }}-${{ matrix.python }}.log"
 
       - name: Publish failure summary
         if: failure()
@@ -92,11 +96,4 @@ jobs:
           grep -E '^(FAILED|ERROR) ' "$LOG" | head -20 | while read -r line; do
             echo "::error title=pytest::${line}"
           done || true
-
-      # 只在一条矩阵腿上跑覆盖率门槛，避免四份重复统计；门槛值见 .coveragerc
-      - name: Run tests with coverage gate
-        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
-        env:
-          PYTHONUTF8: "1"
-        run: python -m pytest -q --cov=. --cov-report=term
 
