@@ -13,6 +13,7 @@ import math
 import os
 import struct
 import time
+import weakref
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -41,7 +42,13 @@ except ImportError:  # pragma: no cover - 未安装时惰性报错，不影响 T
 # 两帧交错写下去，从站会回错帧或干脆不回：CRC 校验可能通过、站号校验也可能通过
 # （同一总线上确有该站），最终表现为「某台表读数偶尔乱跳」这种最难查的现场故障。
 # 因此按端口做进程内互斥，并保证帧间静默 ≥ 3.5 字符时间（Modbus RTU 规范要求）。
-_serial_port_locks: dict[str, asyncio.Lock] = {}
+#
+# 锁按「事件循环 + 端口」两级缓存：asyncio.Lock 首次 await 时会绑定当前循环，
+# 之后在另一个循环里再用会抛 RuntimeError（「is bound to a different event loop」）。
+# 生产环境只有一个循环，但脚本、测试、以及任何 asyncio.run() 包裹的调用都会换循环，
+# 届时一把跨循环缓存的锁就是启动即崩的隐藏地雷。用 WeakKeyDictionary 按循环分组，
+# 循环被回收后对应的锁自然释放。
+_serial_port_locks: "weakref.WeakKeyDictionary[Any, dict[str, asyncio.Lock]]" = weakref.WeakKeyDictionary()
 _serial_last_io: dict[str, float] = {}
 
 
@@ -51,12 +58,17 @@ def _serial_port_key(port_name: str) -> str:
 
 
 def _serial_port_lock(port_name: str) -> asyncio.Lock:
-    """取该端口专属的互斥锁（同端口跨客户端实例共享同一把）。"""
+    """取该端口在当前事件循环内的互斥锁（同循环同端口跨客户端实例共享同一把）。"""
     key: str = _serial_port_key(port_name)
-    lock: asyncio.Lock | None = _serial_port_locks.get(key)
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    per_loop: dict[str, asyncio.Lock] | None = _serial_port_locks.get(loop)
+    if per_loop is None:
+        per_loop = {}
+        _serial_port_locks[loop] = per_loop
+    lock: asyncio.Lock | None = per_loop.get(key)
     if lock is None:
         lock = asyncio.Lock()
-        _serial_port_locks[key] = lock
+        per_loop[key] = lock
     return lock
 
 

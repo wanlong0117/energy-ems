@@ -79,11 +79,34 @@ def _fake_pyserial(response: bytes, hold_sec: float = 0.02) -> tuple[SimpleNames
 
 def test_same_port_clients_share_one_lock_and_distinct_ports_do_not():
     """同端口（含大小写/空白差异）共享锁；不同端口各持一把。"""
-    a = modbus._serial_port_lock("COM3")
-    b = modbus._serial_port_lock("  COM3  ")
-    c = modbus._serial_port_lock("COM4")
+
+    async def scenario():
+        a = modbus._serial_port_lock("COM3")
+        b = modbus._serial_port_lock("  COM3  ")
+        c = modbus._serial_port_lock("COM4")
+        return a, b, c
+
+    a, b, c = run(scenario())
     assert a is b, "同一 COM 口必须共享同一把锁"
     assert a is not c, "不同端口不得共用锁"
+
+
+def test_lock_is_not_reused_across_event_loops(monkeypatch):
+    """同端口跨两个事件循环读取不得抛「bound to a different event loop」。
+
+    asyncio.Lock 首次 await 会绑定循环，模块级缓存一把锁会让第二个 asyncio.run()
+    直接 RuntimeError——生产只有一个循环，但脚本/测试/工具函数换循环就会炸。
+    """
+    response = _rtu_response(1, 3, [0x1234, 0x5678])
+    fake, _ = _fake_pyserial(response, hold_sec=0.0)
+    monkeypatch.setattr(modbus, "serial", fake)
+
+    async def one_read() -> list[int]:
+        client = ModbusRTUSerialClient("COM_LOOP", 9600, timeout_ms=500, retry=0)
+        return await client.read_registers(1, 3, 0, 2)
+
+    for _ in range(3):  # 每次 asyncio.run 都是新循环
+        assert run(one_read()) == [0x1234, 0x5678]
 
 
 def test_serial_reads_on_same_port_are_serialized(monkeypatch):
