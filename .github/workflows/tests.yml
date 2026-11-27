@@ -80,12 +80,18 @@ jobs:
         if: failure()
         shell: bash
         run: |
+          LOG="pytest-${{ matrix.os }}-${{ matrix.python }}.log"
           {
             echo "### pytest 失败尾部（${{ matrix.os }} / py${{ matrix.python }}）"
             echo '```'
-            tail -100 pytest-${{ matrix.os }}-${{ matrix.python }}.log || true
+            tail -100 "$LOG" || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          # 失败用例同时冒成 annotation：Job Summary 只能在网页看，annotation 可以通过
+          # check-runs API 读到，没有管理员权限的维护者也能定位到具体用例。
+          grep -E '^(FAILED|ERROR) ' "$LOG" | head -20 | while read -r line; do
+            echo "::error title=pytest::${line}"
+          done || true
 
       # 只在一条矩阵腿上跑覆盖率门槛，避免四份重复统计；门槛值见 .coveragerc
       - name: Run tests with coverage gate
