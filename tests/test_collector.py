@@ -138,10 +138,18 @@ def test_poll_device_logs_failure_and_out_of_range(isolated_db):
         device = dict(db.query_one("SELECT * FROM device WHERE id=?", (device_id,)))
         task = asyncio.create_task(collector.poll_device(device))
         try:
-            # 连接被拒绝在不同平台会呈现为 READ_FAIL 或 READ_TIMEOUT，两者都算「失败留痕」
-            assert await wait_until(lambda: db.query_one(
-                "SELECT 1 FROM event_log WHERE code IN ('READ_FAIL','READ_TIMEOUT')"
-            ) is not None)
+            # 连接被拒绝在不同平台会呈现为 READ_FAIL 或 READ_TIMEOUT，两者都算「失败留痕」。
+            # 等待条件必须是「事件 + 设备状态都写完」：这两个写入是两次独立的线程池调用，
+            # 只等其中一个就取消任务，取消点正好可能落在另一个之前（Windows 上调度更慢），
+            # 断言随之偶发失败。
+            def failed_round_done() -> bool:
+                row = db.query_one("SELECT last_error FROM device WHERE id=?", (device_id,))
+                event = db.query_one(
+                    "SELECT 1 FROM event_log WHERE code IN ('READ_FAIL','READ_TIMEOUT')"
+                )
+                return bool(row and row["last_error"]) and event is not None
+
+            assert await wait_until(failed_round_done)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -153,9 +161,15 @@ def test_poll_device_logs_failure_and_out_of_range(isolated_db):
             device = dict(db.query_one("SELECT * FROM device WHERE id=?", (device_id,)))
             task = asyncio.create_task(collector.poll_device(device))
             try:
-                assert await wait_until(lambda: db.query_one(
-                    "SELECT 1 FROM event_log WHERE code='VALUE_OUT_OF_RANGE'"
-                ) is not None)
+                # 同理：越界日志先写、读数（quality=2）后写，只等日志会丢掉读数
+                def out_of_range_stored() -> bool:
+                    row = db.query_one(
+                        "SELECT quality FROM reading WHERE point_id=? ORDER BY ts DESC LIMIT 1",
+                        (point_id,),
+                    )
+                    return row is not None and int(row["quality"]) == 2
+
+                assert await wait_until(out_of_range_stored)
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
