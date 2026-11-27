@@ -93,3 +93,55 @@ def test_logout_invalidates_session(isolated_db):
     assert "ems_session=" in logout_response.headers["set-cookie"]
     assert token not in auth._sessions
     assert auth.current_user(_request(f"ems_session={token}")) is False
+
+
+# ---------- 失败计数的空闲回收（v0.1.10 / 复审 R-02） ----------
+
+
+def test_sparse_login_failures_are_reclaimed_after_idle(isolated_db):
+    """每个来源只错 1~4 次的零散记录，也必须在空闲窗口后被回收。
+
+    回归 v0.1.9 的遗漏：_prune_sessions 原来只清「until 过期 **且** count<=0」。
+    内网扫描器或写错的脚本每个 IP 只试 1~4 次，永远到不了 5 次锁定线，于是
+    count>0 且 until==0，一条都清不掉——扫一个 /24 段就是 256 条永久驻留，
+    扫十遍就是两千多条，而且没有任何日志提示。
+    """
+    auth._fail_state.clear()
+    auth._last_prune = 0.0
+    for index in range(3):
+        auth._record_login_failure(f"10.1.0.{index}")  # 各错 1 次，都没到锁定线
+
+    for state in auth._fail_state.values():
+        assert state["until"] == 0.0 and state["count"] == 1.0, "前提：这些记录没被锁定"
+        state["last_at"] = time.time() - auth.LOGIN_FAIL_IDLE_SEC - 1
+
+    auth._prune_sessions(time.time())
+    assert auth._fail_state == {}, "零散失败记录必须被回收，否则每扫一遍网段就涨一份内存"
+
+
+def test_prune_keeps_fresh_and_locked_records(isolated_db):
+    """回收不能误伤：刚失败的、以及仍在锁定期的记录都必须留着。
+
+    否则「改个源 IP 重来」或「等 60 秒锁一到期计数就没了」就绕开了阈值——阈值本身
+    成了摆设，比内存泄漏更糟。
+    """
+    auth._fail_state.clear()
+    auth._last_prune = 0.0
+    for _ in range(auth.LOGIN_FAIL_LIMIT):
+        auth._record_login_failure("10.2.0.1")  # 达阈值 → 进入锁定
+    auth._record_login_failure("10.2.0.2")      # 刚错一次
+
+    now = time.time()
+    auth._prune_sessions(now)
+    assert "10.2.0.1" in auth._fail_state, "仍在锁定期，不能回收"
+    assert "10.2.0.2" in auth._fail_state, "刚发生的失败要保留计数"
+
+    # 锁定刚过期也不能立刻丢：most-recent 取 until，已远超空闲窗口才算真闲置
+    auth._last_prune = 0.0
+    auth._prune_sessions(now + auth.LOGIN_LOCK_SEC + 1)
+    assert "10.2.0.1" in auth._fail_state, "解封后立刻回收等于把锁定变成 60 秒一次的重置"
+
+    # 真闲置（锁定到期后再过一整个空闲窗口）才回收
+    auth._last_prune = 0.0
+    auth._prune_sessions(now + auth.LOGIN_LOCK_SEC + auth.LOGIN_FAIL_IDLE_SEC + 1)
+    assert "10.2.0.1" not in auth._fail_state

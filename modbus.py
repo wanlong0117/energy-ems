@@ -482,10 +482,18 @@ class ModbusRTUSerialClient(BaseModbusClient):
         「串口已打开（该设备未配置点位，未读取寄存器）」并刷新 last_ok_at——
         端口号写错、USB 转 485 没插、机器上根本没装 pyserial，全都报成功。
         只在这条路径做实际打开：采集路径每帧自己开合，多一次探测纯属浪费。
+
+        **开端口本身也是一次独占访问**，必须与读取共用同一把端口锁：Windows 上
+        同一个 COM 口已被别的线程持有句柄时，CreateFile 直接回 PermissionError
+        (Access is denied)。读路径有锁而这里没有，就等于「后台正在轮询 COM3 时，
+        前端点一下连接测试」能把整台设备打成读取失败——而且报的是「串口打开失败」，
+        现场只会去查线，查不出是自家页面上那个按钮干的。
+        本类 read_registers 全程持锁且内部不调 connect()，不存在重入死锁。
         """
         if serial is None:
             raise ModbusError("未安装 pyserial，无法使用 modbus_rtu_serial 协议")
-        await asyncio.to_thread(self._probe_open)
+        async with _serial_port_lock(self.port_name):
+            await asyncio.to_thread(self._probe_open)
 
     def _probe_open(self) -> None:
         """同步打开并立即关闭串口；失败统一转成人话的 ModbusError。"""

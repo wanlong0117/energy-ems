@@ -71,6 +71,13 @@ _HASH_ITERATIONS: int = 120_000
 # 登录失败锁定：同来源连续失败达到阈值后锁定一段时间
 LOGIN_FAIL_LIMIT: int = 5
 LOGIN_LOCK_SEC: float = 60.0
+# 失败计数记录的空闲回收窗口：来源在这么久之内没再试错，就把它那条计数丢掉。
+# 只清「已过期且 count<=0」是漏的——扫描器每个 IP 只试 1~4 次（永远到不了 5 次
+# 锁定线），这些记录 count>0 且 until==0，既不会被锁定也不会被回收，长期运行
+# 就是一条无上限的内存增长路径。窗口取 10 分钟：足以覆盖正常人打错几次密码的
+# 间隔，而攻击者被清零后要重来 5 次，速率从「5 次/分钟」降到「5 次/10 分钟」，
+# 对撞库毫无意义。
+LOGIN_FAIL_IDLE_SEC: float = max(LOGIN_LOCK_SEC, 600.0)
 _fail_state: dict[str, dict[str, float]] = {}
 
 # 默认密码状态下仍允许访问的路径（改密、登出、会话查询）
@@ -325,12 +332,17 @@ def is_login_locked(client: str = "") -> bool:
 
 
 def _record_login_failure(client: str = "") -> None:
-    """记录一次失败；达到阈值则锁定一段时间并清空计数。"""
+    """记录一次失败；达到阈值则锁定一段时间并清空计数。
+
+    每条记录都盖一个 last_at：prune 靠它判断「这条来源还活着没有」。没有它就只能
+    看 count，而「试了 2 次就换 IP」的记录 count 恒为正，永远不会被回收。
+    """
     key: str = _client_key(client)
     locked: bool = False
     with _state_lock:
         state: dict[str, float] = _fail_state.setdefault(key, {"count": 0.0, "until": 0.0})
         state["count"] = float(state.get("count", 0.0)) + 1.0
+        state["last_at"] = time.time()
         if state["count"] >= LOGIN_FAIL_LIMIT:
             state["until"] = time.time() + LOGIN_LOCK_SEC
             state["count"] = 0.0
@@ -368,7 +380,11 @@ def _prune_sessions(now: float) -> None:
     """定期清掉过期会话与失效的失败计数，避免内存长期堆积。
 
     _fail_state 原来只增不减：扫描器换着源 IP 撞库时，每个 IP 留一条记录永不释放。
-    锁定已过期且计数归零的来源在这里一并清掉。
+    但回收条件不能只看 count：内网扫描器或写错的脚本每个 IP 只试 1~4 次，根本到不了
+    5 次锁定线，这些记录 count>0 且 until==0，一条都清不掉——200 个 IP 的段扫一遍
+    就是 200 条永久驻留，扫十遍就是两千条。
+    改成按「最近一次活动」回收：仍在锁定期的一律留着；锁定已过期、且距最近一次失败
+    超过 LOGIN_FAIL_IDLE_SEC 的，不论 count 是否为 0 都丢掉。
     """
     global _last_prune
     with _state_lock:
@@ -379,7 +395,13 @@ def _prune_sessions(now: float) -> None:
             if expire_at < now:
                 _sessions.pop(token, None)
         for key, state in list(_fail_state.items()):
-            if float(state.get("until", 0.0)) < now and float(state.get("count", 0.0)) <= 0.0:
+            until: float = float(state.get("until", 0.0))
+            if until >= now:
+                continue  # 仍在锁定期，计数与到期时刻都还要用
+            # 取 until 与 last_at 的较晚者：锁定期间不再有失败写入，只看 last_at
+            # 会把「刚解封、正被观察」的记录当成空闲已久直接回收。
+            last_active: float = max(until, float(state.get("last_at", 0.0)))
+            if now - last_active >= LOGIN_FAIL_IDLE_SEC:
                 _fail_state.pop(key, None)
 
 

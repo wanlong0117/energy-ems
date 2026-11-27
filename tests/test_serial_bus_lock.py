@@ -33,8 +33,15 @@ def _rtu_response(slave: int, func: int, values: list[int]) -> bytes:
     return body + bytes([crc & 0xFF, crc >> 8])
 
 
-def _fake_pyserial(response: bytes, hold_sec: float = 0.02) -> tuple[SimpleNamespace, dict]:
-    """构造假 pyserial：read 时睡 hold_sec，并记录进出时间与并发度。"""
+def _fake_pyserial(
+    response: bytes, hold_sec: float = 0.02, open_sec: float = 0.0
+) -> tuple[SimpleNamespace, dict]:
+    """构造假 pyserial：read 时睡 hold_sec，并记录进出时间与并发度。
+
+    open_sec 模拟「打开 COM 口本身要花的时间」——真机上 CreateFile 是毫秒级到
+    几十毫秒的独占操作，Windows 上端口被占时直接回 Access denied。把它设为 0
+    会让「open 与 read 是否并发」变成纳秒级竞争，测不出东西。
+    """
     state: dict = {"concurrent": 0, "max_concurrent": 0, "frames": []}
     guard = threading.Lock()
 
@@ -48,6 +55,8 @@ def _fake_pyserial(response: bytes, hold_sec: float = 0.02) -> tuple[SimpleNames
             with guard:
                 state["concurrent"] += 1
                 state["max_concurrent"] = max(state["max_concurrent"], state["concurrent"])
+            if open_sec:
+                time.sleep(open_sec)
             self.entered_at = time.perf_counter()
             return self
 
@@ -159,3 +168,35 @@ def test_frame_gap_scales_with_baudrate_and_parity():
     assert serial_frame_gap_sec(9600, "N") > serial_frame_gap_sec(115200, "N")
     assert serial_frame_gap_sec(9600, "E") > serial_frame_gap_sec(9600, "N")
     assert serial_frame_gap_sec(0, "N") > 0, "异常波特率不能产生除零"
+
+
+def test_connect_probe_shares_the_port_lock(monkeypatch):
+    """「设备连接测试」（connect → _probe_open）必须与读取排队，不能抢开端口。
+
+    回归 v0.1.9 的遗漏：read_registers 整段持锁，但 connect() 直接 to_thread 开端口
+    绕过了锁。现场表现是——后台正在轮询 COM3，前端对同口另一台（尚未配点位）设备点
+    「连接测试」，Windows 上 CreateFile 撞上已占用的句柄直接 PermissionError，
+    整台设备被打成读取失败，而报错文字是「串口打开失败」，没人会怀疑是那个按钮。
+    这里断言：并发发起 1 次读 + 2 次探测，同一时刻打开的句柄数恒为 1。
+    """
+    response = _rtu_response(1, 3, [0x1234, 0x5678])
+    fake, state = _fake_pyserial(response, hold_sec=0.02, open_sec=0.02)
+    monkeypatch.setattr(modbus, "serial", fake)
+
+    async def scenario():
+        reader = ModbusRTUSerialClient("COM11", 9600, timeout_ms=500, retry=0)
+        prober = ModbusRTUSerialClient("COM11", 9600, timeout_ms=500, retry=0)
+        return await asyncio.gather(
+            reader.read_registers(1, 3, 0, 2),
+            prober.connect(),
+            prober.connect(),
+            return_exceptions=True,
+        )
+
+    results = run(scenario())
+    assert results[0] == [0x1234, 0x5678], f"读取不该被探测影响：{results[0]!r}"
+    assert all(r is None for r in results[1:]), f"探测不该失败：{results[1:]!r}"
+    assert state["max_concurrent"] == 1, (
+        f"探测与读取同时打开了 {state['max_concurrent']} 个句柄——"
+        "Windows 上这就是 PermissionError(Access denied) 的来源"
+    )

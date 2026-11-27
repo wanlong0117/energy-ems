@@ -218,7 +218,7 @@ Excel/PDF 结构与单位、认证与密码策略（服务端改密拦截、失�
 - 默认密码 `ems2026` 状态下，**服务端**只放行改密/登出/会话查询，其余接口一律 403（不是仅靠前端引导）
 - 口令以 PBKDF2-SHA256 加盐哈希存储；旧明文配置在首次成功登录时自动升级
 - 同来源连续 5 次登录失败锁定 60 秒，并记事件日志
-- `/docs`、`/openapi.json` 需登录后访问（Swagger 静态资源取自 CDN，纯内网可能渲染不出）
+- `/docs`、`/openapi.json` 需登录后访问；Swagger UI 静态资源随包内置，纯内网（无外网）可直接打开
 - 会话为 httponly + SameSite=Lax cookie，7 天过期；叠 HTTPS 后设 `EMS_COOKIE_SECURE=1`
 - 登录失败锁定按来源 IP 计数（5 次 / 60 秒）。置于 Nginx、Caddy 之后时对端恒为
   `127.0.0.1`，一个人输错 5 次就会锁住全厂——此时设 `EMS_TRUST_PROXY_HEADERS=1`
